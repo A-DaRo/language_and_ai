@@ -8,76 +8,100 @@ class RecursiveScraper {
     this.config = config;
     this.logger = logger;
     this.pageScraper = pageScraper;
-    this.scrapeQueue = [];
-    this.allContexts = []; // Track all contexts for link rewriting
+    this.allContexts = [];
   }
   
   /**
-   * Start recursive scraping from the root page
+   * Discovery phase: build the PageContext tree without heavy downloads
    */
-  async scrape(page, rootUrl) {
-    this.logger.separator('Starting Recursive Scraping');
-    this.scrapeQueue = [];
+  async discover(page, rootUrl, maxDepth) {
+    this.logger.separator('Starting Recursive Discovery');
     this.allContexts = [];
+    this.pageScraper.resetContextMap();
     
-    // Create root context
     const rootContext = new PageContext(rootUrl, 'Main_Page', 0, null);
-    
-    // Register the root context
     this.pageScraper.registerPageContext(rootUrl, rootContext);
     this.allContexts.push(rootContext);
     
-    // Add to queue
-    this.scrapeQueue.push({ context: rootContext, isFirstPage: true });
+    const queue = [{ context: rootContext, isFirstPage: true }];
+    const visited = new Set([rootUrl]);
     
-    // Process queue
-    while (this.scrapeQueue.length > 0) {
-      const { context, isFirstPage } = this.scrapeQueue.shift();
+    while (queue.length > 0) {
+      const { context, isFirstPage } = queue.shift();
       
-      // Check depth limit
-      if (context.depth >= this.config.MAX_RECURSION_DEPTH) {
-        this.logger.warn('RECURSION', `Skipping ${context.title} - max depth reached`);
+      if (context.depth >= maxDepth) {
+        this.logger.info('DISCOVERY', `Depth limit reached for ${context.displayTitle || context.title}`);
         continue;
       }
       
-      // Scrape the page
-      const links = await this.pageScraper.scrapePage(page, context, isFirstPage);
+      const pageInfo = await this.pageScraper.discoverPageInfo(page, context.url, isFirstPage);
+      if (pageInfo && pageInfo.title) {
+        context.setDisplayTitle(pageInfo.title);
+      }
+      const links = (pageInfo && pageInfo.links) || [];
       
-      // Add child pages to queue
       for (const linkInfo of links) {
-        // Skip if already visited
-        if (this.pageScraper.isVisited(linkInfo.url)) {
+        if (!linkInfo.url || visited.has(linkInfo.url)) {
           continue;
         }
+        visited.add(linkInfo.url);
         
-        // Create child context - now as a nested child under parent
         const childContext = new PageContext(
           linkInfo.url,
           linkInfo.title,
           context.depth + 1,
-          context // This creates the nested structure
+          context
         );
-        
         childContext.isNestedUnderParent = true;
+        childContext.setDisplayTitle(linkInfo.title);
+        if (linkInfo.section) childContext.setSection(linkInfo.section);
+        if (linkInfo.subsection) childContext.setSubsection(linkInfo.subsection);
         
-        // Add to parent's children
         context.addChild(childContext);
-        
-        // Register context for link rewriting
         this.pageScraper.registerPageContext(linkInfo.url, childContext);
         this.allContexts.push(childContext);
         
-        // Add to queue
-        this.scrapeQueue.push({ context: childContext, isFirstPage: false });
+        queue.push({ context: childContext, isFirstPage: false });
+      }
+    }
+    
+    return { rootContext, allContexts: this.allContexts };
+  }
+  
+  /**
+   * Execution phase: traverse planned tree and run full scraping routine
+   */
+  async execute(page, rootContext) {
+    if (!rootContext) {
+      throw new Error('Execution requires a previously discovered root context');
+    }
+    if (!this.allContexts || this.allContexts.length === 0) {
+      this.allContexts = this._collectContexts(rootContext);
+    }
+    
+    this.logger.separator('Starting Recursive Scraping');
+    this.pageScraper.resetVisited();
+    const scrapeQueue = [{ context: rootContext, isFirstPage: true }];
+    
+    while (scrapeQueue.length > 0) {
+      const { context, isFirstPage } = scrapeQueue.shift();
+      
+      if (context.depth >= this.config.MAX_RECURSION_DEPTH) {
+        this.logger.warn('RECURSION', `Skipping ${context.displayTitle || context.title} - max depth reached`);
+        continue;
       }
       
-      // Log progress
-      this.logger.info('RECURSION', `Queue size: ${this.scrapeQueue.length} pages remaining`);
+      await this.pageScraper.scrapePage(page, context, isFirstPage);
+      
+      for (const child of context.children) {
+        scrapeQueue.push({ context: child, isFirstPage: false });
+      }
+      
+      this.logger.info('RECURSION', `Queue size: ${scrapeQueue.length} pages remaining`);
     }
     
     this.logger.separator('Scraping Complete - Starting Link Rewriting');
     
-    // Phase 2: Rewrite all internal links in saved HTML files
     let totalLinksRewritten = 0;
     for (const ctx of this.allContexts) {
       const count = await this.pageScraper.rewriteLinksInFile(ctx);
@@ -88,6 +112,19 @@ class RecursiveScraper {
     this.logger.separator('All Operations Complete');
     
     return { rootContext, totalLinksRewritten, allContexts: this.allContexts };
+  }
+  
+  _collectContexts(rootContext) {
+    const results = [];
+    const stack = [rootContext];
+    while (stack.length > 0) {
+      const ctx = stack.pop();
+      results.push(ctx);
+      for (const child of ctx.children) {
+        stack.push(child);
+      }
+    }
+    return results;
   }
 }
 

@@ -30,31 +30,42 @@ npm start
 # Or with Node directly
 node main.js
 
+# Discovery-only planning
+node main.js --dry-run
+
+# Auto-confirm after planning
+node main.js --yes
+
+# Start the dry run at a specific depth
+node main.js --max-depth 3
+
 # Enable debug logging
 DEBUG=1 node main.js
 ```
 
 ## What Happens
 
-1. **Cookie Handling** (5-10 seconds)
-   - Automatically rejects cookie banners
-   - Handles confirmation dialog
-   - Waits for page reload
+1. **Discovery (Dry Run)** (fast)
+   - Visits each page just long enough to capture the title + internal links
+   - Builds an in-memory tree and prints an ASCII plan to the terminal
+   - Lets you inspect or request a deeper crawl *before* any heavy work starts
 
-2. **Content Expansion** (10-30 seconds per page)
+2. **Interactive Prompt** (optional)
+   - Enter `Y`/`yes` to continue, `n`/`no` to abort, or `d`/`deeper` to bump depth by one level and rebuild the plan
+
+3. **Content Expansion** (10-30 seconds per page once execution begins)
    - Clicks "Load more" buttons in databases
    - Scrolls to trigger lazy-loading
    - Expands all toggle blocks
 
-3. **Recursive Scraping** (varies by site size)
-   - Follows all internal links
+4. **Recursive Scraping** (varies by site size)
+   - Follows the confirmed plan only—no redundant rediscovery
    - Creates nested folder structure
    - Downloads all images and assets
 
-4. **Link Rewriting** (5-10 seconds per page)
-   - Parses all saved HTML files
-   - Rewrites internal links to relative paths
-   - Creates fully navigable offline copy
+5. **Link Rewriting & Auditing** (5-10 seconds per page)
+   - Parses saved HTML files and rewrites internal links to relative paths
+   - Runs the integrity auditor to catch missing assets or residual URLs
 
 ## Expected Output
 

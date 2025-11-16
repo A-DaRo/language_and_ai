@@ -14,6 +14,7 @@ A sophisticated, object-oriented Node.js application for recursively scraping No
 - **🍪 Cookie Handling**: Manages cookie consent banners automatically
 - **📊 Structured Logging**: Professional logging with categories and timestamps
 - **⚙️ Configurable Depth**: Control recursion depth and expansion levels
+- **🧭 Interactive Discovery Phase**: Plan scrapes with a fast dry run, ASCII tree preview, and depth controls before downloading anything
 
 ## Architecture
 
@@ -48,6 +49,18 @@ npm install puppeteer axios jsdom
 ```bash
 node main.js
 ```
+
+This launches the full two-phase workflow:
+
+1. **Discovery (Dry Run)** quickly maps the entire reachable Notion space.
+2. The resulting hierarchy is rendered as an ASCII tree.
+3. You're prompted to proceed, abort, or request a deeper crawl before any content is downloaded.
+
+### Planning & Confirmation Options
+
+- `node main.js --dry-run` → perform **only** the discovery phase and exit. Great for planning without downloading files.
+- `node main.js --yes` → skip the interactive prompt and proceed directly from discovery to execution when you're already confident.
+- `node main.js --max-depth 3` → override the initial discovery depth (you can still request "deeper" interactively later).
 
 ### Configuration
 
@@ -112,23 +125,20 @@ downloaded_course_material/
 
 ## How It Works
 
-### Phase 1: Scraping
-1. **Initialization**: Browser and components are initialized
-2. **Cookie Handling**: Automatically rejects cookie banners and handles reload
-3. **Content Expansion**: Expands databases, scrolls for lazy-loading, and opens toggles
-4. **Link Extraction**: Finds all internal Notion page links with their hierarchical context
-5. **Recursive Scraping**: Follows links up to the configured depth, creating nested folder structure
-6. **Asset Download**: Downloads and localizes all images with retry logic and URL sanitization
-7. **HTML Preservation**: Saves complete HTML with all CSS and JavaScript intact
+### Phase 1: Discovery (Dry Run)
+1. **Initialization**: Browser and automation helpers spin up.
+2. **Lightweight Visits**: Each page is opened just long enough to capture the title and internal links—no downloads, no expansions.
+3. **Tree Assembly**: The discovered hierarchy is stored in `PageContext` objects and rendered as an ASCII tree for review.
+4. **Interactive Prompt**: Accept the plan, abort, or type `d`/`deeper` to bump the discovery depth and rebuild the map before continuing.
 
-### Phase 2: Link Rewriting
-8. **Context Mapping**: Builds a map of all scraped URLs to their local file paths
-9. **Link Translation**: Parses each saved HTML file and rewrites all internal `<a>` tags
-10. **Relative Path Calculation**: Converts absolute Notion URLs to relative local paths (e.g., `../../Week_2/index.html`)
-11. **Verification**: Logs all rewritten links for verification
+### Phase 2: Execution (Scraping)
+5. **Plan Reuse**: The confirmed tree becomes the authoritative roadmap—no redundant rediscovery.
+6. **Content Expansion & Asset Capture**: Each queued page undergoes the full scraping routine (expansions, asset/file downloads, HTML preservation).
+7. **Link Rewriting**: Saved HTML is revisited so internal `<a>` tags point to the correct local paths.
+8. **Integrity Audit**: The auditor runs last to flag missing files or lingering remote references.
 
 ### Result
-A fully self-contained, interactive offline copy that looks and behaves exactly like the original Notion site!
+A fully self-contained, interactive offline copy that mirrors the original Notion site, produced under your direct supervision.
 
 ## Logging
 
@@ -205,6 +215,12 @@ At the end of scraping, the application provides:
 - Maintains navigation between pages offline
 - External links preserved unchanged
 - JSDOM-based HTML parsing for accuracy
+
+### ✨ Interactive Discovery & Confirmation
+- Rapid "dry run" pass builds the entire crawl tree with zero downloads
+- ASCII plan view keeps you in control before any heavy work begins
+- Built-in prompt lets you deepen, abort, or auto-approve with CLI flags (`--dry-run`, `--yes`, `--max-depth`)
+- Execution phase reuses the plan for maximum efficiency—no duplicate crawling
 
 ## Contributing
 

@@ -29,6 +29,20 @@ class PageScraper {
   }
   
   /**
+   * Reset visited state before a fresh execution phase
+   */
+  resetVisited() {
+    this.visitedUrls.clear();
+  }
+  
+  /**
+   * Reset the page context map prior to discovery
+   */
+  resetContextMap() {
+    this.urlToContextMap.clear();
+  }
+  
+  /**
    * Register a page context for link rewriting
    */
   registerPageContext(url, context) {
@@ -92,6 +106,43 @@ class PageScraper {
     } catch (error) {
       this.logger.error('SCRAPE', `Error scraping page ${pageContext.title}`, error);
       return [];
+    }
+  }
+
+  /**
+   * Lightweight metadata fetch used during discovery
+   */
+  async discoverPageInfo(page, url, isFirstPage = false) {
+    try {
+      this.logger.info('DISCOVERY', `Scanning page metadata: ${url}`);
+      await page.goto(url, {
+        waitUntil: 'domcontentloaded',
+        timeout: this.config.TIMEOUT_PAGE_LOAD
+      });
+      
+      if (isFirstPage) {
+        await this.cookieHandler.handle(page);
+      }
+      
+      let title = null;
+      try {
+        await page.waitForSelector('.notion-frame .notion-page-title-icon-and-text', {
+          timeout: this.config.TIMEOUT_NAVIGATION
+        });
+        title = await page.$eval('.notion-frame .notion-page-title-icon-and-text', el => el.innerText.trim());
+      } catch (err) {
+        this.logger.debug('DISCOVERY', `Fallback title strategy for ${url}: ${err.message}`);
+      }
+      
+      if (!title) {
+        title = (await page.title()) || 'Untitled';
+      }
+      
+      const links = await this.linkExtractor.extractLinks(page, url);
+      return { title, links };
+    } catch (error) {
+      this.logger.error('DISCOVERY', `Failed to discover page info for ${url}`, error);
+      return { title: 'Unavailable', links: [] };
     }
   }
   

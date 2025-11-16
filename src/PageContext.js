@@ -6,6 +6,8 @@ const path = require('path');
 class PageContext {
   constructor(url, title, depth = 0, parentContext = null) {
     this.url = url;
+    this.originalTitle = title || 'Untitled';
+    this.displayTitle = this.originalTitle;
     this.title = this.sanitizeTitle(title);
     this.depth = depth;
     this.parentContext = parentContext;
@@ -13,6 +15,15 @@ class PageContext {
     this.subsection = null; // e.g., "Week 1", "Week 2"
     this.children = [];
     this.isNestedUnderParent = false; // Flag to indicate if this is a nested sub-page
+  }
+
+  /**
+   * Update the human-friendly title while keeping sanitized filesystem name
+   */
+  setDisplayTitle(title) {
+    if (!title) return;
+    this.originalTitle = title;
+    this.displayTitle = title.trim() || this.displayTitle;
   }
   
   /**

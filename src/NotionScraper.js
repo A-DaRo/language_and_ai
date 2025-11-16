@@ -1,5 +1,6 @@
 const puppeteer = require('puppeteer');
 const path = require('path');
+const readline = require('readline');
 const Config = require('./Config');
 const Logger = require('./Logger');
 const CookieHandler = require('./CookieHandler');
@@ -21,6 +22,7 @@ class NotionScraper {
     this.logger = new Logger();
     this.browser = null;
     this.page = null;
+    this.currentPlan = null;
     
     // Initialize components
     this.cookieHandler = new CookieHandler(this.config, this.logger);
@@ -72,15 +74,61 @@ class NotionScraper {
   /**
    * Run the complete scraping process
    */
-  async run() {
+  async run(options = {}) {
     try {
       await this.initialize();
-      
-      // Start recursive scraping and link rewriting
-      const result = await this.recursiveScraper.scrape(
-        this.page,
-        this.config.NOTION_PAGE_URL
+
+      const runOptions = {
+        dryRunOnly: false,
+        autoConfirm: false,
+        initialMaxDepth: this.config.MAX_RECURSION_DEPTH,
+        ...options
+      };
+
+      let currentDepth = Math.min(
+        runOptions.initialMaxDepth || this.config.MAX_RECURSION_DEPTH,
+        this.config.MAX_RECURSION_DEPTH
       );
+      if (currentDepth < 1) {
+        currentDepth = 1;
+      }
+
+      while (true) {
+        this.currentPlan = await this.plan(currentDepth);
+        this.displayTree(this.currentPlan.rootContext);
+
+        if (runOptions.dryRunOnly) {
+          this.logger.info('MAIN', 'Dry run flag detected. Skipping execution phase.');
+          return;
+        }
+
+        if (runOptions.autoConfirm) {
+          this.logger.info('MAIN', '--yes flag provided. Skipping confirmation prompt.');
+          break;
+        }
+
+        const userChoice = await this._promptForPlanDecision();
+        if (userChoice === 'yes') {
+          break;
+        }
+        if (userChoice === 'no') {
+          this.logger.warn('MAIN', 'Aborted by user after discovery phase.');
+          return;
+        }
+        if (userChoice === 'deeper') {
+          if (currentDepth >= this.config.MAX_RECURSION_DEPTH) {
+            this.logger.warn('MAIN', 'Already at configured MAX_RECURSION_DEPTH; cannot go deeper.');
+          } else {
+            currentDepth += 1;
+            this.logger.info('MAIN', `Increasing discovery depth to ${currentDepth} and re-running plan...`);
+            continue;
+          }
+        }
+      }
+
+      this.logger.info('MAIN', 'User confirmed. Starting Execution Phase...');
+      console.log('[MAIN] User confirmed. Starting Execution Phase...');
+      const result = await this.recursiveScraper.execute(this.page, this.currentPlan.rootContext);
 
       const auditSummary = await this.integrityAuditor.audit(result.allContexts);
       
@@ -95,6 +143,74 @@ class NotionScraper {
     } finally {
       await this.cleanup();
     }
+  }
+
+  /**
+   * Run discovery-only planning step
+   */
+  async plan(maxDepth) {
+    this.logger.separator('Discovery Phase');
+    const plan = await this.recursiveScraper.discover(
+      this.page,
+      this.config.NOTION_PAGE_URL,
+      maxDepth
+    );
+    this.logger.success('PLAN', `Discovery complete with ${plan.allContexts.length} page(s).`);
+    return plan;
+  }
+
+  /**
+   * Render the discovered hierarchy as ASCII tree
+   */
+  displayTree(rootContext) {
+    if (!rootContext) {
+      this.logger.warn('PLAN', 'No root context to display.');
+      return;
+    }
+    console.log('[PLAN] Discovery complete. The following site structure will be scraped:');
+    console.log('.');
+    const rootLabel = rootContext.displayTitle || rootContext.title || '(root)';
+    const rootChildren = rootContext.children || [];
+    if (rootChildren.length === 0) {
+      console.log(`└─ ${rootLabel}`);
+      return;
+    }
+    console.log(`└─ ${rootLabel}`);
+    rootChildren.forEach((child, index) => {
+      const isLast = index === rootChildren.length - 1;
+      this._printTreeNode(child, '   ', isLast);
+    });
+  }
+
+  _printTreeNode(context, prefix, isLast) {
+    const connector = isLast ? '└─ ' : '├─ ';
+    const title = context.displayTitle || context.title || 'Untitled';
+    console.log(`${prefix}${connector} ${title}`);
+    const childPrefix = prefix + (isLast ? '   ' : '│  ');
+    context.children.forEach((child, index) => {
+      const childIsLast = index === context.children.length - 1;
+      this._printTreeNode(child, childPrefix, childIsLast);
+    });
+  }
+
+  async _promptForPlanDecision() {
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    const promptText = '[PROMPT] Do you want to proceed with scraping this structure?\n> Enter (Y)es to continue, (n)o to abort, or (d)eeper to expand the search by one level: ';
+    const answer = await new Promise(resolve => {
+      rl.question(promptText, response => {
+        rl.close();
+        resolve(response);
+      });
+    });
+
+    const normalized = (answer || '').trim().toLowerCase();
+    if (normalized === 'n' || normalized === 'no') {
+      return 'no';
+    }
+    if (normalized === 'd' || normalized === 'deeper') {
+      return 'deeper';
+    }
+    return 'yes';
   }
   
   /**
@@ -146,7 +262,8 @@ class NotionScraper {
   _printHierarchy(context, indent) {
     const prefix = '  '.repeat(indent) + '├─ ';
     const path = context.getRelativePath() || 'root';
-    console.log(`${prefix}${context.title} (${path})`);
+    const title = context.displayTitle || context.title;
+    console.log(`${prefix}${title} (${path})`);
     
     for (const child of context.children) {
       this._printHierarchy(child, indent + 1);
