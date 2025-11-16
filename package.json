@@ -1,0 +1,27 @@
+{
+  "name": "notion-recursive-scraper",
+  "version": "1.0.0",
+  "description": "A sophisticated recursive scraper for Notion pages with hierarchical organization",
+  "main": "main.js",
+  "scripts": {
+    "start": "node main.js",
+    "test": "echo \"No tests specified yet\" && exit 0"
+  },
+  "keywords": [
+    "notion",
+    "scraper",
+    "puppeteer",
+    "recursive",
+    "web-scraping"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "puppeteer": "^21.0.0",
+    "axios": "^1.6.0",
+    "jsdom": "^23.0.0"
+  },
+  "engines": {
+    "node": ">=14.0.0"
+  }
+}

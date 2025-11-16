@@ -1,0 +1,155 @@
+const path = require('path');
+
+/**
+ * Represents the context of a page in the hierarchy
+ */
+class PageContext {
+  constructor(url, title, depth = 0, parentContext = null) {
+    this.url = url;
+    this.title = this.sanitizeTitle(title);
+    this.depth = depth;
+    this.parentContext = parentContext;
+    this.section = null; // e.g., "Syllabus", "Material"
+    this.subsection = null; // e.g., "Week 1", "Week 2"
+    this.children = [];
+    this.isNestedUnderParent = false; // Flag to indicate if this is a nested sub-page
+  }
+  
+  /**
+   * Sanitize title for use in file/folder names
+   * More aggressive sanitization to handle all file system constraints
+   */
+  sanitizeTitle(title) {
+    if (!title) return 'untitled';
+    
+    // Remove or replace all problematic characters
+    let sanitized = title
+      .replace(/[<>:"/\\|?*\x00-\x1F]/g, '') // Remove invalid filename characters
+      .replace(/[^\w\s\-\.]/g, '') // Remove non-alphanumeric except spaces, hyphens, dots
+      .replace(/\s+/g, '_') // Replace spaces with underscores
+      .replace(/_{2,}/g, '_') // Replace multiple underscores with single
+      .replace(/^[._]+|[._]+$/g, '') // Remove leading/trailing dots and underscores
+      .trim();
+    
+    // Ensure not empty
+    if (!sanitized) sanitized = 'page';
+    
+    // Limit length while preserving file extension if present
+    if (sanitized.length > 100) {
+      const parts = sanitized.split('.');
+      if (parts.length > 1 && parts[parts.length - 1].length <= 10) {
+        const ext = parts.pop();
+        sanitized = parts.join('.').substring(0, 90) + '.' + ext;
+      } else {
+        sanitized = sanitized.substring(0, 100);
+      }
+    }
+    
+    return sanitized;
+  }
+  
+  /**
+   * Set the section this page belongs to (e.g., "Syllabus")
+   */
+  setSection(section) {
+    this.section = this.sanitizeTitle(section);
+  }
+  
+  /**
+   * Set the subsection this page belongs to (e.g., "Week_1")
+   */
+  setSubsection(subsection) {
+    this.subsection = this.sanitizeTitle(subsection);
+  }
+  
+  /**
+   * Get the relative path for this page with deep nesting support
+   * This builds a path that reflects the true hierarchical structure
+   * THIS IS THE SINGLE SOURCE OF TRUTH for where a page should be saved
+   */
+  getRelativePath() {
+    const parts = [];
+    
+    // Build path by traversing up the parent chain
+    let current = this;
+    while (current) {
+      // Add current page's folder name (including Main_Page)
+      if (current.title && current.title !== 'untitled') {
+        parts.unshift(current.title);
+      }
+      current = current.parentContext;
+    }
+    
+    return parts.join('/');
+  }
+  
+  /**
+   * Get the full directory path for this page
+   * Used for saving files to disk
+   */
+  getDirectoryPath(baseDir) {
+    const relativePath = this.getRelativePath();
+    if (relativePath) {
+      return path.join(baseDir, relativePath);
+    }
+    return baseDir;
+  }
+  
+  /**
+   * Get the full file path for this page's index.html
+   */
+  getFilePath(baseDir) {
+    const dirPath = this.getDirectoryPath(baseDir);
+    return path.join(dirPath, 'index.html');
+  }
+  
+  /**
+   * Get the relative path from one page to another for link rewriting
+   * Returns a relative path string like '../Week_2/index.html'
+   */
+  getRelativePathTo(targetContext) {
+    const sourcePath = this.getRelativePath();
+    const targetPath = targetContext.getRelativePath();
+    
+    // Split paths into segments
+    const sourceSegments = sourcePath ? sourcePath.split('/') : [];
+    const targetSegments = targetPath ? targetPath.split('/') : [];
+    
+    // Find common ancestor
+    let commonDepth = 0;
+    while (commonDepth < sourceSegments.length && 
+           commonDepth < targetSegments.length && 
+           sourceSegments[commonDepth] === targetSegments[commonDepth]) {
+      commonDepth++;
+    }
+    
+    // Build relative path
+    const upLevels = sourceSegments.length - commonDepth;
+    const downSegments = targetSegments.slice(commonDepth);
+    
+    const relativeParts = [];
+    for (let i = 0; i < upLevels; i++) {
+      relativeParts.push('..');
+    }
+    relativeParts.push(...downSegments);
+    relativeParts.push('index.html');
+    
+    return relativeParts.join('/');
+  }
+  
+  /**
+   * Add a child page context
+   */
+  addChild(childContext) {
+    this.children.push(childContext);
+  }
+  
+  /**
+   * Get a string representation for debugging
+   */
+  toString() {
+    return `PageContext(title="${this.title}", depth=${this.depth}, section="${this.section}", subsection="${this.subsection}")`;
+  }
+}
+
+module.exports = PageContext;

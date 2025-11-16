@@ -1,0 +1,563 @@
+
+
+
+
+
+
+
+
+
+
+<!doctype html>
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+
+
+
+    
+        
+
+
+
+
+
+
+
+
+
+
+	<script src="https://ez1-static.yuja.com/Libraries/jquery/jquery-3.6.0.min.ve360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne.js"></script>
+	<script src="https://ez1-static.yuja.com/Libraries/jquery/jquery-migrate-3.4.0.min.ve360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne.js"></script>
+
+
+
+            <script>
+                // checking browser cpmpatibility
+
+                //Internet Explorer not compatible
+                if (!!document.documentMode)
+                    window.location.href = "/Dashboard/External/BrowserNotSupported";
+            </script>
+
+            
+                <script src="https://ez1-static.yuja.com/Libraries/polyfill.min.ve360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne.js"></script>
+
+                
+                	<script src="https://ez1-static.yuja.com/Libraries/lottie/5.7.1_lottie.min.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                    <script src="https://ez1-static.yuja.com/Libraries/jqueryui1.13.2/jquery-ui.min.ve360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne.js"></script>
+                    <script src="https://ez1-static.yuja.com/Libraries/modernizr.ve360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne.js"></script>
+                    <script src="https://ez1-static.yuja.com/Libraries/Bootstrap/plugins/bootstrap/js/bootstrap.min.ve360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne.js"></script>
+                    <script src="https://ez1-static.yuja.com/Libraries/jquery.fileDownload/jquery.fileDownload.ve360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne.js"></script>
+                    <script src="https://ez1-static.yuja.com/Libraries/Bootstrap/plugins/bootstrap-toastr/toastr.ve360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne.js"></script>
+                    <script src="https://ez1-static.yuja.com/Libraries/Bootstrap/scripts/ui-toastr.ve360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne.js"></script>
+                    <script src="https://ez1-static.yuja.com/Libraries/es6-promise/3.0.2/es6-promise.min.ve360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne.js"></script>
+                    <script src="https://ez1-static.yuja.com/Libraries/rsvp/3.1.0/rsvp.min.ve360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne.js"></script>
+                    
+                    
+                    <script src="https://ez1-static.yuja.com/Libraries/ab-datepicker/js/datepicker.ve360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne.js"></script>
+                    <script src="https://ez1-static.yuja.com/Libraries/daterangepicker/daterangepicker.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                    <script src="https://ez1-static.yuja.com/Libraries/timeentry/jquery.timeentry.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                    <script src="https://ez1-static.yuja.com/Libraries/jquery.datatables/jquery.dataTables.min.ve360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne.js"></script>
+                    <script src="https://ez1-static.yuja.com/Libraries/html2canvas/html2canvas_1.4.1.min.ve360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne.js"></script>
+                    <link rel="stylesheet" href="https://ez1-static.yuja.com/Libraries/react-virtualized-select@3.0.0/styles.css?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne" />
+
+                    <script>
+                        $(document).ready(
+                            function() {
+                                var nodeExplorerTabs = {};
+                                RSVP.on('error', function(reason) {
+                                    console.assert(false, reason);
+                                });
+                                var globalStrings = namespace('com.yuja.globalStrings');
+                                if (typeof(initializedGlobalString) != "undefined") {
+                                    initializedGlobalString.then(onInitialPageLoaded);
+                                }
+                            });
+
+                        function onInitialPageLoaded() {
+                            if (globalStrings.hasGlobalStringsLoaded && globalStrings.hasGlobalStringsLoaded === true) {
+                                nodeExplorerTabs = {
+                                    users: globalStrings.UsersStr ? globalStrings.UsersStr() : "Users",
+                                    courses: globalStrings.CoursesStr ? globalStrings.CoursesStr() : "Courses",
+                                    devices: globalStrings.DevicesStr ? globalStrings.DevicesStr() : "Devices",
+                                    settings: globalStrings.SettingsStr ? globalStrings.SettingsStr() : "Settings"
+                                }
+                            }
+                        }
+                    </script>
+                    <script src="https://ez1-static.yuja.com/Libraries/jquery.imageWithOverlay/jquery.imageWithOverlay.ve360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne.js"></script>
+                    <script src="https://ez1-static.yuja.com/Libraries/jquery.listGridView/jquery.listGridView.ve360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne.js"></script>
+                    <script src="https://ez1-static.yuja.com/Libraries/jquery.ba-bbq.min.ve360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne.js"></script>
+                    <script src="https://ez1-static.yuja.com/Libraries/jquery.slick/1.5.8/slick.min.ve360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne.js"></script>
+                    <script src="https://ez1-static.yuja.com/Libraries/jquery.dotdotdot/jquery.dotdotdot.ve360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne.js"></script>
+                    <script src="https://ez1-static.yuja.com/Libraries/Bootstrap/plugins/jquery-validation/dist/jquery.validate.min.ve360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne.js"></script>
+                    <script src="https://ez1-static.yuja.com/Libraries/d3/3.5.5/d3.min.ve360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne.js"></script>
+                    <script src="https://ez1-static.yuja.com/Libraries/nvd3/1.8.1/nv.d3.min.ve360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne.js"></script>
+                    <script src="https://ez1-static.yuja.com/Libraries/moment/moment.min.ve360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne.js"></script>
+                    <script src="https://ez1-static.yuja.com/Libraries/moment/moment-with-locales.min.ve360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne.js"></script>
+                    <script src="https://ez1-static.yuja.com/Libraries/moment/moment-timezone.min.ve360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne.js"></script>
+                    <script src="https://ez1-static.yuja.com/Libraries/url-search-params-polyfill.ve360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne.js"></script>
+                    <script src="https://ez1-static.yuja.com/Libraries/DOMPurify/purify.min.ve360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne.js"></script>
+                    
+
+                        
+
+
+                            <script src="https://ez1-static.yuja.com/Libraries/prop-types@15.6.2/prop-types.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                            
+                                    <script src="https://ez1-static.yuja.com/Libraries/react@15.3.2/dist/react-with-addons.min.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                    <script src="https://ez1-static.yuja.com/Libraries/react-dom@15.3.2/dist/react-dom-server.min.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                    <script src="https://ez1-static.yuja.com/Libraries/react-dom@15.3.2/dist/react-dom.min.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                    
+                                        <script src="https://ez1-static.yuja.com/Libraries/react-virtualized@9.21.0/dist/umd/react-virtualized.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                        <script src="https://ez1-static.yuja.com/Libraries/react-select@1.2.0/dist/react-select.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                        <script src="https://ez1-static.yuja.com/Libraries/react-virtualized-select@3.0.0/dist/umd/react-virtualized-select.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                        <script src="https://ez1-static.yuja.com/Libraries/js-search@1.4.2/dist/umd/js-search.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                        <script src="https://ez1-static.yuja.com/Libraries/react-select-fast-filter-options@0.2.3/dist/umd/react-select-fast-filter-options.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+
+                                        <link rel="stylesheet" href="https://ez1-static.yuja.com/Libraries/react-virtualized-select@3.0.0/styles.css?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne" />
+                                        <script src="https://ez1-static.yuja.com/Libraries/ajax/libs/react-bootstrap/0.31.5/react-bootstrap.min.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+
+
+                                        <script src="https://ez1-static.yuja.com/Libraries/alt/0.18.5/alt.min.ve360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne.js"></script>
+                                        <script src="https://ez1-static.yuja.com/Libraries/ReactDnD/2.5.4/ReactDnD.min.ve360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne.js"></script>
+                                        <script src="https://ez1-static.yuja.com/Libraries/ReactDnD/2.5.4/ReactDnDHTML5Backend.min.ve360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne.js"></script>
+                                        <script src="https://ez1-static.yuja.com/Libraries/react-slick.0.11.1.ve360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne.js"></script>
+
+
+                                        
+                                            <script src="https://ez1-static.yuja.com/Dashboard/Core/js/UIToastrWrapper.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                            <script src="https://ez1-static.yuja.com/Dashboard/js/general.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                            <script src="https://ez1-static.yuja.com/Dashboard/js/generalUI.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                            <script src="https://ez1-static.yuja.com/Dashboard/js/FileTypes.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                            <script src="https://ez1-static.yuja.com/Libraries/react-d3-cloud/WordCloud.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                            <script src="https://ez1-static.yuja.com/Libraries/react-resize-observer/ReactResizeObserver.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                            <script src="https://ez1-static.yuja.com/Libraries/react-draggable/react-draggable.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                            <script src="https://ez1-static.yuja.com/Libraries/react-simplebar/simplebar-react.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+
+								            
+								    		<script src="https://ez1-static.yuja.com/Dashboard/LTI/js/LtiSessionManagement.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+											<script>
+	                                            var constants = namespace('com.yuja.constants');
+												constants.currentSessionId = 'k4gXVyN60odJ36JkOoYsK9EO-hxPE1hB22889GFL';
+												constants.tsts = 'tsts=blue-osxck-xcoer3-msgne';
+											</script>
+                                            
+                                            <script src="https://ez1-static.yuja.com/Dashboard/js/loadConstants.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                            
+                                            <script src="https://ez1-static.yuja.com/Dashboard/js/Pagination/PageNavigator.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+
+    		
+                                                <!-- Multi-Language support -->
+                                                
+
+
+
+<script src="https://d3js.org/d3-time.v2.min.js"></script>
+<script src="https://d3js.org/d3-time-format.v3.min.js"></script>
+<script>
+	var staticResources = "https://ez1-static.yuja.com";
+	var staticVersion = "e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne";
+</script>
+<!-- globalstrings.js, run webpack to generate -->
+
+<!-- globalstrings.js -->
+<script src="https://ez1-static.yuja.com/Dashboard/webpack/globalstrings.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+<script src="https://ez1-static.yuja.com/Dashboard/js/GlobalSettings/globalStringsUtils.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+
+<script>
+
+	//Retrieve language values from session and request attributes
+	var sessionLang = "";
+	var tempLang = "";
+	
+	var currLang;
+	
+	if (tempLang) {
+	    currLang = tempLang;
+	} else if (sessionLang) {
+	    currLang = sessionLang;
+	} else {
+	    currLang = "en";
+	}
+	
+	// Initialize global strings based on determined language
+	var initializedGlobalString = initializeGlobalStrings(currLang);
+	
+	// Store the selected language in localStorage for persistence
+	try {
+	    ltiSessionManagement.localStorageSetItem('lang', currLang);
+	} catch (e) {
+	    console.log(e);
+	}
+	
+</script>
+
+
+                                                    
+                                                        <script>
+                                                            window.addEventListener('storage', function() {
+                                                                try {
+                                                                    if (currLang != null) {
+                                                                    	const localLang = ltiSessionManagement.localStorageGetItem('lang');
+                                                                    	if (currLang != localLang)
+                                                                        {
+                                                                            currLang = localLang;
+                                                                            window.top.location.reload();
+                                                                        }
+                                                                    }
+                                                                } catch (e) {
+																	console.error(e);
+                                                                }
+                                                                
+                                                            }, false);
+                                                        </script>
+                                                        <script src="https://ez1-static.yuja.com/Dashboard/js/ReactLib/ReactCommon.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                        <script src="https://ez1-static.yuja.com/Dashboard/js/ReactLib/MetadataTable.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                        <link rel="stylesheet" type="text/css" href="https://ez1-static.yuja.com/Dashboard/js/ReactLib/styles/ToggleSwitch.css?v="/>
+<link rel="stylesheet" type="text/css" href="https://ez1-static.yuja.com/Dashboard/js/ReactLib/styles/FormGroup.css?v="/>
+<link rel="stylesheet" type="text/css" href="https://ez1-static.yuja.com/Dashboard/js/ReactLib/styles/InfoCard.css?v="/>
+<link rel="stylesheet" type="text/css" href="https://ez1-static.yuja.com/Dashboard/js/ReactLib/styles/InfoTooltip.css?v="/>
+<link rel="stylesheet" type="text/css" href="https://ez1-static.yuja.com/Dashboard/js/ReactLib/styles/SecondaryTabs.css?v="/>
+<link rel="stylesheet" type="text/css" href="https://ez1-static.yuja.com/Dashboard/js/ReactLib/styles/MulitSelectDropDown.css?v="/>
+<link rel="stylesheet" type="text/css" href="https://ez1-static.yuja.com/Dashboard/js/ReactLib/styles/Checkbox.css?v="/>
+<link rel="stylesheet" type="text/css" href="https://ez1-static.yuja.com/Dashboard/js/ReactLib/styles/RadioButton.css?v="/>
+<link rel="stylesheet" type="text/css" href="https://ez1-static.yuja.com/Dashboard/js/ReactLib/styles/CommonDropdown.css?v="/>
+<link rel="stylesheet" type="text/css" href="https://ez1-static.yuja.com/Dashboard/js/ReactLib/styles/LineChart.css?v="/>
+<link rel="stylesheet" type="text/css" href="https://ez1-static.yuja.com/Dashboard/js/ReactLib/styles/VerticalBarChart.css?v="/>
+<link rel="stylesheet" type="text/css" href="https://ez1-static.yuja.com/Dashboard/js/ReactLib/styles/MultiBarChart.css?v="/>
+<link rel="stylesheet" type="text/css" href="https://ez1-static.yuja.com/Dashboard/js/ReactLib/styles/HorizontalBarChart.css?v="/>
+<link rel="stylesheet" type="text/css" href="https://ez1-static.yuja.com/Dashboard/js/ReactLib/styles/PieChart.css?v="/>
+<link rel="stylesheet" type="text/css" href="https://ez1-static.yuja.com/Dashboard/js/ReactLib/styles/ChartCommon.css?v="/>
+<link rel="stylesheet" type="text/css" href="https://ez1-static.yuja.com/Dashboard/js/ReactLib/styles/WarningCard.css?v="/>
+<link rel="stylesheet" type="text/css" href="https://ez1-static.yuja.com/Dashboard/js/ReactLib/styles/DropDownComponent.css?v="/>
+<link rel="stylesheet" type="text/css" href="https://ez1-static.yuja.com/Dashboard/js/ReactLib/styles/CommonButton.css?v="/>
+<link rel="stylesheet" type="text/css" href="https://ez1-static.yuja.com/Dashboard/js/ReactLib/styles/TableComponentStyle.css?v="/>
+<link rel="stylesheet" type="text/css" href="https://ez1-static.yuja.com/Dashboard/js/ReactLib/styles/KebabMenuStyle.css?v="/>
+<link rel="stylesheet" type="text/css" href="https://ez1-static.yuja.com/Dashboard/js/ReactLib/styles/TextField.css?v="/>
+<link rel="stylesheet" type="text/css" href="https://ez1-static.yuja.com/Dashboard/js/ReactLib/styles/MultiSelectBadges.css?v="/>
+<link rel="stylesheet" type="text/css" href="https://ez1-static.yuja.com/Dashboard/js/ReactLib/styles/SettingsCard.css?v="/>
+<script src="https://ez1-static.yuja.com/Dashboard/js/ReactLib/common/ToggleSwitch.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+<script src="https://ez1-static.yuja.com/Dashboard/js/ReactLib/common/TextField.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+<script src="https://ez1-static.yuja.com/Dashboard/js/ReactLib/common/FormGroup.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+<script src="https://ez1-static.yuja.com/Dashboard/js/ReactLib/common/MultiSelectBadges.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+<script src="https://ez1-static.yuja.com/Dashboard/js/ReactLib/common/InfoCard.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+<script src="https://ez1-static.yuja.com/Dashboard/js/ReactLib/common/InfoTooltip.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+<script src="https://ez1-static.yuja.com/Dashboard/js/ReactLib/common/SecondaryTab.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+<script src="https://ez1-static.yuja.com/Dashboard/js/ReactLib/common/SecondaryTabs.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+<script src="https://ez1-static.yuja.com/Dashboard/js/ReactLib/common/Checkbox.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+<script src="https://ez1-static.yuja.com/Dashboard/js/ReactLib/common/RadioButton.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+<script src="https://ez1-static.yuja.com/Dashboard/js/ReactLib/common/CommonDropdown.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+<script src="https://ez1-static.yuja.com/Dashboard/js/ReactLib/common/LineChart.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+<script src="https://ez1-static.yuja.com/Dashboard/js/ReactLib/common/VerticalBarChart.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+<script src="https://ez1-static.yuja.com/Dashboard/js/ReactLib/common/MultiBarChart.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+<script src="https://ez1-static.yuja.com/Dashboard/js/ReactLib/common/HorizontalBarChart.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+<script src="https://ez1-static.yuja.com/Dashboard/js/ReactLib/common/PieChart.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+<script src="https://ez1-static.yuja.com/Dashboard/js/ReactLib/common/WarningCard.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+<script src="https://ez1-static.yuja.com/Dashboard/js/ReactLib/common/DropDownComponent.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+<script src="https://ez1-static.yuja.com/Dashboard/js/ReactLib/common/ChartTooltip.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+<script src="https://ez1-static.yuja.com/Dashboard/js/ReactLib/ReactCommon/Button.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+<script src="https://ez1-static.yuja.com/Dashboard/js/ReactLib/common/KebabMenu.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+<script src="https://ez1-static.yuja.com/Dashboard/js/ReactLib/common/TableComponent.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+<script src="https://ez1-static.yuja.com/Dashboard/js/ReactLib/common/TableComponentWrapper.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+<script src="https://ez1-static.yuja.com/Dashboard/js/ReactLib/common/UserEngagementChart.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+<script src="https://ez1-static.yuja.com/Dashboard/js/ReactLib/common/ChartCommonHelper.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+<script src="https://ez1-static.yuja.com/Dashboard/js/ReactLib/common/SettingsCard.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+
+                                                        <script src="https://ez1-static.yuja.com/Dashboard/js/ReactLib/ReactMenu.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                        <script src="https://ez1-static.yuja.com/Dashboard/js/ReactLib/ReactSidebar.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                        <script src="https://ez1-static.yuja.com/Dashboard/js/ReactLib/ReactVideo.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                        <script src="https://ez1-static.yuja.com/Dashboard/js/ReactLib/AudioWaveFormGenerator.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                        <script src="https://ez1-static.yuja.com/Dashboard/js/ReactLib/ReactFile.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                        <script src="https://ez1-static.yuja.com/Dashboard/js/ReactLib/LoadingSpinner.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                        <script src="https://ez1-static.yuja.com/Dashboard/js/ReactLib/AdvancedSearchConsole.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                        <script src="https://ez1-static.yuja.com/Dashboard/js/ReactLib/SearchBar.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                        <script src="https://ez1-static.yuja.com/Dashboard/js/ReactLib/MediaChooserTopBar.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                        <script src="https://ez1-static.yuja.com/Dashboard/js/ReactLib/SearchResultsRow.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                        <script src="https://ez1-static.yuja.com/Dashboard/js/ReactLib/react-transition-group.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                        <script src="https://ez1-static.yuja.com/Dashboard/js/ReactLib/DecoratorReactTransitions.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                        <script src="https://ez1-static.yuja.com/Dashboard/js/ReactLib/dropDown.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                        <script src="https://ez1-static.yuja.com/Dashboard/HierarchyNodeManagement/js/Tab.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                        <script src="https://ez1-static.yuja.com/Dashboard/HierarchyNodeManagement/js/Tabs.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                        <script src="https://ez1-static.yuja.com/Dashboard/js/ReactLib/PlaceholderComponents.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                        <!-- ztree plugin -->
+                                                        <link rel="stylesheet" type="text/css" href="https://ez1-static.yuja.com/Libraries/load-awesome/css/ball-spin.css?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"/>
+                                                        <link rel="stylesheet" type="text/css" href="https://ez1-static.yuja.com/Dashboard/js/ReactLib/styles/LoadingSpinner.css?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"/>
+                                                        <link rel="stylesheet" href="https://ez1-static.yuja.com/Libraries/ztree/css/zTreeStyle/zTreeStyle.css?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne">
+														<script type="text/javascript" src="https://ez1-static.yuja.com/Libraries/ztree/jquery.ztree.core.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+														<script type="text/javascript" src="https://ez1-static.yuja.com/Libraries/ztree/jquery.ztree.excheck.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+														<script type="text/javascript" src="https://ez1-static.yuja.com/Libraries/ztree/jquery.ztree.exhide.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+														<script type="text/javascript" src="https://ez1-static.yuja.com/Libraries/ztree/fuzzysearch.min.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+
+                                                        
+                                                            
+
+                                                                
+                                                                    <script src="https://ez1-static.yuja.com/Dashboard/js/bgload.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                                    <script src="https://ez1-static.yuja.com/Dashboard/js/fallback.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                                    <script src="https://ez1-static.yuja.com/Dashboard/js/Knock.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                                    <script src="https://ez1-static.yuja.com/Dashboard/js/Util.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+
+                                                                    <script src="https://ez1-static.yuja.com/Libraries/lodash.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+
+                                                                    <script src="https://ez1-static.yuja.com/Dashboard/js/cache.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                                    <script src="https://ez1-static.yuja.com/Dashboard/js/alt.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                                    <script src="https://ez1-static.yuja.com/Dashboard/js/VideoListGridView.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                                    <script src="https://ez1-static.yuja.com/Dashboard/js/VideoManagementCommon.IO.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                                    <script src="https://ez1-static.yuja.com/Dashboard/js/TreeNav/TreeNavigation.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                                    <script src="https://ez1-static.yuja.com/Dashboard/js/VideoManagementCommon.Logic.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                                    <script src="https://ez1-static.yuja.com/Dashboard/js/VideoManagementActions.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                                    <script src="https://ez1-static.yuja.com/Dashboard/js/VideoManagementStore.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                                    <script src="https://ez1-static.yuja.com/Dashboard/TMSIKUGCCT/js/DataGrid.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                                    <link rel="stylesheet" href="https://ez1-static.yuja.com/Dashboard/TMSIKUGCCT/style/AnalyticsCommon.css?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></link>
+                                                                    <script src="https://ez1-static.yuja.com/Dashboard/TMSIKUGCCT/js/AnalyticsCommon.IO.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                                    <script src="https://ez1-static.yuja.com/Dashboard/TMSIKUGCCT/js/AnalyticsCommon.Logic.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                                    <script src="https://ez1-static.yuja.com/Dashboard/TMSIKUGCCT/js/AnalyticsCommon.UI.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                                    <script src="https://ez1-static.yuja.com/Dashboard/MediaChannel/TranscriptPanel.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                                    <script src="https://ez1-static.yuja.com/Dashboard/MediaChannel/WatchVideo.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                                    <script src="https://ez1-static.yuja.com/Dashboard/MediaChannel/ViewMedia.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                                    <script src="https://ez1-static.yuja.com/Dashboard/js/CommentSection.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                                    <script src="https://ez1-static.yuja.com/Dashboard/js/EnterpriseTubeView.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                                    <script src="https://ez1-static.yuja.com/Dashboard/External/js/EnterpriseTube.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                                    <link rel="stylesheet" type="text/css" href="/Dashboard/style/InstitutionPublicPageCommon.css?v=">
+                                                                    <script src="https://ez1-static.yuja.com/Dashboard/js/FileGrid.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                                    <script src="https://ez1-static.yuja.com/Dashboard/js/FolderSelection.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                                    <script src="https://ez1-static.yuja.com/Dashboard/js/EditVideoDialog.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                                    <script src="https://ez1-static.yuja.com/Dashboard/js/FileExplorerModalDialogs.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                                    <script src="https://ez1-static.yuja.com/Dashboard/js/detectPopupBlocker.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                                    <script src="https://ez1-static.yuja.com/Dashboard/js/FileExplorerTopBar.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                                    <script src="https://ez1-static.yuja.com/Libraries/evaporate/spark-md5.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                                    <script src="https://ez1-static.yuja.com/Libraries/evaporate/evaporate.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                                    <script src="https://ez1-static.yuja.com/Libraries/evaporate/sha256.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                                    <script src="https://ez1-static.yuja.com/Dashboard/Core/js/Upload.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                                    <script src="https://ez1-static.yuja.com/Dashboard/js/ReactLib/UserSelection.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                                    <script src="https://ez1-static.yuja.com/Dashboard/js/TreeNav/PublishModal.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                                    <script src="https://ez1-static.yuja.com/Dashboard/js/FileExplorer.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                                    <script src="https://ez1-static.yuja.com/Dashboard/js/ReactFolderFile.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                                    <script src="https://ez1-static.yuja.com/Dashboard/js/AccessibilityUpload.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                                    <script src="https://ez1-static.yuja.com/Dashboard/js/TableComponents/Table.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                                    <script src="https://ez1-static.yuja.com/Dashboard/AudioDescription/js/EnhancedAudioDescriptionModals.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                                    <script src="https://ez1-static.yuja.com/Dashboard/AudioDescription/js/EnhancedAudioDescriptionTab.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                                    <script src="https://ez1-static.yuja.com/Dashboard/AudioDescription/js/AudioDescriptionTab.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                                    <script src="https://ez1-static.yuja.com/Dashboard/js/AnalyticsTab.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                                    <script src="https://ez1-static.yuja.com/Dashboard/js/DetailsPanelModalDialogs.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                                    <script src="https://ez1-static.yuja.com/Dashboard/js/FileExplorerDetailsPanel.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                                    <script src="https://ez1-static.yuja.com/Dashboard/js/ReactLib/NodeTreeView.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                                    <script src="https://ez1-static.yuja.com/Dashboard/js/ReactLib/QuizLog.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                                    <script src="https://ez1-static.yuja.com/Dashboard/js/ReactLib/QuizTabModals.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                                    <script src="https://ez1-static.yuja.com/Dashboard/js/ReactLib/QuizTabContent.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                                    <script src="https://ez1-static.yuja.com/Dashboard/js/ReactLib/SyndicationTabContent.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                                    <script src="https://ez1-static.yuja.com/Dashboard/js/ReactLib/PlayerTabContent.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                                    <script src="https://ez1-static.yuja.com/Dashboard/js/ReactLib/TranscodeTabContent.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                                    <script src="https://ez1-static.yuja.com/Dashboard/js/ReactLib/VersioningTabContent.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                                    <script src="https://ez1-static.yuja.com/Dashboard/js/ReactLib/BrandingAudioTabContent.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                                    <script src="https://ez1-static.yuja.com/Dashboard/js/ReactLib/BrandingTabContent.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                                    <script src="https://ez1-static.yuja.com/Dashboard/js/ReactLib/ConsentFormTabContent.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+																	<script src="https://ez1-static.yuja.com/Dashboard/js/ReactLib/FacialAnalysisTabContent.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+																	<script src="https://ez1-static.yuja.com/Dashboard/js/ReactLib/FacialAnalysisTabModals.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                                    <script src="https://ez1-static.yuja.com/Dashboard/js/ReactLib/MergeVideoModalDialog.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                                    <script src="https://ez1-static.yuja.com/Dashboard/js/ReactLib/NotificationComponents.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                                    <script src="https://ez1-static.yuja.com/Dashboard/js/InstitutionPublicPageCommon.Logic.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                                    <script src="https://ez1-static.yuja.com/Dashboard/js/Watch.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                                    <script src="https://ez1-static.yuja.com/Dashboard/Himalayas/js/MainHimalayas.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+
+
+                                                                    <script src="https://ez1-static.yuja.com/Dashboard/Polls/js/Polling.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                                    <script src="https://ez1-static.yuja.com/Dashboard/VideoManagement/js/YuJaYoutubeVideoPlayerOverlay.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                                    <script src="https://ez1-static.yuja.com/Dashboard/Polls/js/VideoPolling.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                                    <script src="https://ez1-static.yuja.com/Dashboard/Polls/js/VideoControl.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+
+                                                                    <script src="https://ez1-static.yuja.com/Dashboard/HierarchyNodeManagement/js/NodeManagementActions.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                                    <script src="https://ez1-static.yuja.com/Dashboard/HierarchyNodeManagement/js/NodeManagementCommon.IO.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                                    <script src="https://ez1-static.yuja.com/Dashboard/HierarchyNodeManagement/js/NodeManagementStore.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                                    <script src="https://ez1-static.yuja.com/Dashboard/HierarchyNodeManagement/js/LargeInstitutionConstants.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                                    <script src="https://ez1-static.yuja.com/Dashboard/HierarchyNodeManagement/js/NodeExplorerDisplayBody.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                                    <script src="https://ez1-static.yuja.com/Dashboard/HierarchyNodeManagement/js/NodeExplorerHelp.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                                    <script src="https://ez1-static.yuja.com/Dashboard/HierarchyNodeManagement/js/NodeFileDisplay.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                                    <script src="https://ez1-static.yuja.com/Dashboard/HierarchyNodeManagement/js/NodeActionModals.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                                    <script src="https://ez1-static.yuja.com/Dashboard/HierarchyNodeManagement/js/NodeSearch.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                                    <script src="https://ez1-static.yuja.com/Dashboard/HierarchyNodeManagement/js/NodeExplorer.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                                    <script src="https://ez1-static.yuja.com/Dashboard/HierarchyNodeManagement/js/NodeManagementCommon.Logic.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                                    <script src="https://ez1-static.yuja.com/Dashboard/HierarchyNodeManagement/js/NodeSettings.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                                    <script src="https://ez1-static.yuja.com/Dashboard/GroupMember/ViewGroupInvitations.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+
+                                                                    <script src="https://ez1-static.yuja.com/Dashboard/js/UmbrellaDropdown.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+
+                                                                    
+                                                                        <script src="https://ez1-static.yuja.com/Libraries/Bootstrap/plugins/prettyPhoto/js/jquery.prettyPhoto.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne" type="text/javascript" charset="utf-8"></script>
+
+                                                                        
+                                                                            <script src="https://ez1-static.yuja.com/Libraries/highlight/prettify.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+
+                                                                            
+                                                                                <script src="https://ez1-static.yuja.com/Libraries/drawingboard/drawingboard.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+
+                                                                                
+                                                                                    <script src="https://ez1-static.yuja.com/Libraries/videojs/video.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                                                    <script>
+                                                                                        videojs.options.flash.swf = "https://ez1-static.yuja.com/Libraries/videojs/video-js.swf";
+                                                                                    </script>
+
+                                                                                    <script src="https://ez1-static.yuja.com/Libraries/react-selectable.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                                                    <script src="https://ez1-static.yuja.com/Libraries/Selection.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                                                    <script src="https://ez1-static.yuja.com/Libraries/Paginator.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                                                    <script src="https://ez1-static.yuja.com/Libraries/classnames.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                                                    <script src="https://ez1-static.yuja.com/Libraries/Page.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                                                    <script src="https://ez1-static.yuja.com/Libraries/Pagination.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                                                    <script src="https://ez1-static.yuja.com/Libraries/js-xss/xss.min.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                                                    <script src="https://ez1-static.yuja.com/Libraries/papaparse/papaparse.min.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+
+                                                                                    
+                                                                                    <script src="https://ez1-static.yuja.com/Libraries/jszip.min.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                                                    <script src="https://ez1-static.yuja.com/Libraries/FileSaver/FileSaver.min.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+
+                                                                                    <script type="text/javascript" src="https://ez1-static.yuja.com/Dashboard/Institution/js/notificationManagement/AjaxCalls/AuditTrackingSummaryAjaxCalls.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                                                    <script type="text/javascript" src="https://ez1-static.yuja.com/Dashboard/Institution/js/notificationManagement/Actions/AuditActions.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                                                    <script type="text/javascript" src="https://ez1-static.yuja.com/Dashboard/Institution/js/notificationManagement/Stores/AuditTrackingStores.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                                                    <script type="text/javascript" src="https://ez1-static.yuja.com/Dashboard/Institution/js/notificationManagement/components/AuditSummaryTableComponent.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                                                    <script type="text/javascript" src="https://ez1-static.yuja.com/Dashboard/Institution/js/notificationManagement/components/CardBoardComponent.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                                                    <script type="text/javascript" src="https://ez1-static.yuja.com/Dashboard/Institution/js/notificationManagement/components/AuditSummayComponent.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                                                    <script type="text/javascript" src="https://ez1-static.yuja.com/Dashboard/Institution/js/notificationManagement/Notifications.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+
+                                                                                    
+                                                                                    <script src="https://ez1-static.yuja.com/Dashboard/LiveStream/js/LiveStreamViewingLog.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+                                                                                    
+
+                                                                                    
+                                                                                    <link rel="stylesheet" href="https://ez1-static.yuja.com/Libraries/ajax/libs/animate.css/3.5.2/animate.min.css?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne">
+                                                                                    <link rel="stylesheet" href="https://ez1-static.yuja.com/Libraries/react-simplebar/simplebar.css?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne">
+
+
+
+
+
+
+
+
+
+<link rel="shortcut icon" href="https://ez1-static.yuja.com/Dashboard/icons/favicon1.ico?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne" />
+
+
+<meta http-equiv="X-UA-Compatible" content="IE=edge" />
+<meta content="width=device-width, initial-scale=1.0" name="viewport" />
+<meta content="" name="description" />
+<meta content="" name="author" />
+<meta name="MobileOptimized" content="320" />
+
+
+<link rel="stylesheet" type="text/css" href="https://ez1-static.yuja.com/Libraries/Bootstrap/plugins/font-awesome/css/font-awesome.min.css?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"/>
+<link rel="stylesheet" type="text/css" href="https://ez1-static.yuja.com/Libraries/Bootstrap/plugins/bootstrap/css/bootstrap.css?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"/>
+<link rel="stylesheet" type="text/css" href="https://ez1-static.yuja.com/Libraries/Bootstrap/plugins/uniform/css/uniform.default.css?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"/>
+<link rel="stylesheet" type="text/css" href="https://ez1-static.yuja.com/Libraries/Bootstrap/plugins/bootstrap-toastr/toastr.css?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"/>
+
+
+<link rel="stylesheet" type="text/css" href="https://ez1-static.yuja.com/Libraries/Bootstrap/css/style.css?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"/>
+<link rel="stylesheet" type="text/css" href="https://ez1-static.yuja.com/Libraries/Bootstrap/css/style-metronic.css?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"/>
+<link rel="stylesheet" type="text/css" href="https://ez1-static.yuja.com/Libraries/Bootstrap/css/style-responsive.css?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"/>
+<link rel="stylesheet" type="text/css" href="https://ez1-static.yuja.com/Libraries/Bootstrap/css/plugins.css?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"/>
+<link rel="stylesheet" type="text/css" href="https://ez1-static.yuja.com/Libraries/Bootstrap/css/themes/grey.css?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"/>
+<link rel="stylesheet" type="text/css" href="https://ez1-static.yuja.com/Libraries/Bootstrap/plugins/jquery-ui/jquery-ui-1.10.3.custom.min.css?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne" id="style_color" />
+<link rel="stylesheet" type="text/css" href="https://ez1-static.yuja.com/Libraries/Bootstrap/plugins/select2/select2_metro.css?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne" />
+<link rel="stylesheet" type="text/css" href="https://ez1-static.yuja.com/Libraries/Bootstrap/css/pages/profile.css?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne" />
+
+
+
+<link rel="stylesheet" type="text/css" href="https://ez1-static.yuja.com/Libraries/Bootstrap/css/custom.css?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"/>
+<link href="https://ez1-static.yuja.com/Dashboard/VideoTimestamp/css/VideoTimestamp.css?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne" rel="stylesheet" type="text/css"/>
+<link rel="stylesheet" type="text/css" href="https://ez1-static.yuja.com/Dashboard/Core/css/Dashboard.css?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"/>
+<link rel="stylesheet" type="text/css" href="https://ez1-static.yuja.com/Dashboard/Core/css/select2custom.css?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"/>
+<link rel="stylesheet" type="text/css" href="https://ez1-static.yuja.com/Dashboard/style/MetronicReverse.css?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne" />
+
+
+
+<link rel="stylesheet" href="https://ez1-static.yuja.com/Libraries/Bootstrap/plugins/prettyPhoto/css/prettyPhoto.css?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne" type="text/css" media="screen"/>
+
+<link rel="stylesheet" type="text/css" href="https://ez1-static.yuja.com/Libraries/nvd3/1.8.1/nv.d3.css?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne" />
+<link rel="stylesheet" type="text/css" href="https://ez1-static.yuja.com/Libraries/jquery.slick/1.5.8/slick.css?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></link>
+<link rel="stylesheet" type="text/css" href="https://ez1-static.yuja.com/Libraries/jquery.slick/1.5.8/slick-theme.css?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></link>
+<link rel="stylesheet" type="text/css" href="https://ez1-static.yuja.com/Libraries/jquery.scrollbar/jquery.scrollbar.css?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"/>
+<link rel="stylesheet" type="text/css" href="https://ez1-static.yuja.com/Libraries/jquery.imageWithOverlay/jquery.imageWithOverlay.css?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></link>
+<link rel="stylesheet" type="text/css" href="https://ez1-static.yuja.com/Libraries/jquery.listGridView/jquery.listGridView.css?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></link>
+
+
+<link rel="stylesheet" type="text/css" href="https://ez1-static.yuja.com/Libraries/highlight/prettify.css?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"/>
+
+
+<link rel="stylesheet" type="text/css" href="https://ez1-static.yuja.com/Libraries/drawingboard/drawingboard.css?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"/>
+
+
+<!--<link rel="stylesheet" type="text/css" href="/Libraries/videojs/video-js.css?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne">-->
+
+<link rel="stylesheet" type="text/css" href="https://ez1-static.yuja.com/Dashboard/Polls/style/Polling.css?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne" />
+
+
+<link rel="stylesheet" type="text/css" href="https://ez1-static.yuja.com/Dashboard/style/general.css?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne" id="generalCSS"/>
+<link rel="stylesheet" type="text/css" href="https://ez1-static.yuja.com/Dashboard/style/cornerstyle.css?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne" />
+<link rel="stylesheet" type="text/css" href="https://ez1-static.yuja.com/Dashboard/style/bg.css?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne" />
+<link rel="stylesheet" type="text/css" href="https://ez1-static.yuja.com/Dashboard/style/VideoManagementCommon.css?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne">
+<link rel="stylesheet" type="text/css" href="https://ez1-static.yuja.com/Dashboard/js/TreeNav/styles/PublishModal.css?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne">
+<link rel="stylesheet" type="text/css" href="https://ez1-static.yuja.com/Dashboard/style/modalDialogs.css?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne">
+<link rel="stylesheet" type="text/css" href="https://ez1-static.yuja.com/Dashboard/style/NodeManagementCommon.css?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne">
+<link rel="stylesheet" type="text/css" href="https://ez1-static.yuja.com/Dashboard/style/react-drag-select.css?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne">
+<link rel="stylesheet" type="text/css" href="https://ez1-static.yuja.com/Dashboard/style/addMedia.css?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"/>
+<link rel="stylesheet" type="text/css" href="https://ez1-static.yuja.com/Dashboard/VideoManagement/styles/UploadMedia.css?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"/>
+
+<link rel="stylesheet" type="text/css" href="https://ez1-static.yuja.com/Dashboard/js/Pagination/styles/PageNavigator.css?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"/>
+<link rel="stylesheet" type="text/css" href="https://ez1-static.yuja.com/Libraries/load-awesome/css/ball-spin.css?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"/>
+<link rel="stylesheet" type="text/css" href="https://ez1-static.yuja.com/Dashboard/js/ReactLib/styles/QuizTab.css?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"/>
+<link rel="stylesheet" type="text/css" href="https://ez1-static.yuja.com/Dashboard/js/ReactLib/styles/MediaChooserTopBar.css?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"/>
+<link rel="stylesheet" type="text/css" href="https://ez1-static.yuja.com/Dashboard/LTI/js/styles/MediaChooserModals.css?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"/>
+<link rel="stylesheet" type="text/css" href="https://ez1-static.yuja.com/Dashboard/js/ReactLib/styles/FFMediaChooser.css?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"/>
+<link rel="stylesheet" type="text/css" href="https://ez1-static.yuja.com/Dashboard/js/ReactLib/styles/LoadingSpinner.css?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"/>
+<link rel="stylesheet" type="text/css" href="https://ez1-static.yuja.com/Dashboard/js/ReactLib/styles/MetadataTab.css?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"/>
+<link rel="stylesheet" type="text/css" href="https://ez1-static.yuja.com/Dashboard/Institution/style/auditTrackingStyle.css?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"/>
+<link rel="stylesheet" type="text/css" href="https://ez1-static.yuja.com/Dashboard/js/ReactLib/styles/PlayerTab.css?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"/>
+<link rel="stylesheet" type="text/css" href="https://ez1-static.yuja.com/Dashboard/js/ReactLib/styles/FacialAnalysisTab.css?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"/>
+<link rel="stylesheet" type="text/css" href="https://ez1-static.yuja.com/Dashboard/js/ReactLib/styles/PlaceholderComponents.css?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"/>
+<link rel="stylesheet" type="text/css" href="https://ez1-static.yuja.com/Dashboard/js/ReactLib/styles/ScrollableTable.css?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"/>
+<link rel="stylesheet" type="text/css" href="https://ez1-static.yuja.com/Dashboard/HierarchyNodeManagement/style/Tabs.css?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"/>
+<link rel="stylesheet" type="text/css" href="https://ez1-static.yuja.com/Dashboard/HierarchyNodeManagement/style/NodeExplorer.css?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"/>
+<link rel="stylesheet" type="text/css" href="https://ez1-static.yuja.com/Dashboard/HierarchyNodeManagement/style/NodeSettings.css?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"/>
+<link rel="stylesheet" type="text/css" href="https://ez1-static.yuja.com/Dashboard/js/TableComponents/Table.css?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"/>
+<link rel="stylesheet" type="text/css" href="https://ez1-static.yuja.com/Dashboard/js/TabComponents/style/TabComponents.css?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"/>
+<link rel="stylesheet" type="text/css" href="https://ez1-static.yuja.com/Dashboard/AudioDescription/styles/EnhancedAudioDescriptionModals.css?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"/>
+<link rel="stylesheet" type="text/css" href="https://ez1-static.yuja.com/Dashboard/AudioDescription/styles/AudioDescriptionTab.css?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"/>
+
+<link rel="stylesheet" type="text/css" href="https://ez1-static.yuja.com/Dashboard/style/mediaAuthentication.css?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"/>
+<link rel="stylesheet" type="text/css" href="https://ez1-static.yuja.com/Dashboard/style/yujaYoutubeOverlayStyling.css?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"/>
+
+
+<link rel="stylesheet" type="text/css" href="https://ez1-static.yuja.com/Libraries/jquery.datatables/jquery.dataTables.min.css?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"/> 
+
+
+<link rel="stylesheet" type="text/css" href="/Dashboard/style/Playlist.css?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne">
+
+<script src="/Dashboard/js/ReactLib/LoginDropdown.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+<script src="/Dashboard/js/Playlist.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+<script src="/Dashboard/js/PublicPlaylist.js?v=e360b27166b1c4eea187dd0a1d23f9ee45c27365&tsts=blue-osxck-xcoer3-msgne"></script>
+<script>
+var videoManagement = namespace('com.yuja.videoManagement');
+
+$(document).ready(function()
+{
+	window["addEventListener"]("message",function(e) {
+	    if (e.data.loginCode != null)
+	    {
+	    	ltiSessionManagement.loginWithCodeAndRedirect(e.data.loginCode)
+	    	.then(function(response) {
+	    		videoManagement.loadWatchFolderPublic(true)
+		    });
+	    }
+	},false);
+	videoManagement.loadWatchFolderPublic(false);
+});
+
+</script>
+<title id="folderName"></title>
+</head>
+<body style="background-color: white !important;" data-node="5448718" data-autoplay="0" data-authcode="79940390">
+	<div class="container content spinnerEnabled" id="tab-content" style="padding-left: 0px;">
+	</div>
+</body>
+</html>
