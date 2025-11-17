@@ -87,11 +87,6 @@ class LinkExtractor {
           }
         }
         
-        // If title is generic or empty, extract from URL using the hash pattern
-        if (!title || title.toLowerCase() === 'notion' || title === 'Untitled') {
-          // Mark for URL-based extraction (will be done after evaluate)
-          title = '__EXTRACT_FROM_URL__:' + absoluteUrl;
-        }
         
         // Try to determine the section and subsection
         let section = null;

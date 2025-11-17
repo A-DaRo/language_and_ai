@@ -17,48 +17,6 @@ class ContentExpander {
   }
   
   /**
-   * Expand database views by clicking "Load more" buttons
-   */
-  async _expandDatabases(page) {
-    this.logger.info('DATABASE', 'Looking for database/gallery "Load more" buttons...');
-    let loadMoreClicked = 0;
-    
-    try {
-      while (true) {
-        const clicked = await page.evaluate(() => {
-          const loadMoreButtons = Array.from(document.querySelectorAll('div[role="button"]'))
-            .filter(btn => {
-              const text = btn.textContent.toLowerCase();
-              return text.includes('load more') || 
-                     text.includes('show more') || 
-                     text.includes('view more');
-            });
-          
-          if (loadMoreButtons.length > 0) {
-            loadMoreButtons[0].click();
-            return true;
-          }
-          return false;
-        });
-        
-        if (!clicked) break;
-        
-        loadMoreClicked++;
-        this.logger.info('DATABASE', `Clicked "Load more" button (${loadMoreClicked}). Waiting for content...`);
-        await new Promise(resolve => setTimeout(resolve, this.config.WAIT_AFTER_LOAD_MORE));
-      }
-      
-      if (loadMoreClicked > 0) {
-        this.logger.success('DATABASE', `Expanded ${loadMoreClicked} database views.`);
-      } else {
-        this.logger.info('DATABASE', 'No "Load more" buttons found.');
-      }
-    } catch (error) {
-      this.logger.error('DATABASE', 'Error while expanding databases', error);
-    }
-  }
-  
-  /**
    * Scroll to the bottom of the page to trigger lazy-loading
    */
   async _scrollToBottom(page) {
@@ -82,10 +40,6 @@ class ContentExpander {
     
     this.logger.info('SCROLL', 'Reached bottom of page. Waiting for content to stabilize...');
     await new Promise(resolve => setTimeout(resolve, this.config.WAIT_AFTER_SCROLL));
-    
-    // Scroll back to top
-    await page.evaluate(() => window.scrollTo(0, 0));
-    this.logger.info('SCROLL', 'Scrolled back to top.');
   }
   
   /**
