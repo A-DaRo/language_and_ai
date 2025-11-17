@@ -8,35 +8,22 @@ class LinkExtractor {
   }
   
   /**
-   * Check if a URL is an internal Notion link (relative to the scraping domain)
-   */
-  isInternalLink(url, baseUrl) {
-    try {
-      // Handle relative URLs
-      if (url.startsWith('/')) {
-        return true;
-      }
-      
-      // Parse URLs
-      const urlObj = new URL(url);
-      const baseUrlObj = new URL(baseUrl);
-      
-      // Check if same domain
-      return urlObj.hostname === baseUrlObj.hostname;
-    } catch (error) {
-      return false;
-    }
-  }
-  
-  /**
    * Extract all internal Notion page links with their context
+   * @param {Object} page - Puppeteer page object
+   * @param {string} currentUrl - Current page URL to filter out
+   * @param {string} baseUrl - Optional base URL for composing internal links (defaults to config base URL)
    */
-  async extractLinks(page, currentUrl) {
-    this.logger.info('LINKS', 'Extracting internal Notion page links...');
+  async extractLinks(page, currentUrl, baseUrl = null) {
+    const effectiveBaseUrl = baseUrl || this.config.getBaseUrl();
+    this.logger.info('LINKS', `Extracting internal Notion page links (base: ${effectiveBaseUrl})...`);
     
     const links = await page.evaluate((baseUrl) => {
       const results = [];
       const seenUrls = new Set();
+      
+      // Parse base URL to get hostname for validation
+      const baseUrlObj = new URL(baseUrl);
+      const baseHostname = baseUrlObj.hostname;
       
       // Find all links
       const allLinks = document.querySelectorAll('a[href]');
@@ -44,18 +31,38 @@ class LinkExtractor {
       allLinks.forEach(link => {
         const href = link.getAttribute('href');
         
-        // Skip if not a relative Notion page link
-        if (!href || href.startsWith('http') && !href.includes('notion.site')) {
+        // Skip empty hrefs
+        if (!href) {
           return;
         }
         
         // Convert relative URLs to absolute
         let absoluteUrl;
+        let isInternal = false;
+        
         if (href.startsWith('/')) {
+          // Internal relative link - append to base URL
           absoluteUrl = baseUrl + href;
+          isInternal = true;
         } else if (href.startsWith('http')) {
-          absoluteUrl = href;
+          // Full URL - check if it's same domain
+          try {
+            const hrefObj = new URL(href);
+            isInternal = hrefObj.hostname === baseHostname;
+            absoluteUrl = href;
+          } catch (e) {
+            return; // Invalid URL
+          }
         } else {
+          // Other relative formats (e.g., "./page" or "page")
+          // Treat as internal and append to base URL
+          const normalizedHref = href.startsWith('./') ? href.substring(2) : href;
+          absoluteUrl = baseUrl + (normalizedHref.startsWith('/') ? '' : '/') + normalizedHref;
+          isInternal = true;
+        }
+        
+        // Skip external links
+        if (!isInternal) {
           return;
         }
         
@@ -138,7 +145,7 @@ class LinkExtractor {
       });
       
       return results;
-    }, this.config.getBaseUrl());
+    }, effectiveBaseUrl);
     
     // Filter out the current page
     const filteredLinks = links.filter(link => link.url !== currentUrl);
