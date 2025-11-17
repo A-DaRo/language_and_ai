@@ -50,6 +50,14 @@ class PageScraper {
   }
   
   /**
+   * Check if a URL is already registered in the context map
+   * Used to prevent breadcrumb/navigation links from creating spurious parent-child relationships
+   */
+  isUrlRegistered(url) {
+    return this.urlToContextMap.has(url);
+  }
+  
+  /**
    * Scrape a single page and return its links
    */
   async scrapePage(page, pageContext, isFirstPage = false) {

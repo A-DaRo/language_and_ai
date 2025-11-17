@@ -11,7 +11,6 @@ class ContentExpander {
    * Expand all content on the page
    */
   async expandAll(page) {
-    await this._expandDatabases(page);
     await this._scrollToBottom(page);
     await this._expandToggles(page);
   }
