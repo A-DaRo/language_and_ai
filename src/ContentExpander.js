@@ -97,7 +97,7 @@ class ContentExpander {
     
     let totalExpanded = 0;
     let iteration = 0;
-    const maxIterations = 20; // Prevent infinite loops
+    const maxIterations = 2; // Prevent infinite loops
     
     while (iteration < maxIterations) {
       iteration++;
