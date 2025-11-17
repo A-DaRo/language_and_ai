@@ -14,6 +14,7 @@ A sophisticated, object-oriented Node.js application for recursively scraping No
 - **🍪 Cookie Handling**: Manages cookie consent banners automatically
 - **📊 Structured Logging**: Professional logging with categories and timestamps
 - **⚙️ Configurable Depth**: Control recursion depth and expansion levels
+- **⚡ Parallel Discovery Engine**: Level-synchronous planning powered by `puppeteer-cluster` with adaptive worker counts based on free RAM
 - **🧭 Interactive Discovery Phase**: Plan scrapes with a fast dry run, ASCII tree preview, and depth controls before downloading anything
 
 ## Architecture
@@ -30,6 +31,7 @@ src/
 ├── LinkExtractor.js       # Internal link extraction
 ├── AssetDownloader.js     # Image and asset downloads
 ├── PageScraper.js         # Individual page scraping
+├── StateManager.js        # Global discovery state + level queues
 ├── RecursiveScraper.js    # Recursive scraping orchestration
 └── NotionScraper.js       # Main orchestrator
 ```
@@ -126,9 +128,9 @@ downloaded_course_material/
 ## How It Works
 
 ### Phase 1: Discovery (Dry Run)
-1. **Initialization**: Browser and automation helpers spin up.
-2. **Lightweight Visits**: Each page is opened just long enough to capture the title and internal links—no downloads, no expansions.
-3. **Tree Assembly**: The discovered hierarchy is stored in `PageContext` objects and rendered as an ASCII tree for review.
+1. **Cluster Spin-Up**: `NotionScraper` calculates safe concurrency from available RAM, then launches a `puppeteer-cluster` swarm dedicated to discovery.
+2. **Metadata-Only Visits**: Worker contexts call `PageScraper.discoverPageInfo`, which blocks heavy resources, captures page titles, and extracts internal links without touching assets.
+3. **Concurrency-Safe State Tracking**: The singleton `StateManager` owns the canonical `PageContext` instances, deduplicates URLs, and advances level queues once every worker in the current band finishes.
 4. **Interactive Prompt**: Accept the plan, abort, or type `d`/`deeper` to bump the discovery depth and rebuild the map before continuing.
 
 ### Phase 2: Execution (Scraping)

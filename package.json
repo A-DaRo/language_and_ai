@@ -17,9 +17,10 @@
   "author": "",
   "license": "MIT",
   "dependencies": {
-    "puppeteer": "^21.0.0",
     "axios": "^1.6.0",
-    "jsdom": "^23.0.0"
+    "jsdom": "^23.0.0",
+    "puppeteer": "^24.30.0",
+    "puppeteer-cluster": "^0.25.0"
   },
   "engines": {
     "node": ">=14.0.0"

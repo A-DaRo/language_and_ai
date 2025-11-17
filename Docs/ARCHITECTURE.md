@@ -9,6 +9,7 @@
 ┌─────────────────────────────────────────────────────────────────────────┐
 │  MAIN ORCHESTRATOR: NotionScraper.js                                     │
 │  • Initializes Puppeteer browser                                        │
+│  • Runs parallel discovery via puppeteer-cluster                        │
 │  • Coordinates all components                                           │
 │  • Generates final statistics                                           │
 └─────────────────────────────────────────────────────────────────────────┘
@@ -25,6 +26,36 @@
 │  • Depth limits  │                              │  • [SCRAPE]      │
 │  • Selectors     │                              │  • [LINK-REWRITE]│
 └──────────────────┘                              └──────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────┐
+│  PARALLEL DISCOVERY ENGINE (PHASE 0)                                     │
+└─────────────────────────────────────────────────────────────────────────┘
+
+            NotionScraper.js
+               │   Dynamically calculates maxConcurrency = f(free RAM)
+               │
+               ▼
+    ┌──────────────────────────────┐          ┌──────────────────────────────┐
+    │  puppeteer-cluster Workers   │ ◄──────► │       StateManager.js        │
+    │  • Contextual browser tabs   │          │  • Global PageContext cache  │
+    │  • Calls discoverPageInfo()  │          │  • currentLevelQueue / next  │
+    │  • Blocks heavy resources    │          │  • registerOrLink(child,...) │
+    └──────────────────────────────┘          └──────────────────────────────┘
+                         │                                      │
+                         ▼                                      ▼
+            ┌────────────────────┐                ┌────────────────────────────┐
+            │PageScraper.discover│                │ Interactive CLI Gate       │
+            │• Metadata only     │                │ • ASCII tree output        │
+            │• Link extraction   │                │ • Y / n / d prompt         │
+            └────────────────────┘                │ • --dry-run / --yes flags  │
+                                                                     └────────────────────────────┘
+
+Level-synchronous orchestration:
+1. Bootstrap root PageContext inside StateManager.
+2. Queue every URL in the current band onto the cluster.
+3. Await `cluster.idle()` → workers finish, pushing unique child URLs into `nextLevelQueue`.
+4. `advanceLevel()` swaps queues; repeat until `maxDepth` satisfied.
+5. Render the consolidated tree and wait for user approval before starting the heavyweight execution phase.
 
 ┌─────────────────────────────────────────────────────────────────────────┐
 │  PHASE 1: RECURSIVE SCRAPING                                             │

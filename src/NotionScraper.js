@@ -1,4 +1,6 @@
 const puppeteer = require('puppeteer');
+const { Cluster } = require('puppeteer-cluster');
+const os = require('os');
 const path = require('path');
 const readline = require('readline');
 const Config = require('./Config');
@@ -12,6 +14,7 @@ const FileDownloader = require('./FileDownloader');
 const PageScraper = require('./PageScraper');
 const RecursiveScraper = require('./RecursiveScraper');
 const IntegrityAuditor = require('./IntegrityAuditor');
+const StateManager = require('./StateManager');
 
 /**
  * Main orchestrator for Notion scraping
@@ -23,6 +26,7 @@ class NotionScraper {
     this.browser = null;
     this.page = null;
     this.currentPlan = null;
+    this.stateManager = StateManager.getInstance();
     
     // Initialize components
     this.cookieHandler = new CookieHandler(this.config, this.logger);
@@ -76,8 +80,6 @@ class NotionScraper {
    */
   async run(options = {}) {
     try {
-      await this.initialize();
-
       const runOptions = {
         dryRunOnly: false,
         autoConfirm: false,
@@ -94,7 +96,7 @@ class NotionScraper {
       }
 
       while (true) {
-        this.currentPlan = await this.plan(currentDepth);
+        this.currentPlan = await this._runParallelDiscovery(currentDepth);
         this.displayTree(this.currentPlan.rootContext);
 
         if (runOptions.dryRunOnly) {
@@ -126,6 +128,9 @@ class NotionScraper {
         }
       }
 
+      await this.initialize();
+      this._prepareExecutionPhase(this.currentPlan);
+
       this.logger.info('MAIN', 'User confirmed. Starting Execution Phase...');
       console.log('[MAIN] User confirmed. Starting Execution Phase...');
       const result = await this.recursiveScraper.execute(this.page, this.currentPlan.rootContext);
@@ -145,18 +150,123 @@ class NotionScraper {
     }
   }
 
-  /**
-   * Run discovery-only planning step
-   */
-  async plan(maxDepth) {
+  async _runParallelDiscovery(maxDepth) {
     this.logger.separator('Discovery Phase');
-    const plan = await this.recursiveScraper.discover(
-      this.page,
-      this.config.NOTION_PAGE_URL,
-      maxDepth
-    );
+    const rootContext = this.stateManager.bootstrap(this.config.NOTION_PAGE_URL, 'Main_Page');
+    const { maxConcurrency, freeMemory } = this._calculateClusterConcurrency();
+
+    this.logger.log('MAIN', `System has ${Math.round(freeMemory / (1024 * 1024))}MB free RAM.`);
+    this.logger.log('MAIN', `Launching cluster with max concurrency: ${maxConcurrency}`);
+
+    const cluster = await Cluster.launch({
+      concurrency: Cluster.CONCURRENCY_CONTEXT,
+      maxConcurrency,
+      retryLimit: 2,
+      retryDelay: 1000,
+      timeout: Math.max(this.config.TIMEOUT_PAGE_LOAD, 90000),
+      puppeteerOptions: {
+        headless: true,
+        args: ['--no-sandbox', '--disable-setuid-sandbox']
+      }
+    });
+
+    cluster.on('taskerror', (err, data, willRetry) => {
+      const target = data && data.url ? data.url : 'unknown job';
+      if (willRetry) {
+        logger.warn('DISCOVERY', `Cluster retry scheduled for ${target}: ${err.message}`);
+      } else {
+        logger.error('DISCOVERY', `Cluster job failed permanently for ${target}`, err);
+      }
+    });
+
+    const state = this.stateManager;
+    const logger = this.logger;
+    const pageScraper = this.pageScraper;
+    const config = this.config;
+
+    await cluster.task(async ({ page, data }) => {
+      const { url, depth } = data;
+      const context = state.getContextByUrl(url);
+      if (!context) {
+        logger.warn('DISCOVERY', `Context missing for ${url}. Skipping.`);
+        return;
+      }
+
+      try {
+        const info = await pageScraper.discoverPageInfo(page, url, depth === 0);
+        if (info && info.title) {
+          context.setDisplayTitle(info.title);
+        }
+
+        const canDiscoverChildren = context.depth < maxDepth;
+        if (!canDiscoverChildren) {
+          return;
+        }
+
+        const links = (info && info.links) || [];
+        for (const linkInfo of links) {
+          if (!linkInfo || !linkInfo.url) continue;
+          if (!config.isNotionUrl(linkInfo.url)) continue;
+          const childDepth = context.depth + 1;
+          if (childDepth > maxDepth) continue;
+          state.registerOrLink(linkInfo, context);
+        }
+      } catch (error) {
+        logger.error('DISCOVERY', `Cluster worker failed for ${url}`, error);
+        throw error;
+      }
+    });
+
+    let currentDepth = 0;
+    try {
+      while (state.hasCurrentLevelWork() && currentDepth <= maxDepth) {
+        const levelQueue = state.getCurrentLevelQueue();
+        this.logger.info('DISCOVERY', `Dispatching ${levelQueue.length} page(s) at depth ${currentDepth}.`);
+        for (const url of levelQueue) {
+          const context = state.getContextByUrl(url);
+          if (!context) {
+            this.logger.warn('DISCOVERY', `No context found for queued URL ${url}; skipping.`);
+            continue;
+          }
+          cluster.queue({ url, depth: context.depth });
+        }
+        await cluster.idle();
+        state.advanceLevel();
+        currentDepth += 1;
+      }
+    } finally {
+      await cluster.idle();
+      await cluster.close();
+    }
+
+    const plan = {
+      rootContext,
+      allContexts: state.getAllContexts()
+    };
     this.logger.success('PLAN', `Discovery complete with ${plan.allContexts.length} page(s).`);
     return plan;
+  }
+
+  _calculateClusterConcurrency() {
+    const BYTES_PER_INSTANCE = 1 * 1024 * 1024 * 1024;
+    const OS_RAM_BUFFER = 2 * 1024 * 1024 * 1024;
+    const freeMemory = os.freemem();
+    const availableMemoryForWorkers = Math.max(0, freeMemory - OS_RAM_BUFFER);
+    const rawConcurrency = Math.floor(availableMemoryForWorkers / BYTES_PER_INSTANCE);
+    const maxConcurrency = Math.max(1, rawConcurrency);
+    return { maxConcurrency, freeMemory };
+  }
+
+  _prepareExecutionPhase(plan) {
+    if (!plan || !plan.rootContext) {
+      throw new Error('Cannot start execution without a validated plan.');
+    }
+    const contexts = plan.allContexts || [];
+    this.pageScraper.resetContextMap();
+    contexts.forEach(ctx => {
+      this.pageScraper.registerPageContext(ctx.url, ctx);
+    });
+    this.recursiveScraper.allContexts = contexts;
   }
 
   /**

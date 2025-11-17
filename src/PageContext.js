@@ -152,7 +152,11 @@ class PageContext {
    * Add a child page context
    */
   addChild(childContext) {
-    this.children.push(childContext);
+    if (!childContext) return;
+    const alreadyLinked = this.children.includes(childContext);
+    if (!alreadyLinked) {
+      this.children.push(childContext);
+    }
   }
   
   /**
