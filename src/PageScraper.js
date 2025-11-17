@@ -138,6 +138,10 @@ class PageScraper {
         title = (await page.title()) || 'Untitled';
       }
 
+      // CRITICAL: Expand all content before extracting links
+      // This ensures we discover links hidden in toggles, databases, and lazy-loaded content
+      await this.contentExpander.expandAll(page);
+
       const links = await this.linkExtractor.extractLinks(page, url);
       return { title, links };
     } catch (error) {
