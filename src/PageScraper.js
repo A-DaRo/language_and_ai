@@ -71,11 +71,13 @@ class PageScraper {
         timeout: this.config.TIMEOUT_PAGE_LOAD
       });
 
-      const pageLabel = isFirstPage ? 'root execution' : 'execution';
-      await this.cookieHandler.ensureConsent(page, `${pageLabel}: ${url}`);
-
       const pageTitle = await page.title();
       this.logger.info('SCRAPE', `Page loaded: "${pageTitle}"`);
+
+      // Handle cookie banner only on first page
+      if (isFirstPage) {
+        await this.cookieHandler.handle(page);
+      }
       
       // Expand all content
       await this.contentExpander.expandAll(page);
@@ -111,30 +113,23 @@ class PageScraper {
    * Lightweight metadata fetch used during discovery
    */
   async discoverPageInfo(page, url, isFirstPage = false) {
-    let cleanup = null;
     try {
       this.logger.info('DISCOVERY', `Scanning page metadata: ${url}`);
-      cleanup = await this._enableDiscoveryRequestBlocking(page);
-
       await page.goto(url, {
-        waitUntil: 'networkidle2',
+        waitUntil: 'domcontentloaded',
         timeout: this.config.TIMEOUT_PAGE_LOAD
       });
-      this.logger.debug('DISCOVERY', `Navigation complete for ${url}`);
 
-      const pageLabel = isFirstPage ? 'root discovery' : 'discovery';
-      await this.cookieHandler.ensureConsent(page, `${pageLabel}: ${url}`);
+      if (isFirstPage) {
+        await this.cookieHandler.handle(page);
+      }
 
       let title = null;
       try {
         await page.waitForSelector('.notion-frame .notion-page-title-icon-and-text', {
           timeout: this.config.TIMEOUT_NAVIGATION
         });
-        this.logger.debug('DISCOVERY', `Title selector resolved for ${url}`);
-        title = await page.$eval(
-          '.notion-frame .notion-page-title-icon-and-text',
-          el => el.innerText.trim()
-        );
+        title = await page.$eval('.notion-frame .notion-page-title-icon-and-text', el => el.innerText.trim());  
       } catch (err) {
         this.logger.debug('DISCOVERY', `Fallback title strategy for ${url}: ${err.message}`);
       }
@@ -142,19 +137,12 @@ class PageScraper {
       if (!title) {
         title = (await page.title()) || 'Untitled';
       }
-      this.logger.debug('DISCOVERY', `Resolved title for ${url}: ${title}`);
 
-      this.logger.debug('DISCOVERY', `Extracting links for ${url}`);
       const links = await this.linkExtractor.extractLinks(page, url);
-      this.logger.debug('DISCOVERY', `Extracted ${links.length} link(s) for ${url}`);
       return { title, links };
     } catch (error) {
       this.logger.error('DISCOVERY', `Failed to discover page info for ${url}`, error);
-      throw error;
-    } finally {
-      if (cleanup) {
-        await cleanup();
-      }
+      return { title: 'Unavailable', links: [] };
     }
   }
   
@@ -286,40 +274,6 @@ class PageScraper {
       pagesScraped: this.visitedUrls.size
     };
   }
-
-  async _enableDiscoveryRequestBlocking(page) {
-    const blockedResources = new Set(['image', 'media', 'font', 'stylesheet']);
-    let interceptionEnabled = false;
-
-    try {
-      await page.setRequestInterception(true);
-      interceptionEnabled = true;
-    } catch (error) {
-      this.logger.warn('DISCOVERY', `Unable to enable request interception: ${error.message}`);
-    }
-
-    const handleRequest = request => {
-      if (blockedResources.has(request.resourceType())) {
-        request.abort();
-      } else {
-        request.continue();
-      }
-    };
-
-    page.on('request', handleRequest);
-
-    return async () => {
-      page.off('request', handleRequest);
-      if (interceptionEnabled) {
-        try {
-          await page.setRequestInterception(false);
-        } catch (error) {
-          this.logger.warn('DISCOVERY', `Unable to disable request interception: ${error.message}`);
-        }
-      }
-    };
-  }
-
 }
 
 module.exports = PageScraper;

@@ -27,6 +27,7 @@ class Config {
     this.CLUSTER_RETRY_LIMIT = 3;
     this.CLUSTER_RETRY_DELAY = 1500;
     this.CLUSTER_TASK_TIMEOUT = Math.max(this.TIMEOUT_PAGE_LOAD, 90000);
+    this.ENABLE_PARALLEL_DISCOVERY = true;
     
     // Notion URL patterns
     this.NOTION_DOMAIN_PATTERN = /^https?:\/\/[^\/]*notion\.site/;

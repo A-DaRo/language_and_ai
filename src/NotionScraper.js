@@ -31,6 +31,7 @@ class NotionScraper {
     this.clusterTaskRegistered = false;
     this.clusterEventsBound = false;
     this.currentDiscoveryDepthLimit = this.config.MAX_RECURSION_DEPTH;
+    this.cookieHandledInCluster = false;
     
     // Initialize components
     this.cookieHandler = new CookieHandler(this.config, this.logger);
@@ -84,6 +85,8 @@ class NotionScraper {
    */
   async run(options = {}) {
     try {
+      await this.initialize();
+
       const runOptions = {
         dryRunOnly: false,
         autoConfirm: false,
@@ -100,7 +103,7 @@ class NotionScraper {
       }
 
       while (true) {
-        this.currentPlan = await this._runParallelDiscovery(currentDepth);
+        this.currentPlan = await this.plan(currentDepth);
         this.displayTree(this.currentPlan.rootContext);
 
         if (runOptions.dryRunOnly) {
@@ -132,7 +135,6 @@ class NotionScraper {
         }
       }
 
-      await this.initialize();
       this._prepareExecutionPhase(this.currentPlan);
 
       this.logger.info('MAIN', 'User confirmed. Starting Execution Phase...');
@@ -154,13 +156,29 @@ class NotionScraper {
     }
   }
 
-  async _runParallelDiscovery(maxDepth) {
+  async plan(maxDepth) {
     this.logger.separator('Discovery Phase');
+    if (!this.config.ENABLE_PARALLEL_DISCOVERY) {
+      const plan = await this.recursiveScraper.discover(
+        this.page,
+        this.config.NOTION_PAGE_URL,
+        maxDepth
+      );
+      this.logger.success('PLAN', `Discovery complete with ${plan.allContexts.length} page(s).`);
+      return plan;
+    }
+    return this._runParallelDiscovery(maxDepth);
+  }
+
+  async _runParallelDiscovery(maxDepth) {
     const rootContext = this.stateManager.bootstrap(this.config.NOTION_PAGE_URL, 'Main_Page');
     this.currentDiscoveryDepthLimit = maxDepth;
 
     const cluster = await this._getOrCreateCluster();
     const state = this.stateManager;
+
+    // Track if we've processed the root page for cookie handling
+    this.cookieHandledInCluster = false;
 
     let currentDepth = 0;
     await cluster.idle();
@@ -198,7 +216,7 @@ class NotionScraper {
     this.logger.log('MAIN', `Launching cluster with max concurrency: ${maxConcurrency}`);
 
     this.discoveryCluster = await Cluster.launch({
-      concurrency: Cluster.CONCURRENCY_CONTEXT,
+      concurrency: Cluster.CONCURRENCY_PAGE,
       maxConcurrency,
       retryLimit: this.config.CLUSTER_RETRY_LIMIT,
       retryDelay: this.config.CLUSTER_RETRY_DELAY,
@@ -250,7 +268,14 @@ class NotionScraper {
       }
 
       try {
-        const info = await this.pageScraper.discoverPageInfo(page, url, context.depth === 0);
+        // With CONCURRENCY_PAGE, cookies are shared across all workers
+        // Only handle cookies on the very first page (depth 0)
+        const isFirstPage = context.depth === 0 && !this.cookieHandledInCluster;
+        if (isFirstPage) {
+          this.cookieHandledInCluster = true;
+        }
+        
+        const info = await this.pageScraper.discoverPageInfo(page, url, isFirstPage);
         if (info && info.title) {
           context.setDisplayTitle(info.title);
         }
