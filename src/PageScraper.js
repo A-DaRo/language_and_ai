@@ -66,18 +66,16 @@ class PageScraper {
     
     try {
       // Navigate to the page
-      await page.goto(url, { 
-        waitUntil: 'networkidle0', 
-        timeout: this.config.TIMEOUT_PAGE_LOAD 
+      await page.goto(url, {
+        waitUntil: 'networkidle0',
+        timeout: this.config.TIMEOUT_PAGE_LOAD
       });
-      
+
+      const pageLabel = isFirstPage ? 'root execution' : 'execution';
+      await this.cookieHandler.ensureConsent(page, `${pageLabel}: ${url}`);
+
       const pageTitle = await page.title();
       this.logger.info('SCRAPE', `Page loaded: "${pageTitle}"`);
-      
-      // Handle cookie banner only on first page
-      if (isFirstPage) {
-        await this.cookieHandler.handle(page);
-      }
       
       // Expand all content
       await this.contentExpander.expandAll(page);
@@ -124,9 +122,8 @@ class PageScraper {
       });
       this.logger.debug('DISCOVERY', `Navigation complete for ${url}`);
 
-      if (isFirstPage) {
-        await this.cookieHandler.handle(page);
-      }
+      const pageLabel = isFirstPage ? 'root discovery' : 'discovery';
+      await this.cookieHandler.ensureConsent(page, `${pageLabel}: ${url}`);
 
       let title = null;
       try {

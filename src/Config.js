@@ -21,6 +21,12 @@ class Config {
     this.WAIT_AFTER_SCROLL = 2000;
     this.SCROLL_DISTANCE = 100;
     this.SCROLL_INTERVAL = 100;
+    this.COOKIE_MAX_RETRIES = 2;
+    this.COOKIE_RETRY_DELAY = 750;
+    this.COOKIE_HANDLE_ALL_PAGES = true;
+    this.CLUSTER_RETRY_LIMIT = 3;
+    this.CLUSTER_RETRY_DELAY = 1500;
+    this.CLUSTER_TASK_TIMEOUT = Math.max(this.TIMEOUT_PAGE_LOAD, 90000);
     
     // Notion URL patterns
     this.NOTION_DOMAIN_PATTERN = /^https?:\/\/[^\/]*notion\.site/;

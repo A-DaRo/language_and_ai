@@ -27,6 +27,10 @@ class NotionScraper {
     this.page = null;
     this.currentPlan = null;
     this.stateManager = StateManager.getInstance();
+    this.discoveryCluster = null;
+    this.clusterTaskRegistered = false;
+    this.clusterEventsBound = false;
+    this.currentDiscoveryDepthLimit = this.config.MAX_RECURSION_DEPTH;
     
     // Initialize components
     this.cookieHandler = new CookieHandler(this.config, this.logger);
@@ -153,90 +157,27 @@ class NotionScraper {
   async _runParallelDiscovery(maxDepth) {
     this.logger.separator('Discovery Phase');
     const rootContext = this.stateManager.bootstrap(this.config.NOTION_PAGE_URL, 'Main_Page');
-    const { maxConcurrency, freeMemory } = this._calculateClusterConcurrency();
+    this.currentDiscoveryDepthLimit = maxDepth;
 
-    this.logger.log('MAIN', `System has ${Math.round(freeMemory / (1024 * 1024))}MB free RAM.`);
-    this.logger.log('MAIN', `Launching cluster with max concurrency: ${maxConcurrency}`);
-
-    const cluster = await Cluster.launch({
-      concurrency: Cluster.CONCURRENCY_CONTEXT,
-      maxConcurrency,
-      retryLimit: 2,
-      retryDelay: 1000,
-      timeout: Math.max(this.config.TIMEOUT_PAGE_LOAD, 90000),
-      puppeteerOptions: {
-        headless: true,
-        args: ['--no-sandbox', '--disable-setuid-sandbox']
-      }
-    });
-
-    cluster.on('taskerror', (err, data, willRetry) => {
-      const target = data && data.url ? data.url : 'unknown job';
-      if (willRetry) {
-        logger.warn('DISCOVERY', `Cluster retry scheduled for ${target}: ${err.message}`);
-      } else {
-        logger.error('DISCOVERY', `Cluster job failed permanently for ${target}`, err);
-      }
-    });
-
+    const cluster = await this._getOrCreateCluster();
     const state = this.stateManager;
-    const logger = this.logger;
-    const pageScraper = this.pageScraper;
-    const config = this.config;
-
-    await cluster.task(async ({ page, data }) => {
-      const { url, depth } = data;
-      const context = state.getContextByUrl(url);
-      if (!context) {
-        logger.warn('DISCOVERY', `Context missing for ${url}. Skipping.`);
-        return;
-      }
-
-      try {
-        const info = await pageScraper.discoverPageInfo(page, url, depth === 0);
-        if (info && info.title) {
-          context.setDisplayTitle(info.title);
-        }
-
-        const canDiscoverChildren = context.depth < maxDepth;
-        if (!canDiscoverChildren) {
-          return;
-        }
-
-        const links = (info && info.links) || [];
-        for (const linkInfo of links) {
-          if (!linkInfo || !linkInfo.url) continue;
-          if (!config.isNotionUrl(linkInfo.url)) continue;
-          const childDepth = context.depth + 1;
-          if (childDepth > maxDepth) continue;
-          state.registerOrLink(linkInfo, context);
-        }
-      } catch (error) {
-        logger.error('DISCOVERY', `Cluster worker failed for ${url}`, error);
-        throw error;
-      }
-    });
 
     let currentDepth = 0;
-    try {
-      while (state.hasCurrentLevelWork() && currentDepth <= maxDepth) {
-        const levelQueue = state.getCurrentLevelQueue();
-        this.logger.info('DISCOVERY', `Dispatching ${levelQueue.length} page(s) at depth ${currentDepth}.`);
-        for (const url of levelQueue) {
-          const context = state.getContextByUrl(url);
-          if (!context) {
-            this.logger.warn('DISCOVERY', `No context found for queued URL ${url}; skipping.`);
-            continue;
-          }
-          cluster.queue({ url, depth: context.depth });
+    await cluster.idle();
+    while (state.hasCurrentLevelWork() && currentDepth <= maxDepth) {
+      const levelQueue = state.getCurrentLevelQueue();
+      this.logger.info('DISCOVERY', `Dispatching ${levelQueue.length} page(s) at depth ${currentDepth}.`);
+      for (const url of levelQueue) {
+        const context = state.getContextByUrl(url);
+        if (!context) {
+          this.logger.warn('DISCOVERY', `No context found for queued URL ${url}; skipping.`);
+          continue;
         }
-        await cluster.idle();
-        state.advanceLevel();
-        currentDepth += 1;
+        cluster.queue({ url, depth: context.depth });
       }
-    } finally {
       await cluster.idle();
-      await cluster.close();
+      state.advanceLevel();
+      currentDepth += 1;
     }
 
     const plan = {
@@ -245,6 +186,96 @@ class NotionScraper {
     };
     this.logger.success('PLAN', `Discovery complete with ${plan.allContexts.length} page(s).`);
     return plan;
+  }
+
+  async _getOrCreateCluster() {
+    if (this.discoveryCluster) {
+      return this.discoveryCluster;
+    }
+
+    const { maxConcurrency, freeMemory } = this._calculateClusterConcurrency();
+    this.logger.log('MAIN', `System has ${Math.round(freeMemory / (1024 * 1024))}MB free RAM.`);
+    this.logger.log('MAIN', `Launching cluster with max concurrency: ${maxConcurrency}`);
+
+    this.discoveryCluster = await Cluster.launch({
+      concurrency: Cluster.CONCURRENCY_CONTEXT,
+      maxConcurrency,
+      retryLimit: this.config.CLUSTER_RETRY_LIMIT,
+      retryDelay: this.config.CLUSTER_RETRY_DELAY,
+      timeout: this.config.CLUSTER_TASK_TIMEOUT,
+      puppeteerOptions: {
+        headless: true,
+        args: ['--no-sandbox', '--disable-setuid-sandbox']
+      }
+    });
+
+    this._bindClusterEvents(this.discoveryCluster);
+    await this._registerClusterTask(this.discoveryCluster);
+    return this.discoveryCluster;
+  }
+
+  _bindClusterEvents(cluster) {
+    if (this.clusterEventsBound) {
+      return;
+    }
+
+    cluster.on('taskerror', (err, data, willRetry) => {
+      const target = data && data.url ? data.url : 'unknown job';
+      if (willRetry) {
+        this.logger.warn('DISCOVERY', `Cluster retry scheduled for ${target}: ${err.message}`);
+      } else {
+        this.logger.error('DISCOVERY', `Cluster job failed permanently for ${target}`, err);
+      }
+    });
+
+    this.clusterEventsBound = true;
+  }
+
+  async _registerClusterTask(cluster) {
+    if (this.clusterTaskRegistered) {
+      return;
+    }
+
+    await cluster.task(async ({ page, data }) => {
+      const url = data && data.url ? data.url : null;
+      if (!url) {
+        this.logger.warn('DISCOVERY', 'Cluster task missing URL payload. Skipping.');
+        return;
+      }
+
+      const context = this.stateManager.getContextByUrl(url);
+      if (!context) {
+        this.logger.warn('DISCOVERY', `Context missing for ${url}. Skipping.`);
+        return;
+      }
+
+      try {
+        const info = await this.pageScraper.discoverPageInfo(page, url, context.depth === 0);
+        if (info && info.title) {
+          context.setDisplayTitle(info.title);
+        }
+
+        const maxDepth = this.currentDiscoveryDepthLimit;
+        const canDiscoverChildren = context.depth < maxDepth;
+        if (!canDiscoverChildren) {
+          return;
+        }
+
+        const links = (info && info.links) || [];
+        for (const linkInfo of links) {
+          if (!linkInfo || !linkInfo.url) continue;
+          if (!this.config.isNotionUrl(linkInfo.url)) continue;
+          const childDepth = context.depth + 1;
+          if (childDepth > maxDepth) continue;
+          this.stateManager.registerOrLink(linkInfo, context);
+        }
+      } catch (error) {
+        this.logger.error('DISCOVERY', `Cluster worker failed for ${url}`, error);
+        throw error;
+      }
+    });
+
+    this.clusterTaskRegistered = true;
   }
 
   _calculateClusterConcurrency() {
@@ -389,6 +420,19 @@ class NotionScraper {
     if (this.browser) {
       await this.browser.close();
       this.logger.success('MAIN', 'Browser closed');
+    }
+
+    if (this.discoveryCluster) {
+      try {
+        await this.discoveryCluster.idle();
+      } catch (error) {
+        this.logger.warn('MAIN', `Cluster idle check failed during cleanup: ${error.message}`);
+      }
+      await this.discoveryCluster.close();
+      this.discoveryCluster = null;
+      this.clusterTaskRegistered = false;
+      this.clusterEventsBound = false;
+      this.logger.success('MAIN', 'Discovery cluster closed');
     }
   }
 }
