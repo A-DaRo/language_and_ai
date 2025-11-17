@@ -342,20 +342,32 @@ class NotionScraper {
       return;
     }
     console.log(`└─ ${rootLabel}`);
+    const visited = new Set();
+    if (rootContext.url) visited.add(rootContext.url);
     rootChildren.forEach((child, index) => {
       const isLast = index === rootChildren.length - 1;
-      this._printTreeNode(child, '   ', isLast);
+      this._printTreeNode(child, '   ', isLast, visited);
     });
   }
 
-  _printTreeNode(context, prefix, isLast) {
+  _printTreeNode(context, prefix, isLast, visited) {
+    // Prevent infinite recursion from circular references
+    if (context.url && visited.has(context.url)) {
+      const connector = isLast ? '└─ ' : '├─ ';
+      const title = context.displayTitle || context.title || 'Untitled';
+      console.log(`${prefix}${connector} ${title} [already visited]`);
+      return;
+    }
+    
+    if (context.url) visited.add(context.url);
+    
     const connector = isLast ? '└─ ' : '├─ ';
     const title = context.displayTitle || context.title || 'Untitled';
     console.log(`${prefix}${connector} ${title}`);
     const childPrefix = prefix + (isLast ? '   ' : '│  ');
     context.children.forEach((child, index) => {
       const childIsLast = index === context.children.length - 1;
-      this._printTreeNode(child, childPrefix, childIsLast);
+      this._printTreeNode(child, childPrefix, childIsLast, visited);
     });
   }
 
