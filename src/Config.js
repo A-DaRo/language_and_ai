@@ -59,6 +59,51 @@ class Config {
   isNotionUrl(url) {
     return this.NOTION_DOMAIN_PATTERN.test(url);
   }
+  
+  /**
+   * Extract page name from Notion URL
+   * Notion URLs follow pattern: /Page-Name-29d979eeca9f81469905f51d65beefae
+   * The -[32-char-hex] suffix is always present and serves as a reliable delimiter
+   * @param {string} url - Full Notion URL
+   * @returns {string} Extracted page name or 'Untitled'
+   */
+  extractPageNameFromUrl(url) {
+    try {
+      const urlObj = new URL(url);
+      const pathname = urlObj.pathname;
+      
+      // Remove leading/trailing slashes
+      const cleanPath = pathname.replace(/^\/+|\/+$/g, '');
+      
+      // Match the pattern: everything before -[32 hex chars]
+      // Notion page IDs are exactly 32 characters (no hyphens in the ID itself)
+      const match = cleanPath.match(/^(.+?)(?:-[a-f0-9]{32})$/i);
+      
+      if (match && match[1]) {
+        // Replace URL hyphens with spaces for readability
+        return match[1]
+          .replace(/-/g, ' ')
+          .replace(/%20/g, ' ')
+          .trim();
+      }
+      
+      // Fallback: use the last segment before any hash
+      const segments = cleanPath.split('/');
+      const lastSegment = segments[segments.length - 1];
+      
+      if (lastSegment) {
+        return lastSegment
+          .replace(/-[a-f0-9]{32}$/i, '') // Remove hash if present
+          .replace(/-/g, ' ')
+          .replace(/%20/g, ' ')
+          .trim();
+      }
+      
+      return 'Untitled';
+    } catch (e) {
+      return 'Untitled';
+    }
+  }
 }
 
 module.exports = Config;

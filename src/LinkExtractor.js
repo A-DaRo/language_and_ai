@@ -87,6 +87,12 @@ class LinkExtractor {
           }
         }
         
+        // If title is generic or empty, extract from URL using the hash pattern
+        if (!title || title.toLowerCase() === 'notion' || title === 'Untitled') {
+          // Mark for URL-based extraction (will be done after evaluate)
+          title = '__EXTRACT_FROM_URL__:' + absoluteUrl;
+        }
+        
         // Try to determine the section and subsection
         let section = null;
         let subsection = null;
@@ -146,6 +152,15 @@ class LinkExtractor {
       
       return results;
     }, effectiveBaseUrl);
+    
+    // Post-process: extract titles from URLs where needed
+    for (const link of links) {
+      if (link.title && link.title.startsWith('__EXTRACT_FROM_URL__:')) {
+        const url = link.title.substring('__EXTRACT_FROM_URL__:'.length);
+        link.title = this.config.extractPageNameFromUrl(url);
+        this.logger.info('LINKS', `Extracted title from URL: "${link.title}"`);
+      }
+    }
     
     // Filter out the current page
     const filteredLinks = links.filter(link => link.url !== currentUrl);
