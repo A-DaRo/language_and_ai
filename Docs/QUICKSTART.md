@@ -12,7 +12,7 @@ npm install puppeteer axios jsdom
 
 ## Configuration
 
-Edit `src/Config.js` to set your target Notion page:
+Edit `src/core/Config.js` to set your target Notion page:
 
 ```javascript
 this.NOTION_PAGE_URL = 'https://your-notion-site-url-here';
@@ -27,45 +27,62 @@ this.MAX_EXPANSION_DEPTH = 3;   // How deep to expand toggles
 # Start scraping
 npm start
 
-# Or with Node directly
-node main.js
+# Or directly
+node main-cluster.js
 
-# Discovery-only planning
-node main.js --dry-run
+# With custom depth
+node main-cluster.js --max-depth 3
 
-# Auto-confirm after planning
-node main.js --yes
+# Show help
+node main-cluster.js --help
+```
 
-# Start the dry run at a specific depth
-node main.js --max-depth 3
+**System Requirements:**
+- 4GB+ RAM recommended for optimal performance
+- Each worker requires ~1GB RAM
+- Worker count auto-scales based on available memory
 
-# Enable debug logging
-DEBUG=1 node main.js
+### Testing
+
+```bash
+# Run full integration test suite
+npm test
+
+# Run specific tests
+node tests/test-integration.js      # Full workflow test
+node tests/test-worker-crash.js     # Crash recovery test
+node tests/test-cookie-propagation.js  # Cookie handling test
 ```
 
 ## What Happens
 
-1. **Discovery (Dry Run)** (fast)
-   - Visits each page just long enough to capture the title + internal links
-   - Builds an in-memory tree and prints an ASCII plan to the terminal
-   - Lets you inspect or request a deeper crawl *before* any heavy work starts
+The scraper executes in **5 distinct phases**:
 
-2. **Interactive Prompt** (optional)
-   - Enter `Y`/`yes` to continue, `n`/`no` to abort, or `d`/`deeper` to bump depth by one level and rebuild the plan
+### 1. Bootstrap Phase (10-15 seconds)
+- Spawns initial worker for cookie capture
+- Spawns remaining workers based on system capacity
+- Broadcasts authentication cookies to all workers
 
-3. **Content Expansion** (10-30 seconds per page once execution begins)
-   - Clicks "Load more" buttons in databases
-   - Scrolls to trigger lazy-loading
-   - Expands all toggle blocks
+### 2. Discovery Phase (parallel, fast)
+- Multiple workers discover pages simultaneously
+- Extracts metadata, titles, and links only (no heavy assets)
+- Builds complete PageContext tree
 
-4. **Recursive Scraping** (varies by site size)
-   - Follows the confirmed plan only—no redundant rediscovery
-   - Creates nested folder structure
-   - Downloads all images and assets
+### 3. Conflict Resolution (5-10 seconds)
+- Detects duplicate pages (same URL referenced multiple times)
+- Selects canonical version for each unique page
+- Generates link rewrite map for download phase
 
-5. **Link Rewriting & Auditing** (5-10 seconds per page)
-   - Parses saved HTML files and rewrites internal links to relative paths
-   - Runs the integrity auditor to catch missing assets or residual URLs
+### 4. Download Phase (parallel, varies by site size)
+- Multiple workers download unique pages simultaneously
+- Full scraping with assets (images, CSS, files)
+- Link rewriting using the map from phase 3
+- Workers write files directly to disk
+
+### 5. Complete Phase (instant)
+- Statistics reporting
+- Resource cleanup
+- All workers gracefully terminated
 
 ## Expected Output
 
@@ -120,16 +137,21 @@ npm install jsdom
 ```
 
 ### "Page load timeout"
-Increase timeout in `src/Config.js`:
+Increase timeout in `src/core/Config.js`:
 ```javascript
 this.TIMEOUT_PAGE_LOAD = 120000; // 2 minutes
 ```
 
-### "Too many open files"
-Reduce recursion depth in `src/Config.js`:
+### "Too many open files" or "Out of memory"
+Reduce recursion depth in `src/core/Config.js`:
 ```javascript
 this.MAX_RECURSION_DEPTH = 3;
 ```
+
+Or manually limit worker count by editing `src/cluster/BrowserInitializer.js`.
+
+### Workers not spawning
+Check system resources. Each worker needs ~1GB RAM. If system has <4GB, workers may be limited.
 
 ### Images not downloading
 Check the console for `[DOWNLOAD] ERROR` messages. The scraper will retry up to 3 times automatically.
@@ -142,40 +164,45 @@ Check that link rewriting completed:
 
 ## Performance Tips
 
-- **Large sites**: Set `MAX_RECURSION_DEPTH = 3` initially, then increase if needed
-- **Slow internet**: Increase timeouts in `Config.js`
-- **Debug issues**: Run with `DEBUG=1` for detailed logs
+- **Large sites**: Set `MAX_RECURSION_DEPTH = 3` initially in `src/core/Config.js`
+- **Slow internet**: Increase timeouts in `src/core/Config.js`
+- **Limited RAM**: System auto-scales workers, but you can manually limit in `BrowserInitializer.js`
+- **Monitor resources**: Use Task Manager/Activity Monitor to watch memory usage during scraping
 
 ## Example Session
 
 ```
 [14:30:00] [MAIN] ========================================
-[14:30:00] [MAIN] Starting Notion page download process
+[14:30:00] [MAIN] Initializing Cluster Mode
 [14:30:00] [MAIN] ========================================
-[14:30:05] [COOKIE] Cookie banner detected.
-[14:30:07] [COOKIE] Page reloaded successfully.
-[14:30:10] [DATABASE] No "Load more" buttons found.
-[14:30:15] [TOGGLE] Expanded 5 toggles at this depth.
-[14:30:20] [LINKS] Found 12 internal page links.
-[14:30:25] [IMAGE] Downloaded 8/8 assets and rewritten paths.
-[14:30:27] [SCRAPE] Saved HTML to: downloaded_course_material/Main_Page/index.html
-...
-[14:32:00] [LINK-REWRITE] Rewrote 8 links in Introduction
-[14:32:05] [LINK-REWRITE] Total internal links rewritten: 47
-[14:32:05] [STATS] Total pages scraped: 13
-[14:32:05] [STATS] Total assets downloaded: 89
-[14:32:05] [STATS] Total internal links rewritten: 47
-[14:32:05] [STATS] Total time elapsed: 2m 5s
-[14:32:05] [STATS] 
-[14:32:05] [STATS] The downloaded site is now fully browsable offline!
-[14:32:05] [STATS] Open downloaded_course_material/Main_Page/index.html in your browser.
+[14:30:02] [BOOTSTRAP] Spawning initial worker for cookie capture...
+[14:30:05] [WORKER] Worker 1 ready
+[14:30:06] [COOKIES] Captured 3 authentication cookies
+[14:30:07] [BOOTSTRAP] Spawning 3 additional workers...
+[14:30:10] [WORKER] Worker 2 ready
+[14:30:10] [WORKER] Worker 3 ready
+[14:30:11] [WORKER] Worker 4 ready
+[14:30:11] [COOKIES] Broadcast cookies to 4 workers
+[14:30:12] [DISCOVERY] Starting parallel discovery phase...
+[14:30:45] [DISCOVERY] Discovered 47 pages
+[14:30:46] [CONFLICT] Resolving duplicates... found 5 duplicates
+[14:30:46] [CONFLICT] Generated rewrite map for 42 unique pages
+[14:30:47] [DOWNLOAD] Starting parallel download phase...
+[14:32:30] [DOWNLOAD] Completed 42/42 pages
+[14:32:31] [STATS] Total pages scraped: 42
+[14:32:31] [STATS] Total assets downloaded: 215
+[14:32:31] [STATS] Total internal links rewritten: 138
+[14:32:31] [STATS] Total time elapsed: 2m 31s
+[14:32:31] [STATS] 
+[14:32:31] [STATS] The downloaded site is now fully browsable offline!
+[14:32:31] [STATS] Open downloaded_course_material/Main_Page/index.html in your browser.
 ```
 
 ## Need Help?
 
 Check these files:
-- `README.md` - Full documentation
-- `ENHANCEMENTS.md` - Technical details of recent improvements
-- `src/Config.js` - All configuration options
+- `Docs/README.md` - Full documentation
+- `Docs/CLUSTER_MODE.md` - Detailed cluster architecture
+- `src/core/Config.js` - All configuration options
 
 Happy scraping! 🚀

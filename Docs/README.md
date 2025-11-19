@@ -14,27 +14,41 @@ A sophisticated, object-oriented Node.js application for recursively scraping No
 - **🍪 Cookie Handling**: Manages cookie consent banners automatically
 - **📊 Structured Logging**: Professional logging with categories and timestamps
 - **⚙️ Configurable Depth**: Control recursion depth and expansion levels
-- **⚡ Parallel Discovery Engine**: Level-synchronous planning powered by `puppeteer-cluster` with adaptive worker counts based on free RAM
-- **🧭 Interactive Discovery Phase**: Plan scrapes with a fast dry run, ASCII tree preview, and depth controls before downloading anything
+- **⚡ Distributed Architecture**: Micro-kernel design with Master-Worker processes for scalable parallel scraping
+- **🛡️ Fault Tolerance**: Worker isolation ensures system stability even when individual processes crash
 
 ## Architecture
 
-The application follows object-oriented principles with clear separation of concerns:
+The application uses a **Micro-Kernel architecture** with distributed Master-Worker processes:
 
 ```
 src/
-├── Config.js              # Configuration management
-├── Logger.js              # Structured logging utility
-├── PageContext.js         # Page hierarchy context
-├── CookieHandler.js       # Cookie banner handling
-├── ContentExpander.js     # Toggle and database expansion
-├── LinkExtractor.js       # Internal link extraction
-├── AssetDownloader.js     # Image and asset downloads
-├── PageScraper.js         # Individual page scraping
-├── StateManager.js        # Global discovery state + level queues
-├── RecursiveScraper.js    # Recursive scraping orchestration
-└── NotionScraper.js       # Main orchestrator
+├── core/
+│   ├── Config.js                    # Configuration
+│   ├── Logger.js                    # Logging
+│   ├── ProtocolDefinitions.js       # IPC protocol
+│   └── SystemEventBus.js            # Event coordination
+├── domain/
+│   └── PageContext.js               # Serializable page context
+├── worker/
+│   ├── WorkerEntrypoint.js          # Worker process entry
+│   └── TaskRunner.js                # IPC command router
+├── cluster/
+│   ├── BrowserManager.js            # Worker pool manager
+│   ├── BrowserInitializer.js        # Worker spawning
+│   └── WorkerProxy.js               # Master-side worker handle
+├── orchestration/
+│   ├── ClusterOrchestrator.js       # Main state machine
+│   ├── GlobalQueueManager.js        # Task queues
+│   └── analysis/
+│       └── ConflictResolver.js      # Duplicate detection
+└── [processing/download/scraping]   # Reused by workers
+
+main-cluster.js                      # Application entry point
+tests/                               # Test suite
 ```
+
+See `Docs/CLUSTER_MODE.md` for detailed architecture documentation.
 
 ## Installation
 
@@ -49,43 +63,46 @@ npm install puppeteer axios jsdom
 ### Basic Usage
 
 ```bash
-node main.js
+# Run with default settings
+npm start
+
+# Or directly
+node main-cluster.js
+
+# With custom depth
+node main-cluster.js --max-depth 3
+
+# Show help
+node main-cluster.js --help
 ```
 
-This launches the full two-phase workflow:
+### Features
 
-1. **Discovery (Dry Run)** quickly maps the entire reachable Notion space.
-2. The resulting hierarchy is rendered as an ASCII tree.
-3. You're prompted to proceed, abort, or request a deeper crawl before any content is downloaded.
+- **Auto-scaled workers**: Automatically determines optimal worker count based on available RAM (~1GB per worker)
+- **Fault tolerance**: Worker crashes don't affect the Master process or other workers
+- **Parallel processing**: Multiple workers handle discovery and download phases simultaneously
+- **Resource efficient**: Isolated browser processes prevent memory leaks
 
-### Planning & Confirmation Options
+### Testing
 
-- `node main.js --dry-run` → perform **only** the discovery phase and exit. Great for planning without downloading files.
-- `node main.js --yes` → skip the interactive prompt and proceed directly from discovery to execution when you're already confident.
-- `node main.js --max-depth 3` → override the initial discovery depth (you can still request "deeper" interactively later).
+```bash
+# Run full integration test suite
+npm test
+
+# Run specific tests
+npm run test:crash      # Worker crash recovery
+npm run test:cookies    # Cookie propagation
+```
 
 ### Configuration
 
-Edit `src/Config.js` to customize settings:
+Edit `src/core/Config.js` to customize settings:
 
 ```javascript
 this.NOTION_PAGE_URL = 'your-notion-page-url';
 this.OUTPUT_DIR = 'downloaded_course_material';
 this.MAX_RECURSION_DEPTH = 5;  // Maximum depth for following links
 this.MAX_EXPANSION_DEPTH = 3;   // Maximum depth for expanding toggles
-```
-
-### Programmatic Usage
-
-```javascript
-const { NotionScraper } = require('./main');
-
-async function customScrape() {
-  const scraper = new NotionScraper();
-  await scraper.run();
-}
-
-customScrape();
 ```
 
 ## Output Structure
@@ -127,20 +144,35 @@ downloaded_course_material/
 
 ## How It Works
 
-### Phase 1: Discovery (Dry Run)
-1. **Cluster Spin-Up**: `NotionScraper` calculates safe concurrency from available RAM, then launches a `puppeteer-cluster` swarm dedicated to discovery.
-2. **Metadata-Only Visits**: Worker contexts call `PageScraper.discoverPageInfo`, which blocks heavy resources, captures page titles, and extracts internal links without touching assets.
-3. **Concurrency-Safe State Tracking**: The singleton `StateManager` owns the canonical `PageContext` instances, deduplicates URLs, and advances level queues once every worker in the current band finishes.
-4. **Interactive Prompt**: Accept the plan, abort, or type `d`/`deeper` to bump the discovery depth and rebuild the map before continuing.
+The scraper executes in **5 distinct phases** orchestrated by the Master process:
 
-### Phase 2: Execution (Scraping)
-5. **Plan Reuse**: The confirmed tree becomes the authoritative roadmap—no redundant rediscovery.
-6. **Content Expansion & Asset Capture**: Each queued page undergoes the full scraping routine (expansions, asset/file downloads, HTML preservation).
-7. **Link Rewriting**: Saved HTML is revisited so internal `<a>` tags point to the correct local paths.
-8. **Integrity Audit**: The auditor runs last to flag missing files or lingering remote references.
+### Phase 1: Bootstrap
+1. **Initial Worker Spawn**: Master spawns first worker to capture authentication cookies
+2. **Cookie Capture**: Worker navigates to target page and handles cookie consent
+3. **Worker Pool Creation**: Master spawns remaining workers based on available RAM
+4. **Cookie Broadcast**: Captured cookies distributed to all workers via IPC
 
-### Result
-A fully self-contained, interactive offline copy that mirrors the original Notion site, produced under your direct supervision.
+### Phase 2: Discovery
+5. **Parallel Page Discovery**: Workers extract metadata (title, links) from pages in parallel
+6. **Queue Management**: Master's `GlobalQueueManager` coordinates task distribution
+7. **Context Building**: `PageContext` tree constructed with parent-child relationships
+
+### Phase 3: Conflict Resolution
+8. **Duplicate Detection**: `ConflictResolver` identifies pages referenced multiple times
+9. **Canonical Selection**: Best version selected for each unique page
+10. **Path Calculation**: Target file paths computed based on hierarchy
+11. **Link Rewrite Map**: Map generated for transforming links during download
+
+### Phase 4: Download
+12. **Parallel Scraping**: Workers download unique pages with full content expansion
+13. **Asset Download**: Images, CSS, and files downloaded and localized
+14. **Link Rewriting**: Internal links transformed using the rewrite map
+15. **File Writing**: Workers write HTML directly to disk (no IPC bottleneck)
+
+### Phase 5: Complete
+16. **Statistics**: Master aggregates and displays scraping statistics
+17. **Cleanup**: All workers gracefully terminated
+18. **Result**: Fully self-contained, browsable offline copy
 
 ## Logging
 
@@ -218,11 +250,11 @@ At the end of scraping, the application provides:
 - External links preserved unchanged
 - JSDOM-based HTML parsing for accuracy
 
-### ✨ Interactive Discovery & Confirmation
-- Rapid "dry run" pass builds the entire crawl tree with zero downloads
-- ASCII plan view keeps you in control before any heavy work begins
-- Built-in prompt lets you deepen, abort, or auto-approve with CLI flags (`--dry-run`, `--yes`, `--max-depth`)
-- Execution phase reuses the plan for maximum efficiency—no duplicate crawling
+### ✨ Distributed Architecture
+- Micro-kernel design with Master-Worker IPC
+- Native Node.js `child_process` for worker management (no external cluster library)
+- Auto-scaled worker pool based on system resources
+- Graceful degradation when workers crash
 
 ## Contributing
 

@@ -10,15 +10,16 @@
 #SBATCH --error=notion-scraper-full-%j.err
 
 # ============================================================================
-# PRODUCTION SLURM JOB SCRIPT FOR NOTION SCRAPER (FULL RUN)
+# PRODUCTION SLURM JOB SCRIPT FOR NOTION SCRAPER (CLUSTER MODE - FULL RUN)
 # ============================================================================
 # This script is optimized for full production scraping with maximum resources
+# using the distributed cluster mode architecture
 #
 # Resource allocation:
-# - 32 CPUs for maximum parallel browser instances
-# - 64GB RAM to support ~30 concurrent Puppeteer instances
+# - 32 CPUs for maximum parallel worker processes
+# - 64GB RAM to support ~30 concurrent worker instances
 # - 2 hours runtime for large site scraping
-# - Auto-confirm mode (--yes) for unattended execution
+# - Each worker requires ~1GB RAM and runs isolated Puppeteer instance
 # ============================================================================
 
 echo "========================================="
@@ -63,13 +64,13 @@ echo ""
 lscpu | grep -E "^CPU\(s\)|^Model name|^Thread\(s\) per core"
 echo ""
 
-# Run the application with auto-confirm
+# Run the application in cluster mode
 echo "========================================="
-echo "Starting Notion Scraper (FULL RUN)"
+echo "Starting Notion Scraper (CLUSTER MODE - FULL RUN)"
 echo "========================================="
 echo ""
 
-node main.js --yes
+node main-cluster.js
 
 EXIT_CODE=$?
 

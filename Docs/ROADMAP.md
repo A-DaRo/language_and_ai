@@ -13,6 +13,13 @@ This document tracks the progress of the Notion Recursive Scraper refactoring an
 | **Phase 5** | **JSDoc Enforcement** | ✅ **Completed** | All classes and methods documented with JSDoc. |
 | **Phase 6 & 7** | **LOC Limit & JSDoc Refinement** | 📝 **Planned** | Split oversized modules and refine JSDoc for all classes and methods. |
 | **Phase 8** | **Method Refactoring** | 📝 **Planned** | Reduce long class methods into smaller, internal methods. |
+| **Micro-Kernel Phase 1** | **Infrastructure Layer** | ✅ **Completed** | Protocol definitions and event bus for Master-Worker IPC. |
+| **Micro-Kernel Phase 2** | **Domain Serialization** | ✅ **Completed** | PageContext refactor for JSON serialization. |
+| **Micro-Kernel Phase 3** | **Worker Implementation** | ✅ **Completed** | Worker process entry point and task execution. |
+| **Micro-Kernel Phase 4** | **Cluster Management** | ✅ **Completed** | Worker pool and resource management. |
+| **Micro-Kernel Phase 5** | **Orchestration Logic** | ✅ **Completed** | State machine and queue management. |
+| **Micro-Kernel Phase 6** | **Integration** | ✅ **Completed** | Main entry point and system wiring. |
+| **Micro-Kernel Phase 7** | **Verification** | ✅ **Completed** | Testing, cleanup, documentation complete. |
 
 ## Detailed Progress
 
@@ -33,6 +40,40 @@ This document tracks the progress of the Notion Recursive Scraper refactoring an
 
 ### 4. Domain Layer
 *   ✅ **`PageContext.js`**: Remains the single source of truth for the site graph.
+
+### 5. Micro-Kernel Architecture (New)
+*   ✅ **Phase 1 - Infrastructure Layer**:
+    *   ✅ **`src/core/ProtocolDefinitions.js`**: IPC protocol with MESSAGE_TYPES, payload typedefs, error serialization helpers.
+    *   ✅ **`src/core/SystemEventBus.js`**: Singleton EventEmitter for Master process coordination with typed events.
+*   ✅ **Phase 2 - Domain Serialization**:
+    *   ✅ **`src/domain/PageContext.js`**: Refactored with id, parentId, childIds, toJSON(), fromJSON(), targetFilePath for IPC transfer.
+    *   ✅ Backward compatibility verified with existing dry-run tests.
+*   ✅ **Phase 3 - Worker Layer**:
+    *   ✅ **`src/worker/WorkerEntrypoint.js`**: Isolated worker process entry point with browser initialization.
+    *   ✅ **`src/worker/TaskRunner.js`**: IPC command router for discovery and download tasks.
+    *   ✅ Tested worker process independently - spawns, initializes browser, sends READY signal.
+*   ✅ **Phase 4 - Cluster Layer**:
+    *   ✅ **`src/cluster/WorkerProxy.js`**: Master-side handle for worker IPC communication and state tracking.
+    *   ✅ **`src/cluster/BrowserInitializer.js`**: Resource-aware worker spawning with capacity planning.
+    *   ✅ **`src/cluster/BrowserManager.js`**: Worker pool management with idle/busy allocation.
+*   ✅ **Phase 5 - Orchestration Layer**:
+    *   ✅ **`src/orchestration/GlobalQueueManager.js`**: Centralized queue manager for discovery and download phases.
+    *   ✅ **`src/orchestration/analysis/ConflictResolver.js`**: Duplicate detection and canonical path resolution.
+    *   ✅ **`src/orchestration/ClusterOrchestrator.js`**: Main state machine with 5-phase workflow (Bootstrap, Discovery, Conflict Resolution, Download, Complete).
+*   ✅ **Phase 6 - Integration**:
+    *   ✅ **`main-cluster.js`**: New entry point for distributed cluster mode.
+    *   ✅ Graceful shutdown handlers for SIGINT/SIGTERM with worker cleanup.
+    *   ✅ System initialization via SystemEventBus.
+    *   ✅ Command-line argument parsing (--max-depth, --help).
+*   ✅ **Phase 7 - Verification**:
+    *   ✅ **`test-integration.js`**: Comprehensive test suite with 6 test cases covering all 5 workflow phases.
+    *   ✅ **`test-worker-crash.js`**: Fault tolerance testing - verifies system handles worker crashes gracefully.
+    *   ✅ **`test-cookie-propagation.js`**: Authentication testing - verifies cookie capture and broadcast.
+    *   ✅ **Legacy mode verification**: Tested main.js with --dry-run, all features working correctly.
+    *   ✅ **Documentation updates**: README.md, QUICKSTART.md updated with cluster mode; created CLUSTER_MODE.md.
+    *   ✅ **npm scripts**: Added start:cluster, test:integration, test:crash, test:cookies.
+    *   ✅ **Dependency cleanup**: Marked puppeteer-cluster for deprecation (kept for legacy compatibility).
+    *   ✅ See `Docs/PHASE_7_SUMMARY.md` for detailed verification report.
 
 ## Future Improvements (Backlog)
 
@@ -90,7 +131,7 @@ To improve readability and maintainability, long methods will be broken down int
 ### High Priority (Post-Phase 8)
 *   [ ] **Unit Testing**: Add Jest/Mocha tests for core logic (`PageContext`, `FileSystemUtils`, `LinkRewriter`).
 *   [ ] **Error Recovery**: Implement checkpointing to resume interrupted scrapes from the last saved state.
-*   [ ] **Parallel Discovery**: Re-introduce parallel discovery (using `puppeteer-cluster`) for the initial scanning phase to speed up large sites.
+*   [ ] **Worker Auto-Respawn**: Automatically replace crashed workers during execution.
 
 ### Medium Priority
 *   [ ] **Config Validation**: Add schema validation for the `Config` class using `joi` or `zod`.

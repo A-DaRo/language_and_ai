@@ -1,0 +1,227 @@
+/**
+ * @fileoverview Worker Pool State Manager
+ * @module cluster/BrowserManager
+ * @description Manages the lifecycle and allocation of Worker processes.
+ * Maintains idle/busy state and provides task execution interface.
+ * 
+ * **CRITICAL CONTEXT**: Runs in MASTER process. Coordinates worker allocation.
+ */
+
+const SystemEventBus = require('../core/SystemEventBus');
+const { WorkerState } = require('./WorkerProxy');
+
+/**
+ * @class BrowserManager
+ * @classdesc Manages a pool of Worker processes, handling allocation and lifecycle
+ */
+class BrowserManager {
+  constructor() {
+    this.workers = new Map(); // workerId -> WorkerProxy
+    this.idleWorkers = []; // Array of idle worker IDs (LIFO stack)
+    this.busyWorkers = new Map(); // workerId -> taskInfo
+    this.eventBus = SystemEventBus.getInstance();
+    
+    this._setupEventListeners();
+  }
+  
+  /**
+   * Setup event listeners for worker state changes
+   * @private
+   */
+  _setupEventListeners() {
+    // Worker becomes ready (initial or after task)
+    this.eventBus.on('WORKER:READY', ({ workerId }) => {
+      if (!this.idleWorkers.includes(workerId)) {
+        this.idleWorkers.push(workerId);
+      }
+    });
+    
+    // Worker becomes idle after task completion
+    this.eventBus.on('WORKER:IDLE', ({ workerId }) => {
+      this.busyWorkers.delete(workerId);
+      if (!this.idleWorkers.includes(workerId)) {
+        this.idleWorkers.push(workerId);
+      }
+    });
+    
+    // Worker started a task
+    this.eventBus.on('TASK:STARTED', ({ workerId, taskId, taskType }) => {
+      const index = this.idleWorkers.indexOf(workerId);
+      if (index > -1) {
+        this.idleWorkers.splice(index, 1);
+      }
+      this.busyWorkers.set(workerId, { taskId, taskType });
+    });
+    
+    // Worker crashed
+    this.eventBus.on('WORKER:CRASHED', ({ workerId }) => {
+      this._handleWorkerCrash(workerId);
+    });
+  }
+  
+  /**
+   * Register workers with the manager
+   * @param {Array<WorkerProxy>} workerProxies - Array of worker proxies
+   * @returns {void}
+   */
+  registerWorkers(workerProxies) {
+    for (const proxy of workerProxies) {
+      this.workers.set(proxy.workerId, proxy);
+      console.log(`[BrowserManager] Registered worker: ${proxy.workerId}`);
+    }
+    
+    console.log(`[BrowserManager] Registered ${this.workers.size} worker(s)`);
+  }
+  
+  /**
+   * Execute a task on an available worker
+   * @async
+   * @param {string} messageType - Message type (DISCOVER or DOWNLOAD)
+   * @param {Object} payload - Task payload
+   * @returns {Promise<string>} Worker ID that received the task
+   * @throws {Error} If no workers are available
+   * @example
+   * const workerId = await browserManager.execute(MESSAGE_TYPES.DISCOVER, {
+   *   url: 'https://notion.so/page',
+   *   pageId: 'abc123',
+   *   depth: 1
+   * });
+   */
+  async execute(messageType, payload) {
+    const workerId = await this._allocateWorker();
+    const worker = this.workers.get(workerId);
+    
+    if (!worker) {
+      throw new Error(`Worker ${workerId} not found in registry`);
+    }
+    
+    await worker.sendCommand(messageType, payload);
+    return workerId;
+  }
+  
+  /**
+   * Allocate an idle worker for a task
+   * @private
+   * @async
+   * @returns {Promise<string>} Worker ID
+   * @throws {Error} If no workers are available
+   */
+  async _allocateWorker() {
+    // Wait for an idle worker (with timeout)
+    const timeout = 60000; // 60 seconds
+    const startTime = Date.now();
+    
+    while (this.idleWorkers.length === 0) {
+      if (Date.now() - startTime > timeout) {
+        throw new Error('Timeout waiting for available worker');
+      }
+      
+      // Wait 100ms before checking again
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+    
+    // Pop worker from idle stack (LIFO - reuse most recently freed worker)
+    const workerId = this.idleWorkers.pop();
+    
+    return workerId;
+  }
+  
+  /**
+   * Handle worker crash - remove from pool and log
+   * @private
+   * @param {string} workerId - ID of crashed worker
+   */
+  _handleWorkerCrash(workerId) {
+    console.error(`[BrowserManager] Worker ${workerId} crashed`);
+    
+    // Remove from idle workers
+    const idleIndex = this.idleWorkers.indexOf(workerId);
+    if (idleIndex > -1) {
+      this.idleWorkers.splice(idleIndex, 1);
+    }
+    
+    // Remove from busy workers
+    this.busyWorkers.delete(workerId);
+    
+    // TODO: Implement worker replacement logic
+    // For now, just log the crash
+    console.warn(`[BrowserManager] Worker pool now has ${this.getAvailableCount()} available workers`);
+  }
+  
+  /**
+   * Broadcast cookies to all workers
+   * @async
+   * @param {Array<Object>} cookies - Cookie objects
+   * @returns {Promise<void>}
+   */
+  async broadcastCookies(cookies) {
+    console.log(`[BrowserManager] Broadcasting cookies to ${this.workers.size} worker(s)`);
+    
+    const promises = [];
+    for (const worker of this.workers.values()) {
+      promises.push(worker.broadcastCookies(cookies));
+    }
+    
+    await Promise.all(promises);
+  }
+  
+  /**
+   * Get count of available (idle) workers
+   * @returns {number} Number of idle workers
+   */
+  getAvailableCount() {
+    return this.idleWorkers.length;
+  }
+  
+  /**
+   * Get count of allocated (busy) workers
+   * @returns {number} Number of busy workers
+   */
+  getAllocatedCount() {
+    return this.busyWorkers.size;
+  }
+  
+  /**
+   * Get total worker count
+   * @returns {number} Total number of workers
+   */
+  getTotalCount() {
+    return this.workers.size;
+  }
+  
+  /**
+   * Get pool statistics
+   * @returns {Object} Pool statistics
+   */
+  getStatistics() {
+    return {
+      total: this.getTotalCount(),
+      idle: this.getAvailableCount(),
+      busy: this.getAllocatedCount()
+    };
+  }
+  
+  /**
+   * Shutdown all workers gracefully
+   * @async
+   * @returns {Promise<void>}
+   */
+  async shutdown() {
+    console.log(`[BrowserManager] Shutting down ${this.workers.size} worker(s)...`);
+    
+    const promises = [];
+    for (const worker of this.workers.values()) {
+      promises.push(worker.terminate());
+    }
+    
+    await Promise.all(promises);
+    
+    this.workers.clear();
+    this.idleWorkers = [];
+    this.busyWorkers.clear();
+    
+    console.log('[BrowserManager] All workers terminated');
+  }
+}
+
+module.exports = BrowserManager;

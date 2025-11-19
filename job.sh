@@ -10,15 +10,16 @@
 #SBATCH --error=notion-scraper-%j.err
 
 # ============================================================================
-# OPTIMIZED SLURM JOB SCRIPT FOR NOTION SCRAPER
+# OPTIMIZED SLURM JOB SCRIPT FOR NOTION SCRAPER (CLUSTER MODE)
 # ============================================================================
-# This script is optimized for the puppeteer-cluster based Node.js application
-# which dynamically spawns concurrent browser instances based on available RAM
+# This script is optimized for the cluster mode architecture with
+# distributed Master-Worker processes using native Node.js child_process
 #
 # Key optimizations:
 # - Single task with multiple CPUs (--cpus-per-task=16)
-# - Explicit memory allocation (32GB) for predictable concurrency
+# - Explicit memory allocation (32GB) for predictable worker count
 # - Environment variables to maximize Node.js and Puppeteer performance
+# - Each worker requires ~1GB RAM, auto-scaled by the system
 # - Proper output logging for debugging
 # ============================================================================
 
@@ -49,8 +50,9 @@ export PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=false
 export CHROME_PATH=/usr/bin/chromium-browser       # Adjust if needed for your system
 
 # Set number of concurrent workers (optional override)
-# The application auto-calculates based on free RAM, but you can force it:
-# export MAX_CONCURRENCY=12
+# The cluster mode auto-calculates based on free RAM (~1GB per worker)
+# but you can manually limit it by editing src/cluster/BrowserInitializer.js
+# export MAX_WORKERS=12
 
 echo "========================================="
 echo "Environment Configuration"
@@ -71,15 +73,12 @@ echo ""
 
 # Run the application
 echo "========================================="
-echo "Starting Notion Scraper"
+echo "Starting Notion Scraper (Cluster Mode)"
 echo "========================================="
 echo ""
 
-# For production run (actual scraping):
-# node main.js --yes
-
-# For dry-run (planning phase only):
-node main.js --dry-run
+# Cluster mode with custom depth:
+node main-cluster.js --max-depth 3
 
 EXIT_CODE=$?
 

@@ -47,7 +47,7 @@ class LinkExtractor {
     const effectiveBaseUrl = baseUrl || this.config.getBaseUrl();
     this.logger.info('LINKS', `Extracting internal Notion page links (base: ${effectiveBaseUrl})...`);
     
-    const links = await page.evaluate((baseUrl) => {
+    const links = await page.evaluate((baseUrl, currentUrl) => {
       const results = [];
       const seenUrls = new Set();
       
@@ -96,98 +96,49 @@ class LinkExtractor {
           return;
         }
         
-        // Remove query parameters and fragments
-        absoluteUrl = absoluteUrl.split('?')[0].split('#')[0];
+        // Step 1: Remove everything after '?' (query params and fragments)
+        const cleanUrl = absoluteUrl.split('?')[0];
         
-        // Skip if already seen
-        if (seenUrls.has(absoluteUrl)) {
+        // Step 2: Extract raw page ID - everything after first '29' appearance
+        // This handles both /Page-Name-29abc... and /29abc... formats
+        const rawIdMatch = cleanUrl.match(/29[a-f0-9]{30}/i);
+        if (!rawIdMatch) {
+          // No valid page ID found, skip this link
           return;
         }
-        seenUrls.add(absoluteUrl);
         
-        // Extract title from the link
-        let title = link.textContent.trim();
+        const rawPageId = rawIdMatch[0];
         
-        // Try to find a better title from page icon + text structure
-        const parent = link.closest('[data-block-id]');
-        if (parent) {
-          const titleElement = parent.querySelector('[contenteditable="false"]');
-          if (titleElement) {
-            title = titleElement.textContent.trim() || title;
-          }
+        // Check if this is the current page (same raw ID)
+        const currentRawIdMatch = currentUrl.match(/29[a-f0-9]{30}/i);
+        const currentRawId = currentRawIdMatch ? currentRawIdMatch[0] : null;
+        
+        if (currentRawId && rawPageId === currentRawId) {
+          // Same page, different section - skip it
+          return;
         }
         
-        
-        // Try to determine the section and subsection
-        let section = null;
-        let subsection = null;
-        
-        // Look for parent headings
-        let currentElement = link;
-        while (currentElement && currentElement !== document.body) {
-          currentElement = currentElement.parentElement;
-          
-          // Check for headings
-          if (currentElement) {
-            const heading = currentElement.querySelector('h1, h2, h3');
-            if (heading && !section) {
-              const headingText = heading.textContent.trim();
-              
-              // Check if it's a week subsection
-              if (/week\s+\d+/i.test(headingText)) {
-                subsection = headingText;
-              } else {
-                section = headingText;
-              }
-            }
-          }
+        // Skip if already seen (by raw ID)
+        if (seenUrls.has(rawPageId)) {
+          return;
         }
         
-        // Alternative: Check for section by looking at preceding headings
-        if (!section) {
-          const allHeadings = Array.from(document.querySelectorAll('h1, h2, h3'));
-          const linkPosition = Array.from(document.querySelectorAll('*')).indexOf(link);
-          
-          for (let i = allHeadings.length - 1; i >= 0; i--) {
-            const heading = allHeadings[i];
-            const headingPosition = Array.from(document.querySelectorAll('*')).indexOf(heading);
-            
-            if (headingPosition < linkPosition) {
-              const headingText = heading.textContent.trim();
-              
-              if (/week\s+\d+/i.test(headingText)) {
-                if (!subsection) subsection = headingText;
-              } else {
-                if (!section) section = headingText;
-              }
-              
-              if (section && subsection) break;
-            }
-          }
-        }
+        seenUrls.add(rawPageId);
         
+        // Return raw page ID as URL (will be resolved by server later)
         results.push({
-          url: absoluteUrl,
-          title: title || 'Untitled',
-          section: section,
-          subsection: subsection,
-          isInternal: true // Mark as internal by default in this extraction
+          url: baseUrl + '/' + rawPageId,
+          title: rawPageId,  // Use raw ID as placeholder, will be resolved later
+          section: null,
+          subsection: null,
+          isInternal: true
         });
       });
       
       return results;
-    }, effectiveBaseUrl);
+    }, effectiveBaseUrl, currentUrl);
     
-    // Post-process: extract titles from URLs where needed
-    for (const link of links) {
-      if (link.title && link.title.startsWith('__EXTRACT_FROM_URL__:')) {
-        const url = link.title.substring('__EXTRACT_FROM_URL__:'.length);
-        link.title = this.config.extractPageNameFromUrl(url);
-        this.logger.info('LINKS', `Extracted title from URL: "${link.title}"`);
-      }
-    }
-    
-    // Filter out the current page
+    // Filter out the current page (by raw ID)
     const filteredLinks = links.filter(link => link.url !== currentUrl);
     
     this.logger.success('LINKS', `Found ${filteredLinks.length} internal page links.`);

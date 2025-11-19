@@ -2,10 +2,15 @@
   "name": "notion-recursive-scraper",
   "version": "1.0.0",
   "description": "A sophisticated recursive scraper for Notion pages with hierarchical organization",
-  "main": "main.js",
+  "main": "main-cluster.js",
   "scripts": {
-    "start": "node main.js",
-    "test": "echo \"No tests specified yet\" && exit 0"
+    "start": "node main-cluster.js",
+    "test": "node tests/test-integration.js",
+    "test:integration": "node tests/test-integration.js",
+    "test:worker": "node tests/test-worker.js",
+    "test:cluster": "node tests/test-cluster.js",
+    "test:crash": "node tests/test-worker-crash.js",
+    "test:cookies": "node tests/test-cookie-propagation.js"
   },
   "keywords": [
     "notion",
@@ -19,8 +24,7 @@
   "dependencies": {
     "axios": "^1.6.0",
     "jsdom": "^23.0.0",
-    "puppeteer": "^24.30.0",
-    "puppeteer-cluster": "^0.25.0"
+    "puppeteer": "^24.30.0"
   },
   "engines": {
     "node": ">=14.0.0"
