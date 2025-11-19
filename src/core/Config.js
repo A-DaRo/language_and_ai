@@ -6,8 +6,8 @@ class Config {
     // Main configuration
     this.NOTION_PAGE_URL = 'https://mctenthij.notion.site/JBC090-Language-AI-29d979eeca9f81469905f51d65beefae';
     this.OUTPUT_DIR = 'course_material';
-    this.MAX_EXPANSION_DEPTH = 10;
-    this.MAX_RECURSION_DEPTH = 10;
+    this.MAX_EXPANSION_DEPTH = 100;
+    this.MAX_RECURSION_DEPTH = 100;
     this.MAIN_CONTENT_SELECTOR = 'div.notion-page-content';
     
     // Timing configuration (in milliseconds)

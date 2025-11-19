@@ -1,17 +1,47 @@
 /**
- * Extracts and categorizes links from Notion pages
+ * @classdesc Extracts and categorizes links from Notion pages.
+ * 
+ * Identifies internal Notion page links and extracts contextual metadata
+ * including hierarchy information (sections, subsections) based on DOM structure.
+ * 
+ * The extraction process:
+ * - Filters for internal Notion links (same domain)
+ * - Resolves relative URLs to absolute URLs
+ * - Deduplicates discovered links
+ * - Extracts hierarchical context from parent elements
+ * - Excludes self-references and invalid URLs
+ * 
+ * @see RecursiveScraper#discover
+ * @see PageProcessor#scrapePage
  */
 class LinkExtractor {
+  /**
+   * @param {Config} config - Configuration object for base URL resolution.
+   * @param {Logger} logger - Logger instance for extraction progress tracking.
+   */
   constructor(config, logger) {
     this.config = config;
     this.logger = logger;
   }
   
   /**
-   * Extract all internal Notion page links with their context
-   * @param {Object} page - Puppeteer page object
-   * @param {string} currentUrl - Current page URL to filter out
-   * @param {string} baseUrl - Optional base URL for composing internal links (defaults to config base URL)
+   * @summary Extract all internal Notion page links with their hierarchical context.
+   * 
+   * @description Performs comprehensive link extraction using page.evaluate() to run
+   * in the browser context. The extraction process:
+   * 1. Queries all anchor elements with href attributes
+   * 2. Filters for internal links matching the base domain
+   * 3. Resolves relative URLs to absolute URLs
+   * 4. Deduplicates based on URL
+   * 5. Extracts hierarchical context (sections, subsections) from DOM structure
+   * 6. Excludes the current page URL to prevent self-references
+   * 
+   * @param {Page} page - Puppeteer page object.
+   * @param {string} currentUrl - Current page URL to filter out (prevent self-references).
+   * @param {string} [baseUrl=null] - Optional base URL for composing internal links (defaults to config base URL).
+   * @returns {Promise<Array<{url: string, title: string, section?: string, subsection?: string}>>} Array of link objects with metadata.
+   * 
+   * @see Config#getBaseUrl
    */
   async extractLinks(page, currentUrl, baseUrl = null) {
     const effectiveBaseUrl = baseUrl || this.config.getBaseUrl();

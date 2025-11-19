@@ -2,11 +2,29 @@ const axios = require('axios');
 const fs = require('fs/promises');
 const path = require('path');
 const crypto = require('crypto');
+const FileSystemUtils = require('../utils/FileSystemUtils');
 
 /**
- * Downloads and manages assets (images, files, etc.)
+ * @classdesc Downloads and manages assets (images, files, etc.) from Notion pages.
+ * 
+ * Handles the complete asset download and localization workflow:
+ * - Extracts asset URLs from img tags and CSS background properties
+ * - Downloads assets with retry logic and exponential backoff
+ * - Generates safe filenames using content hashing
+ * - Rewrites asset references in the DOM to point to local paths
+ * - Maintains download cache to prevent duplicate requests
+ * 
+ * Uses content-based hashing (MD5) to ensure unique filenames while allowing
+ * deduplication of identical assets across multiple pages.
+ * 
+ * @see PageProcessor#scrapePage
+ * @see FileSystemUtils
  */
 class AssetDownloader {
+  /**
+   * @param {Config} config - Configuration object for timeout and retry settings.
+   * @param {Logger} logger - Logger instance for download progress tracking.
+   */
   constructor(config, logger) {
     this.config = config;
     this.logger = logger;
@@ -16,32 +34,25 @@ class AssetDownloader {
   }
   
   /**
-   * Sanitize filename to be filesystem-safe
-   * Handles complex URLs with special characters
-   */
-  sanitizeFilename(filename) {
-    // Decode URI components
-    let sanitized = decodeURIComponent(filename);
-    
-    // Remove or replace problematic characters
-    sanitized = sanitized
-      .replace(/[<>:"/\\|?*\x00-\x1F]/g, '_') // Replace invalid chars with underscore
-      .replace(/^\.+/, '') // Remove leading dots
-      .replace(/\s+/g, '_') // Replace spaces with underscores
-      .replace(/_{2,}/g, '_'); // Replace multiple underscores with single
-    
-    // If filename is too long or becomes empty, generate a hash-based name
-    if (sanitized.length > 200 || sanitized.length === 0) {
-      const hash = crypto.createHash('md5').update(filename).digest('hex').substring(0, 8);
-      const ext = path.extname(sanitized) || '.jpg';
-      sanitized = `asset_${hash}${ext}`;
-    }
-    
-    return sanitized;
-  }
-  
-  /**
-   * Download all images and assets from a page and rewrite their paths
+   * @summary Download all images and assets from a page and rewrite their paths.
+   * 
+   * @description Executes the complete asset localization workflow:
+   * 1. Creates images directory in output folder
+   * 2. Extracts asset URLs from img tags and background-image CSS
+   * 3. Downloads each asset with retry logic
+   * 4. Generates safe filenames using content hashing
+   * 5. Rewrites DOM references to point to local paths
+   * 
+   * Uses page.evaluate() for extraction and page.$$eval() for rewriting to
+   * operate in the browser context for maximum compatibility.
+   * 
+   * @param {Page} page - Puppeteer page instance.
+   * @param {string} outputDir - Directory to save images to (images/ subdirectory will be created).
+   * @returns {Promise<void>}
+   * 
+   * @throws {Error} If directory creation fails.
+   * 
+   * @see _downloadAsset
    */
   async downloadAndRewriteImages(page, outputDir) {
     this.logger.info('IMAGE', 'Identifying and downloading all visible images and assets...');
@@ -93,7 +104,7 @@ class AssetDownloader {
         }
         
         // Sanitize filename
-        const sanitizedName = this.sanitizeFilename(imageName);
+        const sanitizedName = FileSystemUtils.sanitizeFilename(imageName);
         const localImageName = `${index + 1}-${sanitizedName}`;
         const localImagePath = path.join(imagesDir, localImageName);
         const relativePath = path.posix.join('images', localImageName);

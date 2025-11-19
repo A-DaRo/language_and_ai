@@ -1,0 +1,70 @@
+# JSDoc Block Tags — concise reference
+
+A compact list of common JSDoc block tags with synonyms and short, consistent descriptions.
+
+- `@abstract` (synonyms: `@virtual`) — Marks a member that must be implemented or overridden by subclasses.  
+- `@access` — Specify the access level: `private`, `package-private`, `public`, or `protected`.  
+- `@alias` — Treat a member as if it had another name.  
+- `@async` — Marks a function as asynchronous (returns a Promise).  
+- `@augments` (synonyms: `@extends`) — Indicates a symbol inherits from and extends a parent.  
+- `@author` — Identify the author of an item.  
+- `@borrows` — Indicate that this object borrows members from another object.  
+- `@class` (synonyms: `@constructor`) — Mark a function intended to be called with `new`.  
+- `@classdesc` — Provide the description for the whole class.  
+- `@constant` (synonyms: `@const`) — Document an object or value as constant (read-only).  
+- `@constructs` — Mark a function as the constructor for the preceding class.  
+- `@copyright` — Provide copyright information.  
+- `@default` (synonyms: `@defaultvalue`) — Document a default value.  
+- `@deprecated` — Mark an item as deprecated and suggest alternatives.  
+- `@description` (synonyms: `@desc`) — Describe a symbol.  
+- `@enum` — Document a collection of related named values.  
+- `@event` — Document an event and its payload.  
+- `@example` — Provide a usage example.  
+- `@exports` — Identify the member exported by a module.  
+- `@external` (synonyms: `@host`) — Reference an external class, namespace, or module.  
+- `@file` (synonyms: `@fileoverview`, `@overview`) — Describe a file.  
+- `@fires` (synonyms: `@emits`) — List events a method may fire.  
+- `@function` (synonyms: `@func`, `@method`) — Document a function or method.  
+- `@generator` — Mark a function as a generator (`yield`).  
+- `@global` — Document a global object.  
+- `@hideconstructor` — Hide the constructor from generated docs.  
+- `@ignore` — Exclude a symbol from documentation.  
+- `@implements` — Indicate that a symbol implements an interface.  
+- `@inheritdoc` — Inherit documentation from the parent symbol.  
+- `@inner` — Document an inner (nested) object.  
+- `@instance` — Document an instance member.  
+- `@interface` — Mark a symbol as an interface.  
+- `@kind` — Specify the kind of symbol (e.g., `class`, `function`).  
+- `@lends` — Assign properties to a symbol as if they belonged to it.  
+- `@license` — Specify the applicable license.  
+- `@listens` — List events that the symbol listens for.  
+- `@member` (synonyms: `@var`) — Document a member or variable.  
+- `@memberof` — Indicate the parent symbol.  
+- `@mixes` — Indicate that an object mixes in members from another.  
+- `@mixin` — Document a mixin object.  
+- `@module` — Document a JavaScript module.  
+- `@name` — Specify or override the documented name.  
+- `@namespace` — Document a namespace object.  
+- `@override` — Indicate that a symbol overrides a parent member.  
+- `@package` — Mark a symbol as package-private.  
+- `@param` (synonyms: `@arg`, `@argument`) — Document a function parameter.  
+- `@private` — Mark a symbol as private.  
+- `@property` (synonyms: `@prop`) — Document an object property.  
+- `@protected` — Mark a symbol as protected.  
+- `@public` — Mark a symbol as public.  
+- `@readonly` — Mark a symbol as read-only.  
+- `@requires` — Indicate a required module or dependency.  
+- `@returns` (synonyms: `@return`) — Document a function's return value.  
+- `@see` — Refer to related documentation or external links.  
+- `@since` — Note when a feature was added.  
+- `@static` — Document a static member.  
+- `@summary` — Provide a short summary of the description.  
+- `@this` — Describe what `this` refers to in the context.  
+- `@throws` (synonyms: `@exception`) — Describe errors that may be thrown.  
+- `@todo` — Note tasks or items to complete.  
+- `@tutorial` — Link to an included tutorial file.  
+- `@type` — Document the type of an object or value.  
+- `@typedef` — Define a custom type.  
+- `@variation` — Distinguish different overloads or variations of the same name.  
+- `@version` — Document the version number.  
+- `@yields` (synonyms: `@yield`) — Document the value yielded by a generator.  

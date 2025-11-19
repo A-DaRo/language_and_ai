@@ -1,14 +1,39 @@
 /**
- * Expands toggles, databases, and other collapsible content on Notion pages
+ * @classdesc Expands toggles, databases, and other collapsible content on Notion pages.
+ * 
+ * Implements an aggressive expansion strategy using iterative click-and-wait cycles
+ * to reveal all hidden content. This is critical for ensuring complete page capture,
+ * as Notion heavily uses collapsible UI elements that hide content by default.
+ * 
+ * The expansion process includes:
+ * - Scrolling to bottom to trigger lazy-loading
+ * - Multi-iteration toggle expansion to handle nested content
+ * - Smart element detection to avoid clicking destructive actions
+ * 
+ * @see PageProcessor#scrapePage
  */
 class ContentExpander {
+  /**
+   * @param {Config} config - Configuration object containing scroll and timeout settings.
+   * @param {Logger} logger - Logger instance for expansion progress tracking.
+   */
   constructor(config, logger) {
     this.config = config;
     this.logger = logger;
   }
   
   /**
-   * Expand all content on the page
+   * @summary Expand all content on the page.
+   * 
+   * @description Executes the complete content expansion workflow:
+   * 1. Scrolls to page bottom to trigger lazy-loaded content
+   * 2. Iteratively expands all toggles and collapsible elements
+   * 
+   * @param {Page} page - Puppeteer page instance.
+   * @returns {Promise<void>}
+   * 
+   * @see _scrollToBottom
+   * @see _expandToggles
    */
   async expandAll(page) {
     await this._scrollToBottom(page);
@@ -16,7 +41,15 @@ class ContentExpander {
   }
   
   /**
-   * Scroll to the bottom of the page to trigger lazy-loading
+   * @summary Scroll to the bottom of the page to trigger lazy-loading.
+   * 
+   * @description Performs incremental scrolling using page.evaluate() to simulate
+   * natural user behavior. This triggers Notion's lazy-loading mechanism for images,
+   * content blocks, and other dynamic elements.
+   * 
+   * @param {Page} page - Puppeteer page instance.
+   * @returns {Promise<void>}
+   * @private
    */
   async _scrollToBottom(page) {
     this.logger.info('SCROLL', 'Scrolling to bottom of page to trigger lazy-loading...');
@@ -42,8 +75,23 @@ class ContentExpander {
   }
   
   /**
-   * Aggressively expand ALL toggles, buttons, tabs, and interactive elements
-   * Uses a "click and wait" loop to ensure all hidden content is revealed
+   * @summary Aggressively expand ALL toggles, buttons, tabs, and interactive elements.
+   * 
+   * @description Uses a "click and wait" loop to ensure all hidden content is revealed.
+   * Iterates up to maxIterations (default 2) to handle nested collapsible elements.
+   * 
+   * Selection strategy:
+   * - Targets elements with aria-expanded="false"
+   * - Looks for Notion-specific toggle classes
+   * - Finds generic buttons and expandable elements
+   * - Excludes destructive actions (delete, remove, share)
+   * 
+   * After each iteration, waits for network idle or fixed timeout to allow
+   * content to load.
+   * 
+   * @param {Page} page - Puppeteer page instance.
+   * @returns {Promise<void>}
+   * @private
    */
   async _expandToggles(page) {
     this.logger.info('TOGGLE', 'Starting AGGRESSIVE content expansion...');

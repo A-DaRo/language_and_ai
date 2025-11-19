@@ -1,4 +1,5 @@
 const path = require('path');
+const FileSystemUtils = require('../utils/FileSystemUtils');
 
 /**
  * Represents the context of a page in the hierarchy
@@ -8,7 +9,7 @@ class PageContext {
     this.url = url;
     this.originalTitle = title || 'Untitled';
     this.displayTitle = this.originalTitle;
-    this.title = this.sanitizeTitle(title);
+    this.title = FileSystemUtils.sanitizeFilename(title);
     this.depth = depth;
     this.parentContext = parentContext;
     this.section = null; // e.g., "Syllabus", "Material"
@@ -27,50 +28,17 @@ class PageContext {
   }
   
   /**
-   * Sanitize title for use in file/folder names
-   * More aggressive sanitization to handle all file system constraints
-   */
-  sanitizeTitle(title) {
-    if (!title) return 'untitled';
-    
-    // Remove or replace all problematic characters
-    let sanitized = title
-      .replace(/[<>:"/\\|?*\x00-\x1F]/g, '') // Remove invalid filename characters
-      .replace(/[^\w\s\-\.]/g, '') // Remove non-alphanumeric except spaces, hyphens, dots
-      .replace(/\s+/g, '_') // Replace spaces with underscores
-      .replace(/_{2,}/g, '_') // Replace multiple underscores with single
-      .replace(/^[._]+|[._]+$/g, '') // Remove leading/trailing dots and underscores
-      .trim();
-    
-    // Ensure not empty
-    if (!sanitized) sanitized = 'page';
-    
-    // Limit length while preserving file extension if present
-    if (sanitized.length > 100) {
-      const parts = sanitized.split('.');
-      if (parts.length > 1 && parts[parts.length - 1].length <= 10) {
-        const ext = parts.pop();
-        sanitized = parts.join('.').substring(0, 90) + '.' + ext;
-      } else {
-        sanitized = sanitized.substring(0, 100);
-      }
-    }
-    
-    return sanitized;
-  }
-  
-  /**
    * Set the section this page belongs to (e.g., "Syllabus")
    */
   setSection(section) {
-    this.section = this.sanitizeTitle(section);
+    this.section = FileSystemUtils.sanitizeFilename(section);
   }
   
   /**
    * Set the subsection this page belongs to (e.g., "Week_1")
    */
   setSubsection(subsection) {
-    this.subsection = this.sanitizeTitle(subsection);
+    this.subsection = FileSystemUtils.sanitizeFilename(subsection);
   }
   
   /**

@@ -1,4 +1,4 @@
-const PageContext = require('./PageContext');
+const PageContext = require('../domain/PageContext');
 
 /**
  * Centralized coordinator for discovery state.

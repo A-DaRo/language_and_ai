@@ -1,4 +1,4 @@
-const NotionScraper = require('./src/NotionScraper');
+const NotionScraper = require('./src/orchestration/NotionScraper');
 
 /**
  * Main entry point for the Notion scraper

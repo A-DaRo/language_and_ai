@@ -1,7 +1,25 @@
 /**
- * Handles cookie consent banners on Notion pages
+ * @classdesc Handles cookie consent banners on Notion pages.
+ * 
+ * Implements intelligent cookie consent handling with retry logic and deduplication.
+ * Uses a WeakSet to track processed pages, preventing redundant consent operations
+ * while allowing reconfiguration if needed.
+ * 
+ * Features:
+ * - Automatic banner detection and dismissal
+ * - Configurable retry logic with exponential backoff
+ * - Per-page tracking to avoid duplicate processing
+ * - Safe handling of closed/invalid page contexts
+ * - Graceful degradation on failures
+ * 
+ * @see PageProcessor#scrapePage
+ * @see Config
  */
 class CookieHandler {
+  /**
+   * @param {Config} config - Configuration object for retry settings and behavior flags.
+   * @param {Logger} logger - Logger instance for consent handling progress.
+   */
   constructor(config, logger) {
     this.config = config;
     this.logger = logger;
@@ -9,14 +27,38 @@ class CookieHandler {
   }
 
   /**
-   * Backwards-compat shim for existing callers
+   * @summary Backwards-compatibility shim for existing callers.
+   * 
+   * @description Delegates to ensureConsent() to maintain API compatibility with older code.
+   * 
+   * @param {Page} page - Puppeteer page instance.
+   * @param {string} [label=''] - Optional label for logging.
+   * @returns {Promise<boolean>} True if banner was found and handled.
+   * 
+   * @deprecated Use ensureConsent() directly.
+   * @see ensureConsent
    */
   async handle(page, label = '') {
     return this.ensureConsent(page, label);
   }
 
   /**
-   * Public entry point that safely handles the cookie banner once per page context
+   * @summary Public entry point that safely handles the cookie banner once per page context.
+   * 
+   * @description Manages the complete cookie consent workflow:
+   * 1. Checks if page is usable (not closed)
+   * 2. Verifies if consent already processed (unless COOKIE_HANDLE_ALL_PAGES=true)
+   * 3. Attempts banner dismissal with configurable retries
+   * 4. Tracks successfully processed pages to prevent duplicates
+   * 
+   * Uses WeakSet for page tracking, automatically garbage collected when pages close.
+   * 
+   * @param {Page} page - Puppeteer page instance.
+   * @param {string} [label=''] - Optional label for logging (defaults to page URL).
+   * @returns {Promise<boolean>} True if banner was found and handled, false otherwise.
+   * 
+   * @see Config#COOKIE_HANDLE_ALL_PAGES
+   * @see Config#COOKIE_MAX_RETRIES
    */
   async ensureConsent(page, label = '') {
     if (!this._isPageUsable(page)) {

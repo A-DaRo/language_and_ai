@@ -2,11 +2,33 @@ const axios = require('axios');
 const fs = require('fs/promises');
 const path = require('path');
 const crypto = require('crypto');
+const FileSystemUtils = require('../utils/FileSystemUtils');
 
 /**
- * Downloads embedded files (PDFs, code files, documents, etc.) from Notion pages
+ * @classdesc Downloads embedded files (PDFs, code files, documents, etc.) from Notion pages.
+ * 
+ * Handles the complete file download and localization workflow for non-image assets:
+ * - Detects downloadable files using extension patterns and URL signatures
+ * - Downloads files with retry logic and exponential backoff
+ * - Generates safe filenames preserving original extensions
+ * - Rewrites file links in the DOM to point to local paths
+ * - Maintains download cache to prevent duplicate requests
+ * 
+ * Supports a wide range of file types including:
+ * - Documents (PDF, Office formats)
+ * - Archives (ZIP, RAR, TAR)
+ * - Code files (Python, JavaScript, Java, etc.)
+ * - Media files (video, audio)
+ * - Data files (JSON, CSV, XML)
+ * 
+ * @see PageProcessor#scrapePage
+ * @see FileSystemUtils
  */
 class FileDownloader {
+  /**
+   * @param {Config} config - Configuration object for timeout and retry settings.
+   * @param {Logger} logger - Logger instance for download progress tracking.
+   */
   constructor(config, logger) {
     this.config = config;
     this.logger = logger;
@@ -34,28 +56,16 @@ class FileDownloader {
   }
   
   /**
-   * Sanitize filename to be filesystem-safe
-   */
-  sanitizeFilename(filename) {
-    let sanitized = decodeURIComponent(filename);
-    
-    sanitized = sanitized
-      .replace(/[<>:"/\\|?*\x00-\x1F]/g, '_')
-      .replace(/^\.+/, '')
-      .replace(/\s+/g, '_')
-      .replace(/_{2,}/g, '_');
-    
-    if (sanitized.length > 200 || sanitized.length === 0) {
-      const hash = crypto.createHash('md5').update(filename).digest('hex').substring(0, 8);
-      const ext = path.extname(sanitized) || '';
-      sanitized = `file_${hash}${ext}`;
-    }
-    
-    return sanitized;
-  }
-  
-  /**
-   * Check if a URL is a downloadable file
+   * @summary Check if a URL is a downloadable file.
+   * 
+   * @description Determines if a URL points to a downloadable file by:
+   * 1. Checking URL against Notion file patterns (S3, signed URLs, etc.)
+   * 2. Matching file extension against supported types
+   * 3. Analyzing link text for download indicators
+   * 
+   * @param {string} url - URL to check.
+   * @param {string} [linkText=''] - Optional link text for additional context.
+   * @returns {boolean} True if URL is a downloadable file.
    */
   isDownloadableFile(url, linkText = '') {
     try {
@@ -140,7 +150,7 @@ class FileDownloader {
         let filename = this._extractFilename(fileUrl, linkInfo.text);
         
         // Sanitize filename
-        const sanitizedName = this.sanitizeFilename(filename);
+        const sanitizedName = FileSystemUtils.sanitizeFilename(filename);
         const localFileName = `${index + 1}-${sanitizedName}`;
         const localFilePath = path.join(filesDir, localFileName);
         const relativePath = path.posix.join('files', localFileName);
