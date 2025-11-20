@@ -7,11 +7,29 @@
  * **CRITICAL**: Runs in Worker process. Must be stateless between tasks.
  */
 
+const path = require('path');
 const { MESSAGE_TYPES, serializeError } = require('../core/ProtocolDefinitions');
 const PageContext = require('../domain/PageContext');
 const LinkExtractor = require('../extraction/LinkExtractor');
 const Config = require('../core/Config');
 const Logger = require('../core/Logger');
+
+// Download components
+const ContentExpander = require('../processing/ContentExpander');
+const CookieHandler = require('../processing/CookieHandler');
+const AssetDownloader = require('../download/AssetDownloader');
+const CssDownloader = require('../download/CssDownloader');
+const FileDownloader = require('../download/FileDownloader');
+
+// Pipeline architecture
+const WorkerFileSystem = require('./io/WorkerFileSystem');
+const ScrapingPipeline = require('./pipeline/ScrapingPipeline');
+const NavigationStep = require('./pipeline/steps/NavigationStep');
+const CookieConsentStep = require('./pipeline/steps/CookieConsentStep');
+const ExpansionStep = require('./pipeline/steps/ExpansionStep');
+const AssetDownloadStep = require('./pipeline/steps/AssetDownloadStep');
+const LinkRewriterStep = require('./pipeline/steps/LinkRewriterStep');
+const HtmlWriteStep = require('./pipeline/steps/HtmlWriteStep');
 
 /**
  * @class TaskRunner
@@ -26,8 +44,21 @@ class TaskRunner {
     this.page = null;
     this.config = new Config();
     this.cookies = [];
-    this.logger = new Logger();
+    this.titleRegistry = {}; // Cached title registry (sent once at init, updated with deltas)
+    this.logger = Logger.getInstance();
+    
+    // Discovery components
     this.linkExtractor = new LinkExtractor(this.config, this.logger);
+    
+    // Download components (instantiated once per worker for cache efficiency)
+    this.cookieHandler = new CookieHandler(this.config, this.logger);
+    this.contentExpander = new ContentExpander(this.config, this.logger);
+    this.assetDownloader = new AssetDownloader(this.config, this.logger);
+    this.cssDownloader = new CssDownloader(this.config, this.logger);
+    this.fileDownloader = new FileDownloader(this.config, this.logger);
+    
+    // File system abstraction for safe I/O
+    this.fileSystem = new WorkerFileSystem(this.logger);
   }
   
   /**
@@ -38,7 +69,25 @@ class TaskRunner {
    */
   async setCookies(cookies) {
     this.cookies = cookies || [];
-    console.log(`[TaskRunner] Received ${this.cookies.length} cookie(s) from Master`);
+    this.logger.info('TaskRunner', `Received ${this.cookies.length} cookie(s) from Master`);
+  }
+  
+  /**
+   * Initialize or update title registry (sent once at init, then delta updates)
+   * @param {Object} titleRegistry - ID-to-title map (full or delta)
+   * @param {boolean} [isDelta=false] - Whether this is a delta update
+   * @returns {void}
+   */
+  setTitleRegistry(titleRegistry, isDelta = false) {
+    if (isDelta) {
+      // Merge delta update
+      this.titleRegistry = { ...this.titleRegistry, ...titleRegistry };
+      this.logger.info('TaskRunner', `Updated title registry with ${Object.keys(titleRegistry).length} delta(s)`);
+    } else {
+      // Full initialization
+      this.titleRegistry = titleRegistry || {};
+      this.logger.info('TaskRunner', `Initialized title registry with ${Object.keys(this.titleRegistry).length} title(s)`);
+    }
   }
   
   /**
@@ -50,7 +99,7 @@ class TaskRunner {
    */
   async execute(taskType, payload) {
     try {
-      console.log(`[TaskRunner] Executing ${taskType} task for: ${payload.url}`);
+      this.logger.info('TaskRunner', `Executing ${taskType} task for: ${payload.url}`);
       
       let result;
       
@@ -69,7 +118,7 @@ class TaskRunner {
       };
       
     } catch (error) {
-      console.error(`[TaskRunner] Task failed:`, error);
+      this.logger.error('TaskRunner', `Task failed`, error);
       
       return {
         type: MESSAGE_TYPES.RESULT,
@@ -99,7 +148,7 @@ class TaskRunner {
     }
     
     // Navigate to page
-    console.log(`[TaskRunner] Navigating to: ${payload.url}`);
+    this.logger.info('TaskRunner', `Navigating to: ${payload.url}`);
     await this.page.goto(payload.url, {
       waitUntil: 'networkidle0',
       timeout: 60000
@@ -142,7 +191,7 @@ class TaskRunner {
     let capturedCookies = null;
     if (payload.isFirstPage) {
       capturedCookies = await this.page.cookies();
-      console.log(`[TaskRunner] Captured ${capturedCookies.length} cookie(s) from first page`);
+      this.logger.info('TaskRunner', `Captured ${capturedCookies.length} cookie(s) from first page`);
     }
     
     // Return results with resolved page name
@@ -150,7 +199,7 @@ class TaskRunner {
       success: true,
       pageId: payload.pageId,
       url: payload.url,
-      title: pageName || 'Untitled',
+      resolvedTitle: pageName || 'Untitled',
       links: normalizedLinks,
       cookies: capturedCookies,
       metadata: {
@@ -168,38 +217,96 @@ class TaskRunner {
    * @returns {Promise<import('../core/ProtocolDefinitions').DownloadResult>} Download result
    */
   async _executeDownload(payload) {
+    // Validate payload structure
+    this._validateDownloadPayload(payload);
+    
+    // Get human-readable title for logging (use cached registry)
+    const displayTitle = this.titleRegistry[payload.pageId] || 'Unknown';
+    this.logger.info('DOWNLOAD', `Starting download: ${displayTitle}`);
+    
     // Create or reuse page
     if (!this.page) {
       this.page = await this.browser.newPage();
       await this.page.setViewport({ width: 1920, height: 1080 });
     }
     
-    // Set cookies
-    if (payload.cookies && payload.cookies.length > 0) {
-      await this.page.setCookie(...payload.cookies);
+    // Initialize pipeline context
+    const pipelineContext = {
+      browser: this.browser,
+      page: this.page,
+      config: this.config,
+      logger: this.logger,
+      payload: payload,
+      fileSystem: this.fileSystem,
+      stats: {
+        assetsDownloaded: 0,
+        linksRewritten: 0
+      },
+      downloadedAssets: []
+    };
+    
+    // Construct the scraping pipeline
+    const pipeline = new ScrapingPipeline(
+      [
+        new NavigationStep(),
+        new CookieConsentStep(this.cookieHandler), // Precautionary cookie handling
+        new ExpansionStep(this.contentExpander),
+        new AssetDownloadStep(
+          this.assetDownloader,
+          this.cssDownloader,
+          this.fileDownloader
+        ),
+        new LinkRewriterStep(),
+        new HtmlWriteStep()
+      ],
+      this.logger
+    );
+    
+    // Execute the pipeline
+    try {
+      await pipeline.execute(pipelineContext);
+      
+      this.logger.success('DOWNLOAD', `Completed: ${displayTitle}`);
+      
+      // Return truthful result from actual operations
+      return {
+        success: true,
+        pageId: payload.pageId,
+        url: payload.url,
+        savedPath: payload.savePath,
+        assetsDownloaded: pipelineContext.stats.assetsDownloaded,
+        linksRewritten: pipelineContext.stats.linksRewritten
+      };
+      
+    } catch (error) {
+      this.logger.error('DOWNLOAD', `Failed: ${displayTitle}`, error);
+      throw error;
+    }
+  }
+  
+  /**
+   * Validate download payload structure
+   * @private
+   * @param {Object} payload - Download payload to validate
+   * @throws {Error} If payload is invalid or missing required fields
+   */
+  _validateDownloadPayload(payload) {
+    const requiredFields = ['url', 'pageId', 'savePath'];
+    
+    for (const field of requiredFields) {
+      if (!payload[field]) {
+        throw new Error(`Invalid download payload: missing required field '${field}'`);
+      }
     }
     
-    // Navigate to page
-    console.log(`[TaskRunner] Downloading: ${payload.url}`);
-    await this.page.goto(payload.url, {
-      waitUntil: 'networkidle0',
-      timeout: 60000
-    });
+    // Critical: Verify savePath is absolute
+    if (!path.isAbsolute(payload.savePath)) {
+      throw new Error(
+        `Invalid download payload: savePath must be absolute. Received: ${payload.savePath}`
+      );
+    }
     
-    // Get page content
-    const html = await this.page.content();
-    
-    // TODO: Implement full PageProcessor logic here
-    // For now, return placeholder
-    
-    return {
-      success: true,
-      pageId: payload.pageId,
-      url: payload.url,
-      savedPath: payload.targetFilePath,
-      assetsDownloaded: 0,
-      linksRewritten: 0
-    };
+    this.logger.debug('VALIDATION', `Payload validated for ${payload.pageId}`);
   }
   
   /**

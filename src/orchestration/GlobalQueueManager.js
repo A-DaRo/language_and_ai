@@ -7,6 +7,7 @@
  * **CRITICAL CONTEXT**: Runs in MASTER process. This is the "frontier" state manager.
  */
 
+const path = require('path');
 const SystemEventBus = require('../core/SystemEventBus');
 const PageContext = require('../domain/PageContext');
 
@@ -22,6 +23,7 @@ class GlobalQueueManager {
     this.discoveryQueue = []; // Array of { pageContext, isFirstPage }
     this.visitedUrls = new Set(); // URLs already discovered
     this.pendingDiscovery = 0; // Count of in-flight discovery tasks
+    this.maxDepth = 0; // Track maximum depth discovered (O(1) lookup)
     
     // Download phase queues
     this.downloadQueue = []; // Array of pageContext objects
@@ -30,6 +32,9 @@ class GlobalQueueManager {
     
     // Context registry
     this.allContexts = new Map(); // pageId -> PageContext
+    
+    // Title registry (ID -> human-readable title)
+    this.idToTitleMap = new Map(); // pageId -> resolved title
     
     // Statistics
     this.stats = {
@@ -67,6 +72,11 @@ class GlobalQueueManager {
     
     // Register context
     this.allContexts.set(pageContext.id, pageContext);
+    
+    // Track maximum depth (O(1) incremental update)
+    if (pageContext.depth > this.maxDepth) {
+      this.maxDepth = pageContext.depth;
+    }
     
     // Add to queue
     this.discoveryQueue.push({ pageContext, isFirstPage });
@@ -114,9 +124,11 @@ class GlobalQueueManager {
       return [];
     }
     
-    // Update parent context with resolved title
-    if (resolvedTitle) {
-      parentContext.displayTitle = resolvedTitle;
+    // Store resolved title in centralized registry (immutable after first set)
+    if (resolvedTitle && !this.idToTitleMap.has(pageId)) {
+      this.idToTitleMap.set(pageId, resolvedTitle);
+      // Also update the parent context's title immediately for consistency
+      parentContext.updateTitleFromRegistry(resolvedTitle);
     }
     
     const newContexts = [];
@@ -198,10 +210,13 @@ class GlobalQueueManager {
   }
   
   /**
-   * Get next download task from queue
-   * @returns {PageContext|null} Next page context to download or null
+   * Get next download task from queue with absolute path calculation
+   * @param {string} outputDir - The system's root output directory (absolute)
+   * @returns {Object|null} Download payload with absolute savePath or null
+   * @returns {PageContext} return.context - Page context to download
+   * @returns {string} return.savePath - Absolute filesystem path for index.html
    */
-  nextDownload() {
+  nextDownload(outputDir) {
     if (this.downloadQueue.length === 0) {
       return null;
     }
@@ -209,7 +224,36 @@ class GlobalQueueManager {
     // Simple FIFO for now - could be optimized for dependency order
     const context = this.downloadQueue.shift();
     
-    return context;
+    // Calculate absolute save path to prevent ghost writes
+    const savePath = this._calculateAbsolutePath(outputDir, context);
+    
+    return {
+      context,
+      savePath
+    };
+  }
+  
+  /**
+   * Calculate the absolute filesystem path for a page context
+   * @private
+   * @param {string} outputDir - Root output directory (relative or absolute)
+   * @param {PageContext} context - The page context containing hierarchy info
+   * @returns {string} The absolute path ending in 'index.html'
+   * @example
+   * _calculateAbsolutePath('course_material', context)
+   * // Returns: "C:\Users\...\course_material\Main_Page\Week_1\index.html"
+   */
+  _calculateAbsolutePath(outputDir, context) {
+    // Resolve outputDir to absolute path relative to process.cwd()
+    const absoluteOutputDir = path.resolve(process.cwd(), outputDir);
+    
+    // Get relative path from context (e.g., "Main_Page/Week_1")
+    const relativePath = context.getFilePath(outputDir);
+    
+    // Combine to create absolute path
+    const absolutePath = path.resolve(absoluteOutputDir, relativePath);
+    
+    return absolutePath;
   }
   
   /**
@@ -279,6 +323,45 @@ class GlobalQueueManager {
   }
   
   /**
+   * Get title registry as serializable object for IPC
+   * @returns {Object} Plain object representation of ID-to-title map
+   * @example
+   * const registry = queueManager.getTitleRegistry();
+   * // Returns: { id1: 'Title 1', id2: 'Title 2' }
+   */
+  getTitleRegistry() {
+    return Object.fromEntries(this.idToTitleMap);
+  }
+  
+  /**
+   * Get title by page ID
+   * @param {string} pageId - Page identifier
+   * @returns {string|null} Title or null if not found
+   */
+  getTitleById(pageId) {
+    return this.idToTitleMap.get(pageId) || null;
+  }
+  
+  /**
+   * Get maximum depth discovered
+   * @returns {number} Maximum depth (0 if no pages discovered)
+   */
+  getMaxDepth() {
+    return this.maxDepth;
+  }
+  
+  /**
+   * Set title for a page ID (used for initialization)
+   * @param {string} pageId - Page identifier
+   * @param {string} title - Human-readable title
+   */
+  setTitle(pageId, title) {
+    if (!this.idToTitleMap.has(pageId)) {
+      this.idToTitleMap.set(pageId, title);
+    }
+  }
+  
+  /**
    * Get statistics
    * @returns {Object} Current statistics
    */
@@ -305,10 +388,12 @@ class GlobalQueueManager {
     this.discoveryQueue = [];
     this.visitedUrls.clear();
     this.pendingDiscovery = 0;
+    this.maxDepth = 0;
     this.downloadQueue = [];
     this.pendingDownloads.clear();
     this.completedDownloads.clear();
     this.allContexts.clear();
+    this.idToTitleMap.clear();
     this.stats = { discovered: 0, downloaded: 0, failed: 0 };
   }
 }

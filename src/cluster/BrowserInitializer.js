@@ -9,6 +9,7 @@ const { fork } = require('child_process');
 const os = require('os');
 const path = require('path');
 const { WorkerProxy } = require('./WorkerProxy');
+const Logger = require('../core/Logger');
 
 /**
  * @class BrowserInitializer
@@ -73,7 +74,7 @@ class BrowserInitializer {
    * console.log(`Spawned ${workers.length} workers`);
    */
   static async spawnWorkerPool(count, startIndex = 1) {
-    console.log(`[BrowserInitializer] Spawning ${count} worker process(es)...`);
+    Logger.getInstance().info('BrowserInitializer', `Spawning ${count} worker process(es)...`);
     
     const workers = [];
     const promises = [];
@@ -86,7 +87,7 @@ class BrowserInitializer {
     const results = await Promise.all(promises);
     workers.push(...results);
     
-    console.log(`[BrowserInitializer] Successfully spawned ${workers.length} worker(s)`);
+    Logger.getInstance().info('BrowserInitializer', `Successfully spawned ${workers.length} worker(s)`);
     return workers;
   }
   
@@ -103,11 +104,11 @@ class BrowserInitializer {
     const workerId = `worker-${index}`;
     const workerScriptPath = path.join(__dirname, '..', 'worker', 'WorkerEntrypoint.js');
     
-    console.log(`[BrowserInitializer] Spawning worker ${workerId}...`);
+    Logger.getInstance().info('BrowserInitializer', `Spawning worker ${workerId}...`);
     
     // Spawn child process
     const childProcess = fork(workerScriptPath, [], {
-      silent: false, // Inherit stdio for logs
+      silent: true, // Silence stdout/stderr to prevent terminal pollution
       env: { ...process.env, WORKER_ID: workerId }
     });
     

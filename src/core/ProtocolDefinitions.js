@@ -15,6 +15,7 @@
  * @property {string} READY - Worker ready signal
  * @property {string} RESULT - Task result response
  * @property {string} SET_COOKIES - Broadcast cookies to worker
+ * @property {string} UPDATE_REGISTRY - Update title registry after discovery completion
  */
 
 /**
@@ -28,14 +29,19 @@ const MESSAGE_TYPES = {
   DOWNLOAD: 'IPC_DOWNLOAD',
   SHUTDOWN: 'IPC_SHUTDOWN',
   SET_COOKIES: 'IPC_SET_COOKIES',
+  UPDATE_REGISTRY: 'IPC_UPDATE_REGISTRY',
   
   // Worker -> Master responses
   READY: 'IPC_READY',
-  RESULT: 'IPC_RESULT'
+  RESULT: 'IPC_RESULT',
+  LOG: 'IPC_LOG'
 };
 
 /**
  * @typedef {Object} InitPayload
+ * @description Command payload for Worker initialization. Contains configuration
+ * and optionally the title registry for display purposes.
+ * @property {string} workerId - Unique ID assigned to this worker
  * @property {Object} config - Configuration object for the worker
  * @property {string} config.NOTION_PAGE_URL - Base Notion URL
  * @property {string} config.OUTPUT_DIR - Output directory path
@@ -44,6 +50,7 @@ const MESSAGE_TYPES = {
  * @property {number} config.TIMEOUT_PAGE_LOAD - Page load timeout in ms
  * @property {number} config.TIMEOUT_EXPAND_TOGGLE - Toggle expansion timeout in ms
  * @property {number} config.EXPAND_WAIT_TIME - Wait time between expansions in ms
+ * @property {Object} [titleRegistry] - Initial ID-to-title map for display (sent once at initialization, re-sent after discovery)
  */
 
 /**
@@ -58,11 +65,13 @@ const MESSAGE_TYPES = {
 
 /**
  * @typedef {Object} DownloadPayload
+ * @description Command payload for the Execution Phase (Asset Download).
+ * Updated to support absolute path enforcement and prevent "ghost writes".
  * @property {string} url - Target URL to download
  * @property {string} pageId - Unique page identifier (Notion ID)
  * @property {string|null} parentId - Parent page ID (null for root)
  * @property {number} depth - Current depth in the hierarchy
- * @property {string} targetFilePath - Calculated file path where HTML should be saved (relative to OUTPUT_DIR)
+ * @property {string} savePath - **ABSOLUTE** filesystem path where index.html must be saved (e.g., "C:\...\course_material\Page_Name\index.html")
  * @property {Array<Object>} cookies - Cookies to set before navigation
  * @property {Object} linkRewriteMap - Map of NotionID -> RelativeFilePath for link rewriting
  */
@@ -70,6 +79,14 @@ const MESSAGE_TYPES = {
 /**
  * @typedef {Object} SetCookiesPayload
  * @property {Array<Object>} cookies - Array of cookie objects to set
+ */
+
+/**
+ * @typedef {Object} UpdateRegistryPayload
+ * @description Command to synchronize the Title Registry after Discovery/Pruning.
+ * Sent to all workers after discovery phase completes to ensure they have the
+ * complete ID-to-Title mapping for proper logging.
+ * @property {Object<string, string>} titleRegistry - The authoritative ID-to-Title map
  */
 
 /**
@@ -85,8 +102,7 @@ const MESSAGE_TYPES = {
  * @property {boolean} success - Whether the discovery succeeded
  * @property {string} pageId - Page identifier
  * @property {string} url - Page URL
- * @property {string} title - Page title
- * @property {string} [displayTitle] - Display title if different from title
+ * @property {string} resolvedTitle - Human-readable page title resolved from URL/page.title()
  * @property {Array<Object>} links - Extracted links
  * @property {Array<Object>} [cookies] - Captured cookies (only on first page)
  * @property {Object} [metadata] - Additional metadata
@@ -153,6 +169,38 @@ function deserializeError(serializedError) {
 }
 
 /**
+ * Serialize a Map to a plain object for IPC transmission
+ * @param {Map} map - Map to serialize (ID -> Title)
+ * @returns {Object} Plain object representation
+ * @example
+ * const map = new Map([['id1', 'Title 1'], ['id2', 'Title 2']]);
+ * const obj = serializeTitleMap(map);
+ * // Returns: { id1: 'Title 1', id2: 'Title 2' }
+ */
+function serializeTitleMap(map) {
+  if (!map || !(map instanceof Map)) {
+    return {};
+  }
+  return Object.fromEntries(map);
+}
+
+/**
+ * Deserialize a plain object back into a Map
+ * @param {Object} obj - Plain object to deserialize
+ * @returns {Map} Reconstructed Map
+ * @example
+ * const obj = { id1: 'Title 1', id2: 'Title 2' };
+ * const map = deserializeTitleMap(obj);
+ * // Returns: Map { 'id1' => 'Title 1', 'id2' => 'Title 2' }
+ */
+function deserializeTitleMap(obj) {
+  if (!obj || typeof obj !== 'object') {
+    return new Map();
+  }
+  return new Map(Object.entries(obj));
+}
+
+/**
  * Validate that a message conforms to the IPC protocol
  * @param {IPCMessage} message - Message to validate
  * @returns {boolean} True if valid
@@ -179,5 +227,7 @@ module.exports = {
   MESSAGE_TYPES,
   serializeError,
   deserializeError,
-  validateMessage
+  validateMessage,
+  serializeTitleMap,
+  deserializeTitleMap
 };

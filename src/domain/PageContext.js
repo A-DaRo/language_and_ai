@@ -21,18 +21,19 @@ const FileSystemUtils = require('../utils/FileSystemUtils');
 class PageContext {
   /**
    * @param {string} url - Page URL
-   * @param {string} title - Page title (will be sanitized)
+   * @param {string} rawTitle - Page title (will be sanitized for filesystem use)
    * @param {number} [depth=0] - Depth in the hierarchy
    * @param {PageContext|null} [parentContext=null] - Parent context reference (Master-side only)
    * @param {string|null} [parentId=null] - Parent page ID (IPC-safe alternative)
+   * 
+   * @note Human-readable titles are resolved via GlobalQueueManager.idToTitleMap.
+   * This class only stores sanitized filesystem-safe titles.
    */
-  constructor(url, title, depth = 0, parentContext = null, parentId = null) {
+  constructor(url, rawTitle, depth = 0, parentContext = null, parentId = null) {
     // Generate unique ID from URL (Notion ID)
     this.id = this._extractNotionId(url);
     this.url = url;
-    this.originalTitle = title || 'Untitled';
-    this.displayTitle = null; // Will be set after page is discovered and name is resolved
-    this.title = FileSystemUtils.sanitizeFilename(title);
+    this.title = FileSystemUtils.sanitizeFilename(rawTitle || 'Untitled');
     this.depth = depth;
     
     // Support both tree-based and flat representations
@@ -60,12 +61,13 @@ class PageContext {
   }
 
   /**
-   * Update the human-friendly title while keeping sanitized filesystem name
+   * Update the title from a human-readable title (e.g., from title registry)
+   * This sanitizes the human-readable title and updates the filesystem-safe title
+   * @param {string} humanReadableTitle - The human-readable title to update from
    */
-  setDisplayTitle(title) {
-    if (!title) return;
-    this.originalTitle = title;
-    this.displayTitle = title.trim() || this.displayTitle;
+  updateTitleFromRegistry(humanReadableTitle) {
+    if (!humanReadableTitle) return;
+    this.title = FileSystemUtils.sanitizeFilename(humanReadableTitle);
   }
   
   /**
@@ -175,6 +177,7 @@ class PageContext {
   /**
    * Serialize to JSON for IPC transfer (Worker → Master or Master → Worker)
    * @returns {Object} JSON-serializable object
+   * @note Human-readable titles are stored in GlobalQueueManager.idToTitleMap, not here.
    * @example
    * const json = pageContext.toJSON();
    * // Send via IPC: process.send({ type: 'RESULT', data: json });
@@ -183,8 +186,6 @@ class PageContext {
     return {
       id: this.id,
       url: this.url,
-      originalTitle: this.originalTitle,
-      displayTitle: this.displayTitle,
       title: this.title,
       depth: this.depth,
       parentId: this.parentId,
@@ -202,6 +203,7 @@ class PageContext {
    * @param {Object} json - Serialized PageContext data
    * @param {Map<string, PageContext>} [contextMap] - Optional map to resolve parent references
    * @returns {PageContext} Reconstructed PageContext instance
+   * @note Human-readable titles must be resolved via GlobalQueueManager.idToTitleMap
    * @example
    * const json = { id: 'abc123', url: '...', title: 'Page', ... };
    * const pageContext = PageContext.fromJSON(json);
@@ -210,7 +212,7 @@ class PageContext {
     // Create instance with IPC-safe parentId
     const context = new PageContext(
       json.url,
-      json.originalTitle || json.title,
+      json.title,
       json.depth || 0,
       null, // parentContext will be resolved if contextMap provided
       json.parentId
@@ -218,7 +220,6 @@ class PageContext {
     
     // Restore properties
     context.id = json.id;
-    context.displayTitle = json.displayTitle || json.originalTitle;
     context.section = json.section;
     context.subsection = json.subsection;
     context.childIds = json.childIds || [];
@@ -252,9 +253,10 @@ class PageContext {
   /**
    * Get a string representation for debugging
    * @returns {string} String representation
+   * @note Human-readable title available via GlobalQueueManager.getTitleById(this.id)
    */
   toString() {
-    return `PageContext(id="${this.id}", title="${this.title}", depth=${this.depth}, section="${this.section}", subsection="${this.subsection}")`;
+    return `PageContext(id="${this.id}", sanitizedTitle="${this.title}", depth=${this.depth}, section="${this.section}", subsection="${this.subsection}")`;
   }
 }
 

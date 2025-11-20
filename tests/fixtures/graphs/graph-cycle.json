@@ -1,0 +1,35 @@
+{
+  "description": "Graph with cycle for back-edge testing",
+  "rootUrl": "https://notion.so/root",
+  "nodes": [
+    {
+      "id": "root",
+      "url": "https://notion.so/root",
+      "title": "Root Page",
+      "depth": 0,
+      "parentId": null,
+      "children": ["child-1"]
+    },
+    {
+      "id": "child-1",
+      "url": "https://notion.so/child-1",
+      "title": "Child 1",
+      "depth": 1,
+      "parentId": "root",
+      "children": ["child-2"]
+    },
+    {
+      "id": "child-2",
+      "url": "https://notion.so/child-2",
+      "title": "Child 2",
+      "depth": 2,
+      "parentId": "child-1",
+      "children": ["root"]
+    }
+  ],
+  "edges": [
+    { "from": "root", "to": "child-1", "type": "tree" },
+    { "from": "child-1", "to": "child-2", "type": "tree" },
+    { "from": "child-2", "to": "root", "type": "back" }
+  ]
+}

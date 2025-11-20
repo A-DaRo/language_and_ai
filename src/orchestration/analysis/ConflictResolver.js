@@ -17,16 +17,31 @@ class ConflictResolver {
    * Resolve conflicts and generate download plan
    * @static
    * @param {Array<PageContext>} allContexts - All discovered page contexts
+   * @param {Object} [titleRegistry={}] - ID-to-title map for human-readable logging
    * @returns {Object} Resolution result
    * @returns {Array<PageContext>} return.canonicalContexts - Unique pages to download
    * @returns {Map<string, string>} return.linkRewriteMap - NotionID -> RelativeFilePath mapping
    * @returns {Object} return.stats - Conflict resolution statistics
    * @example
-   * const { canonicalContexts, linkRewriteMap } = ConflictResolver.resolve(allContexts);
+   * const titleRegistry = queueManager.getTitleRegistry();
+   * const { canonicalContexts, linkRewriteMap } = ConflictResolver.resolve(allContexts, titleRegistry);
    * console.log(`Found ${canonicalContexts.length} unique pages`);
    */
-  static resolve(allContexts) {
+  static resolve(allContexts, titleRegistry = {}) {
     console.log(`[ConflictResolver] Analyzing ${allContexts.length} discovered page(s)`);
+    
+    // First pass: Update all context titles from the title registry
+    // This ensures file paths use human-readable names instead of raw IDs
+    console.log(`[ConflictResolver] Updating context titles from title registry...`);
+    let updatedCount = 0;
+    for (const context of allContexts) {
+      const humanReadableTitle = titleRegistry[context.id];
+      if (humanReadableTitle) {
+        context.updateTitleFromRegistry(humanReadableTitle);
+        updatedCount++;
+      }
+    }
+    console.log(`[ConflictResolver] Updated ${updatedCount} context title(s) from registry`);
     
     const urlToContexts = new Map(); // url -> Array of PageContext
     const canonicalContexts = [];
@@ -45,11 +60,12 @@ class ConflictResolver {
     // Process each unique URL
     for (const [url, contexts] of urlToContexts.entries()) {
       // Pick canonical context (first occurrence or shortest path)
-      const canonical = ConflictResolver._selectCanonical(contexts);
+      const canonical = ConflictResolver._selectCanonical(contexts, titleRegistry);
       
       if (contexts.length > 1) {
         duplicateCount += contexts.length - 1;
-        console.log(`[ConflictResolver] Found ${contexts.length} references to: ${canonical.title}`);
+        const displayTitle = titleRegistry[canonical.id] || canonical.title || 'Untitled';
+        console.log(`[ConflictResolver] Found ${contexts.length} references to: ${displayTitle}`);
       }
       
       // Calculate target file path for this page
@@ -87,9 +103,10 @@ class ConflictResolver {
    * @private
    * @static
    * @param {Array<PageContext>} contexts - Array of contexts pointing to same URL
+   * @param {Object} [titleRegistry={}] - ID-to-title map for logging
    * @returns {PageContext} The canonical context to use
    */
-  static _selectCanonical(contexts) {
+  static _selectCanonical(contexts, titleRegistry = {}) {
     if (contexts.length === 1) {
       return contexts[0];
     }
@@ -148,10 +165,11 @@ class ConflictResolver {
    * Generate a visual conflict report (for logging/debugging)
    * @static
    * @param {Array<PageContext>} allContexts - All discovered contexts
+   * @param {Object} [titleRegistry={}] - ID-to-title map for human-readable output
    * @returns {string} Formatted report
    */
-  static generateReport(allContexts) {
-    const { canonicalContexts, linkRewriteMap, stats } = ConflictResolver.resolve(allContexts);
+  static generateReport(allContexts, titleRegistry = {}) {
+    const { canonicalContexts, linkRewriteMap, stats } = ConflictResolver.resolve(allContexts, titleRegistry);
     
     let report = '\n=== Conflict Resolution Report ===\n\n';
     report += `Total Discovered: ${stats.totalDiscovered}\n`;

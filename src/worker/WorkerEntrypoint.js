@@ -21,6 +21,8 @@
 const puppeteer = require('puppeteer');
 const { MESSAGE_TYPES, validateMessage } = require('../core/ProtocolDefinitions');
 const TaskRunner = require('./TaskRunner');
+const Logger = require('../core/Logger');
+const IpcStrategy = require('../core/logger/IpcStrategy');
 
 /**
  * @private
@@ -61,7 +63,7 @@ async function initializeBrowser() {
     
     return browser;
   } catch (error) {
-    console.error('[Worker] Failed to launch browser:', error);
+    Logger.getInstance().error('Worker', 'Failed to launch browser', error);
     throw error;
   }
 }
@@ -79,6 +81,22 @@ function setupIPCListener() {
       validateMessage(message);
       
       const { type, payload } = message;
+      
+      // Handle INIT command (receive initial titleRegistry)
+      if (type === MESSAGE_TYPES.INIT) {
+        if (taskRunner && payload.titleRegistry) {
+          taskRunner.setTitleRegistry(payload.titleRegistry, false);
+        }
+        return;
+      }
+      
+      // Handle UPDATE_REGISTRY command (receive updated titleRegistry after discovery)
+      if (type === MESSAGE_TYPES.UPDATE_REGISTRY) {
+        if (taskRunner && payload.titleRegistry) {
+          taskRunner.setTitleRegistry(payload.titleRegistry, false); // Full update, not delta
+        }
+        return;
+      }
       
       // Handle shutdown command
       if (type === MESSAGE_TYPES.SHUTDOWN) {
@@ -105,7 +123,7 @@ function setupIPCListener() {
       }
       
     } catch (error) {
-      console.error('[Worker] Error handling IPC message:', error);
+      Logger.getInstance().error('Worker', 'Error handling IPC message', error);
       
       // Send error result back to Master
       const { serializeError } = require('../core/ProtocolDefinitions');
@@ -126,7 +144,7 @@ function setupIPCListener() {
  * @returns {Promise<void>}
  */
 async function shutdown(reason) {
-  console.log(`[Worker] Shutting down: ${reason}`);
+  Logger.getInstance().info('Worker', `Shutting down: ${reason}`);
   
   try {
     if (browser) {
@@ -134,7 +152,7 @@ async function shutdown(reason) {
       browser = null;
     }
   } catch (error) {
-    console.error('[Worker] Error during shutdown:', error);
+    Logger.getInstance().error('Worker', 'Error during shutdown', error);
   }
   
   process.exit(0);
@@ -146,12 +164,12 @@ async function shutdown(reason) {
  */
 function setupErrorHandlers() {
   process.on('uncaughtException', async (error) => {
-    console.error('[Worker] Uncaught exception:', error);
+    Logger.getInstance().error('Worker', 'Uncaught exception', error);
     await shutdown('Uncaught exception');
   });
   
   process.on('unhandledRejection', async (reason, promise) => {
-    console.error('[Worker] Unhandled rejection at:', promise, 'reason:', reason);
+    Logger.getInstance().error('Worker', `Unhandled rejection at: ${promise}`, reason);
     await shutdown('Unhandled rejection');
   });
   
@@ -173,13 +191,17 @@ function setupErrorHandlers() {
  */
 async function main() {
   try {
-    console.log(`[Worker] Starting worker process (PID: ${process.pid})`);
+    // Initialize Logger with IPC Strategy
+    const logger = Logger.getInstance();
+    logger.addStrategy(new IpcStrategy());
+
+    logger.info('Worker', `Starting worker process (PID: ${process.pid})`);
     
     // Setup error handlers first
     setupErrorHandlers();
     
     // Initialize browser
-    console.log('[Worker] Launching browser...');
+    logger.info('Worker', 'Launching browser...');
     const browserInstance = await initializeBrowser();
     
     // Initialize TaskRunner
@@ -194,7 +216,7 @@ async function main() {
       pid: process.pid
     });
     
-    console.log('[Worker] Ready and waiting for tasks');
+    logger.info('Worker', 'Ready and waiting for tasks');
     
   } catch (error) {
     console.error('[Worker] Fatal initialization error:', error);

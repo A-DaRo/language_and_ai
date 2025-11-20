@@ -9,9 +9,10 @@
  * Workflow Phases:
  * 1. Bootstrap: Spawn workers, capture cookies from first page
  * 2. Discovery: Parallel discovery of all pages (metadata only)
- * 3. Conflict Resolution: Detect duplicates, calculate file paths
- * 4. Download: Parallel download with link rewriting
- * 5. Completion: Statistics and cleanup
+ * 3. User Confirmation: Display site tree and prompt for confirmation
+ * 4. Conflict Resolution: Detect duplicates, calculate file paths
+ * 5. Download: Parallel download with link rewriting
+ * 6. Completion: Statistics and cleanup
  */
 
 const { MESSAGE_TYPES } = require('../core/ProtocolDefinitions');
@@ -23,6 +24,7 @@ const ConflictResolver = require('./analysis/ConflictResolver');
 const PageContext = require('../domain/PageContext');
 const Logger = require('../core/Logger');
 const Config = require('../core/Config');
+const UserPrompt = require('../utils/UserPrompt');
 
 /**
  * Orchestration phases
@@ -31,6 +33,7 @@ const Config = require('../core/Config');
 const Phase = {
   BOOTSTRAP: 'BOOTSTRAP',
   DISCOVERY: 'DISCOVERY',
+  USER_CONFIRMATION: 'USER_CONFIRMATION',
   CONFLICT_RESOLUTION: 'CONFLICT_RESOLUTION',
   DOWNLOAD: 'DOWNLOAD',
   COMPLETE: 'COMPLETE'
@@ -104,17 +107,24 @@ class ClusterOrchestrator {
       
       if (dryRun) {
         // Dry run mode: skip download phases
-        this.logger.info('ORCHESTRATOR', 'Dry run mode: skipping conflict resolution and download phases');
+        this.logger.info('ORCHESTRATOR', 'Dry run mode: skipping user confirmation, conflict resolution and download phases');
         return await this._phaseComplete(true);
       }
       
-      // Phase 3: Conflict Resolution
+      // Phase 3: User Confirmation
+      const userConfirmed = await this._phaseUserConfirmation();
+      if (!userConfirmed) {
+        this.logger.warn('ORCHESTRATOR', 'Download aborted by user.');
+        return await this._phaseComplete(true);
+      }
+      
+      // Phase 4: Conflict Resolution
       const { canonicalContexts, linkRewriteMap } = await this._phaseConflictResolution();
       
-      // Phase 4: Download
+      // Phase 5: Download
       await this._phaseDownload(canonicalContexts, linkRewriteMap);
       
-      // Phase 5: Complete
+      // Phase 6: Complete
       return await this._phaseComplete();
       
     } catch (error) {
@@ -191,7 +201,15 @@ class ClusterOrchestrator {
       await this.browserManager.broadcastCookies(this.cookies);
     }
     
+    // Initialize all workers with title registry (sent once, eliminates IPC overhead)
+    this.logger.info('BOOTSTRAP', 'Initializing workers with title registry...');
+    const titleRegistry = this.queueManager.getTitleRegistry();
+    await this.browserManager.initializeWorkers(titleRegistry);
+    
     this.logger.success('BOOTSTRAP', `Bootstrap complete with ${this.browserManager.getTotalCount()} worker(s)`);
+    this.eventBus.emit('BOOTSTRAP:COMPLETE', { 
+      workerCount: this.browserManager.getTotalCount() 
+    });
   }
   
   /**
@@ -240,20 +258,91 @@ class ClusterOrchestrator {
     
     const stats = this.queueManager.getStatistics();
     this.logger.success('DISCOVERY', `Discovery complete: ${stats.discovered} page(s) discovered`);
+    
+    // CRITICAL: Update workers with complete title registry after discovery
+    this.logger.info('DISCOVERY', 'Updating workers with discovered titles...');
+    await this._updateWorkerTitleRegistry();
   }
   
   /**
-   * Phase 3: Conflict Resolution - Detect duplicates and generate paths
+   * Update all workers with the complete title registry after discovery
+   * @private
+   * @async
+   */
+  async _updateWorkerTitleRegistry() {
+    const titleRegistry = this.queueManager.getTitleRegistry();
+    const titleCount = Object.keys(titleRegistry).length;
+    
+    this.logger.info('REGISTRY', `Broadcasting ${titleCount} title(s) to workers...`);
+    
+    // Re-initialize all workers with the complete title registry
+    await this.browserManager.initializeWorkers(titleRegistry);
+    
+    this.logger.success('REGISTRY', 'Workers updated with complete title registry');
+  }
+  
+  /**
+   * Phase 3: User Confirmation - Display site tree and prompt for confirmation
+   * @private
+   * @async
+   * @returns {Promise<boolean>} True to proceed, false to abort
+   */
+  async _phaseUserConfirmation() {
+    this.currentPhase = Phase.USER_CONFIRMATION;
+    this.logger.separator('Phase 3: User Confirmation');
+    
+    // Get discovery statistics
+    const stats = this.queueManager.getStatistics();
+    
+    // Handle edge case: no pages discovered
+    if (stats.discovered === 0) {
+      this.logger.warn('USER_CONFIRMATION', 'No pages discovered. Aborting.');
+      return false;
+    }
+    
+    // Display site tree
+    this.logger.info('USER_CONFIRMATION', 'Discovered Site Structure:');
+    const allContexts = this.queueManager.getAllContexts();
+    const rootContext = allContexts.find(ctx => ctx.depth === 0);
+    if (rootContext) {
+      this._displayPageTree(rootContext);
+    }
+    
+    // Display summary statistics
+    this.logger.info('USER_CONFIRMATION', '\nDiscovery Summary:');
+    this.logger.info('USER_CONFIRMATION', `  Total Pages: ${stats.discovered}`);
+    this.logger.info('USER_CONFIRMATION', `  Maximum Depth: ${this.queueManager.getMaxDepth()}`);
+    
+    // Prompt user for confirmation
+    const prompt = new UserPrompt();
+    const proceed = await prompt.promptConfirmDownload({
+      totalPages: stats.discovered,
+      maxDepth: this.queueManager.getMaxDepth()
+    });
+    prompt.close();
+    
+    if (proceed) {
+      this.logger.success('USER_CONFIRMATION', 'User confirmed. Proceeding to download phase...');
+    } else {
+      this.logger.warn('USER_CONFIRMATION', 'User declined. Aborting download process.');
+    }
+    
+    return proceed;
+  }
+  
+  /**
+   * Phase 4: Conflict Resolution - Detect duplicates and generate paths
    * @private
    * @async
    * @returns {Object} Resolution result
    */
   async _phaseConflictResolution() {
     this.currentPhase = Phase.CONFLICT_RESOLUTION;
-    this.logger.separator('Phase 3: Conflict Resolution');
+    this.logger.separator('Phase 4: Conflict Resolution');
     
     const allContexts = this.queueManager.getAllContexts();
-    const { canonicalContexts, linkRewriteMap, stats } = ConflictResolver.resolve(allContexts);
+    const titleRegistry = this.queueManager.getTitleRegistry();
+    const { canonicalContexts, linkRewriteMap, stats } = ConflictResolver.resolve(allContexts, titleRegistry);
     
     this.linkRewriteMap = linkRewriteMap;
     
@@ -264,7 +353,7 @@ class ClusterOrchestrator {
   }
   
   /**
-   * Phase 4: Download - Parallel download with link rewriting
+   * Phase 5: Download - Parallel download with link rewriting
    * @private
    * @async
    * @param {Array<PageContext>} canonicalContexts - Contexts to download
@@ -272,28 +361,30 @@ class ClusterOrchestrator {
    */
   async _phaseDownload(canonicalContexts, linkRewriteMap) {
     this.currentPhase = Phase.DOWNLOAD;
-    this.logger.separator('Phase 4: Download');
+    this.logger.separator('Phase 5: Download');
     
     // Build download queue
     this.queueManager.buildDownloadQueue(canonicalContexts);
     
     // Process download queue
     while (!this.queueManager.isDownloadComplete()) {
-      const context = this.queueManager.nextDownload();
+      const downloadTask = this.queueManager.nextDownload(this.config.OUTPUT_DIR);
       
-      if (!context) {
+      if (!downloadTask) {
         // No tasks available, wait a bit
         await new Promise(resolve => setTimeout(resolve, 100));
         continue;
       }
       
-      // Execute download task
+      const { context, savePath } = downloadTask;
+      
+      // Execute download task with absolute savePath
       await this.browserManager.execute(MESSAGE_TYPES.DOWNLOAD, {
         url: context.url,
         pageId: context.id,
         parentId: context.parentId,
         depth: context.depth,
-        targetFilePath: context.targetFilePath,
+        savePath: savePath, // Absolute path from GlobalQueueManager
         cookies: this.cookies,
         linkRewriteMap: Object.fromEntries(linkRewriteMap)
       });
@@ -309,25 +400,25 @@ class ClusterOrchestrator {
   }
   
   /**
-   * Phase 5: Complete - Cleanup and statistics
+   * Phase 6: Complete - Cleanup and statistics
    * @private
    * @async
-   * @param {boolean} isDryRun - Whether this was a dry run
+   * @param {boolean} aborted - Whether the process was aborted (dry run or user declined)
    * @returns {Object} Final result
    */
-  async _phaseComplete(isDryRun = false) {
+  async _phaseComplete(aborted = false) {
     this.currentPhase = Phase.COMPLETE;
     
-    if (isDryRun) {
-      this.logger.separator('Phase 3: Discovery Complete (Dry Run)');
+    if (aborted) {
+      this.logger.separator('Phase 6: Complete (Aborted)');
     } else {
-      this.logger.separator('Phase 5: Complete');
+      this.logger.separator('Phase 6: Complete');
     }
     
     const stats = this.queueManager.getStatistics();
     
-    if (isDryRun) {
-      this.logger.success('COMPLETE', 'Discovery phase completed successfully (dry run mode)');
+    if (aborted) {
+      this.logger.info('COMPLETE', 'Scraping process aborted. Cleaning up...');
       this.logger.info('STATS', `Discovered: ${stats.discovered} pages`);
       
       // Display page tree
@@ -355,12 +446,14 @@ class ClusterOrchestrator {
   _displayPageTree(rootContext) {
     this.logger.separator('Page Tree');
     console.log('.');
-    const rootLabel = rootContext.displayTitle || rootContext.title || '(root)';
+    
+    const titleRegistry = this.queueManager.getTitleRegistry();
+    const rootLabel = titleRegistry[rootContext.id] || rootContext.title || '(root)';
     console.log(`└─ ${rootLabel}`);
     
     rootContext.children.forEach((child, index) => {
       const isLast = index === rootContext.children.length - 1;
-      this._printTreeNode(child, '   ', isLast);
+      this._printTreeNode(child, '   ', isLast, titleRegistry);
     });
     
     this.logger.separator();
@@ -372,14 +465,14 @@ class ClusterOrchestrator {
    * @param {PageContext} context - Page context
    * @param {string} prefix - Line prefix
    * @param {boolean} isLast - Is this the last child?
+   * @param {Object} titleRegistry - ID-to-title map
    */
-  _printTreeNode(context, prefix, isLast) {
+  _printTreeNode(context, prefix, isLast, titleRegistry) {
     const connector = isLast ? '└─ ' : '├─ ';
-    const title = context.displayTitle || context.title || 'Untitled';
+    const title = titleRegistry[context.id] || context.title || 'Untitled';
     
-    // Filter explored children: those with displayTitle set (resolved after discovery)
-    // Unexplored children have raw IDs as titles (29abc... format)
-    const exploredChildren = context.children.filter(child => child.displayTitle);
+    // Filter explored children: those with titles in registry
+    const exploredChildren = context.children.filter(child => titleRegistry[child.id]);
     const internalRefs = context.children.length - exploredChildren.length;
     
     // Display title with internal reference count if any
@@ -390,7 +483,7 @@ class ClusterOrchestrator {
     const childPrefix = prefix + (isLast ? '   ' : '│  ');
     exploredChildren.forEach((child, index) => {
       const childIsLast = index === exploredChildren.length - 1;
-      this._printTreeNode(child, childPrefix, childIsLast);
+      this._printTreeNode(child, childPrefix, childIsLast, titleRegistry);
     });
   }
   
@@ -402,7 +495,9 @@ class ClusterOrchestrator {
   async _handleTaskComplete(workerId, taskType, result) {
     if (taskType === MESSAGE_TYPES.DISCOVER) {
       // Discovery task completed
-      this.logger.info('TASK', `✓ Discovered: ${result.title}`);
+      const titleRegistry = this.queueManager.getTitleRegistry();
+      const displayTitle = result.resolvedTitle || titleRegistry[result.pageId] || 'Untitled';
+      this.logger.info('TASK', `✓ Discovered: ${displayTitle}`);
       
       // Capture cookies from first page (even if empty)
       if (result.cookies !== null && result.cookies !== undefined && this.cookies === null) {
@@ -419,7 +514,7 @@ class ClusterOrchestrator {
         result.pageId,
         result.links || [],
         result.metadata,
-        result.title  // Pass resolved title
+        result.resolvedTitle  // Pass resolved title to registry
       );
       
       // Enqueue new discoveries

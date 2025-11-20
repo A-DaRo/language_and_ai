@@ -1,0 +1,46 @@
+{
+  "description": "Deep graph (5 levels) for depth-based testing",
+  "rootUrl": "https://notion.so/root",
+  "nodes": [
+    {
+      "id": "root",
+      "url": "https://notion.so/root",
+      "title": "Root Page",
+      "depth": 0,
+      "parentId": null,
+      "children": ["level-1"]
+    },
+    {
+      "id": "level-1",
+      "url": "https://notion.so/level-1",
+      "title": "Level 1 Page",
+      "depth": 1,
+      "parentId": "root",
+      "children": ["level-2"]
+    },
+    {
+      "id": "level-2",
+      "url": "https://notion.so/level-2",
+      "title": "Level 2 Page",
+      "depth": 2,
+      "parentId": "level-1",
+      "children": ["level-3"]
+    },
+    {
+      "id": "level-3",
+      "url": "https://notion.so/level-3",
+      "title": "Level 3 Page",
+      "depth": 3,
+      "parentId": "level-2",
+      "children": ["level-4"]
+    },
+    {
+      "id": "level-4",
+      "url": "https://notion.so/level-4",
+      "title": "Level 4 Page",
+      "depth": 4,
+      "parentId": "level-3",
+      "children": []
+    }
+  ]
+}

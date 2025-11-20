@@ -1,0 +1,44 @@
+{
+  "description": "Diamond dependency graph: Root -> [A, B] -> C",
+  "rootUrl": "https://notion.so/root",
+  "nodes": [
+    {
+      "id": "root",
+      "url": "https://notion.so/root",
+      "title": "Root Page",
+      "depth": 0,
+      "parentId": null,
+      "children": ["child-a", "child-b"]
+    },
+    {
+      "id": "child-a",
+      "url": "https://notion.so/child-a",
+      "title": "Child A",
+      "depth": 1,
+      "parentId": "root",
+      "children": ["child-c"]
+    },
+    {
+      "id": "child-b",
+      "url": "https://notion.so/child-b",
+      "title": "Child B",
+      "depth": 1,
+      "parentId": "root",
+      "children": ["child-c"]
+    },
+    {
+      "id": "child-c",
+      "url": "https://notion.so/child-c",
+      "title": "Child C",
+      "depth": 2,
+      "parentId": "child-a",
+      "children": []
+    }
+  ],
+  "edges": [
+    { "from": "root", "to": "child-a", "type": "tree" },
+    { "from": "root", "to": "child-b", "type": "tree" },
+    { "from": "child-a", "to": "child-c", "type": "tree" },
+    { "from": "child-b", "to": "child-c", "type": "cross" }
+  ]
+}

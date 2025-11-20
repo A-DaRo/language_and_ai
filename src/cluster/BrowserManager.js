@@ -20,6 +20,7 @@ class BrowserManager {
     this.idleWorkers = []; // Array of idle worker IDs (LIFO stack)
     this.busyWorkers = new Map(); // workerId -> taskInfo
     this.eventBus = SystemEventBus.getInstance();
+    this.cachedTitleRegistry = {}; // Cache for respawned workers
     
     this._setupEventListeners();
   }
@@ -71,6 +72,27 @@ class BrowserManager {
     }
     
     console.log(`[BrowserManager] Registered ${this.workers.size} worker(s)`);
+  }
+  
+  /**
+   * Initialize all workers with titleRegistry (sent once at startup, then after discovery)
+   * @async
+   * @param {Object} titleRegistry - ID-to-title map
+   * @returns {Promise<void>}
+   */
+  async initializeWorkers(titleRegistry) {
+    console.log(`[BrowserManager] Initializing ${this.workers.size} worker(s) with title registry`);
+    
+    // Cache the title registry for respawned workers
+    this.cachedTitleRegistry = titleRegistry || {};
+    
+    const initPromises = [];
+    for (const worker of this.workers.values()) {
+      initPromises.push(worker.sendInitialization(titleRegistry));
+    }
+    
+    await Promise.all(initPromises);
+    console.log(`[BrowserManager] All workers initialized with ${Object.keys(this.cachedTitleRegistry).length} title(s)`);
   }
   
   /**
@@ -143,7 +165,11 @@ class BrowserManager {
     // Remove from busy workers
     this.busyWorkers.delete(workerId);
     
-    // TODO: Implement worker replacement logic
+    // NOTE: For production, implement worker respawn logic here:
+    // const newWorker = await BrowserInitializer.spawnWorker(workerId);
+    // await newWorker.sendInitialization(this.cachedTitleRegistry);
+    // this.workers.set(workerId, newWorker);
+    
     // For now, just log the crash
     console.warn(`[BrowserManager] Worker pool now has ${this.getAvailableCount()} available workers`);
   }

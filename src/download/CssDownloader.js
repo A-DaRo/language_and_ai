@@ -53,11 +53,139 @@ class CssDownloader {
   }
 
   /**
-   * @summary Download all CSS files and rewrite DOM to use local versions.
+   * @summary Download stylesheets from a live Puppeteer page during active scraping.
    * 
-   * Main entry point for CSS localization. Processes both external <link> stylesheets
-   * and inline <style> blocks. Downloads all CSS files, their @import dependencies,
-   * and referenced assets (fonts, background images).
+   * @description
+   * This method is designed for the **Active Execution Phase** where we operate on a live
+   * Puppeteer Page object. It performs CSS localization in three stages:
+   * 1. Extraction: Uses page.evaluate() to scrape <link rel="stylesheet"> hrefs from live DOM
+   * 2. Processing: Downloads CSS in Node.js context, processes @import and url() references
+   * 3. Rewriting: Updates live DOM hrefs to point to local files before HTML serialization
+   * 
+   * This approach maintains performance by avoiding JSDOM initialization during scraping
+   * while ensuring complete CSS localization for offline browsing.
+   * 
+   * @param {import('puppeteer').Page} page - The active Puppeteer page instance.
+   * @param {string} outputDir - Absolute path to the directory where index.html will be saved.
+   * @returns {Promise<number>} Count of stylesheets successfully processed.
+   * 
+   * @example
+   * const cssCount = await cssDownloader.downloadFromPuppeteer(page, '/abs/path/to/output');
+   * // Returns: 5 (number of stylesheets downloaded and localized)
+   */
+  async downloadFromPuppeteer(page, outputDir) {
+    this.logger.info('CSS', 'Extracting stylesheet URLs from live page...');
+    
+    // Stage 1: Extract all stylesheet references from live DOM
+    const stylesheets = await page.evaluate(() => {
+      return Array.from(document.querySelectorAll('link[rel="stylesheet"]'))
+        .map(link => ({
+          href: link.href, // Absolute URL resolved by browser
+          originalHref: link.getAttribute('href') // For matching during rewrite
+        }))
+        .filter(s => s.href && !s.href.startsWith('data:') && !s.href.startsWith('blob:'));
+    });
+    
+    if (stylesheets.length === 0) {
+      this.logger.info('CSS', 'No external stylesheets found');
+      return 0;
+    }
+    
+    this.logger.info('CSS', `Found ${stylesheets.length} stylesheet(s) to process`);
+    
+    // Create CSS directory structure
+    const cssDir = path.join(outputDir, 'css');
+    const assetDir = path.join(cssDir, 'assets');
+    await fs.mkdir(cssDir, { recursive: true });
+    await fs.mkdir(assetDir, { recursive: true });
+    
+    // Per-page caches
+    const pageCssCache = new Map();
+    const pageAssetCache = new Map();
+    
+    let successCount = 0;
+    
+    // Stage 2: Process each stylesheet in Node.js context
+    for (const sheet of stylesheets) {
+      try {
+        // Skip if already processed
+        if (pageCssCache.has(sheet.href)) {
+          const cachedPath = pageCssCache.get(sheet.href);
+          const relativePath = path.relative(outputDir, cachedPath).replace(/\\/g, '/');
+          
+          await page.evaluate((originalHref, newPath) => {
+            const links = document.querySelectorAll(`link[rel="stylesheet"]`);
+            for (const link of links) {
+              if (link.href === originalHref || link.getAttribute('href') === originalHref) {
+                link.setAttribute('href', newPath);
+              }
+            }
+          }, sheet.originalHref, relativePath);
+          
+          successCount++;
+          continue;
+        }
+        
+        // Download CSS content
+        const cssContent = await this._downloadCssContent(sheet.href);
+        if (!cssContent) {
+          this.logger.warn('CSS', `Failed to download: ${sheet.href}`);
+          continue;
+        }
+        
+        // Process CSS: handle @import and url() references
+        const processed = await this.contentProcessor.processCssContent(cssContent, {
+          baseUrl: sheet.href,
+          cssDir: cssDir,
+          assetDir: assetDir,
+          referenceContext: 'css',
+          pageCssCache: pageCssCache,
+          pageAssetCache: pageAssetCache,
+          downloadCssFile: this._downloadCssFile.bind(this),
+          downloadCssAsset: this.assetDownloader.downloadCssAsset.bind(this.assetDownloader)
+        });
+        
+        // Save processed CSS to local file
+        const filename = this._extractCssFilename(sheet.href);
+        const localCssPath = path.join(cssDir, filename);
+        await fs.writeFile(localCssPath, processed.css, 'utf-8');
+        
+        pageCssCache.set(sheet.href, localCssPath);
+        this.cssCount++;
+        
+        // Stage 3: Rewrite href in live DOM
+        const relativePath = path.relative(outputDir, localCssPath).replace(/\\/g, '/');
+        
+        await page.evaluate((originalHref, newPath) => {
+          const links = document.querySelectorAll(`link[rel="stylesheet"]`);
+          for (const link of links) {
+            if (link.href === originalHref || link.getAttribute('href') === originalHref) {
+              link.setAttribute('href', newPath);
+            }
+          }
+        }, sheet.originalHref, relativePath);
+        
+        successCount++;
+        this.logger.success('CSS', `Localized: ${filename}`);
+        
+      } catch (error) {
+        this.logger.warn('CSS', `Failed to process ${sheet.href}: ${error.message}`);
+      }
+    }
+    
+    this.logger.success('CSS', `Processed ${successCount}/${stylesheets.length} stylesheet(s)`);
+    return successCount;
+  }
+  
+  /**
+   * @summary Download all CSS files and rewrite DOM to use local versions (JSDOM mode).
+   * 
+   * Main entry point for CSS localization in post-processing phase. Processes both 
+   * external <link> stylesheets and inline <style> blocks. Downloads all CSS files, 
+   * their @import dependencies, and referenced assets (fonts, background images).
+   * 
+   * **Note:** This method is for the post-processing phase using JSDOM. For active
+   * scraping with Puppeteer, use downloadFromPuppeteer() instead.
    * 
    * @param {JSDOM} dom - Parsed DOM of the HTML file.
    * @param {string} pageDir - Directory where the HTML file resides.
@@ -128,6 +256,35 @@ class CssDownloader {
     };
   }
 
+  /**
+   * @summary Download CSS file content without saving (for Puppeteer mode).
+   * 
+   * @description
+   * Simplified download method that only fetches CSS content without processing
+   * or saving. Used by downloadFromPuppeteer() to get raw CSS for processing.
+   * 
+   * @param {string} url - URL of CSS file to download.
+   * @returns {Promise<string|null>} CSS content as string or null on failure.
+   * @private
+   */
+  async _downloadCssContent(url) {
+    try {
+      const response = await axios.get(url, {
+        responseType: 'text',
+        timeout: this.config.TIMEOUT_NAVIGATION,
+        maxRedirects: 5,
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+      });
+      
+      return response.data;
+    } catch (error) {
+      this.logger.warn('CSS', `Download failed for ${url}: ${error.message}`);
+      return null;
+    }
+  }
+  
   /**
    * @summary Download a CSS file with retry logic and process its dependencies.
    * 
@@ -334,11 +491,11 @@ class CssDownloader {
 
   /**
    * @summary Get download statistics.
-   * @returns {{totalCss: number, totalCssAssets: number}} Download counts.
+   * @returns {{stylesheetsDownloaded: number, totalCssAssets: number}} Download counts.
    */
   getStats() {
     return {
-      totalCss: this.cssCount,
+      stylesheetsDownloaded: this.cssCount,
       totalCssAssets: this.assetDownloader.assetCount
     };
   }

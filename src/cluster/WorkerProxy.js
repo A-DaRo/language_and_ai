@@ -10,6 +10,7 @@
 
 const { MESSAGE_TYPES, validateMessage } = require('../core/ProtocolDefinitions');
 const SystemEventBus = require('../core/SystemEventBus');
+const Logger = require('../core/Logger');
 
 /**
  * Worker state constants
@@ -49,8 +50,35 @@ class WorkerProxy {
   _setupListeners() {
     // Listen for messages from worker
     this.childProcess.on('message', (message) => {
+      if (message.type === 'IPC_LOG') {
+        // Forward Worker logs to Master Logger
+        // The Master Logger will then write to File and/or Dashboard
+        const { level, category, message: logMsg, meta } = message.payload;
+        const logger = Logger.getInstance();
+        const workerCategory = `Worker-${this.workerId}:${category}`;
+        
+        if (typeof logger[level] === 'function') {
+            logger[level](workerCategory, logMsg, meta);
+        } else {
+            logger.info(workerCategory, logMsg, meta);
+        }
+        return;
+      }
       this._handleMessage(message);
     });
+    
+    // Capture worker stdout/stderr and route through Logger
+    if (this.childProcess.stdout) {
+      this.childProcess.stdout.on('data', (data) => {
+        Logger.getInstance().info(`Worker-${this.workerId}:stdout`, data.toString().trim());
+      });
+    }
+    
+    if (this.childProcess.stderr) {
+      this.childProcess.stderr.on('data', (data) => {
+        Logger.getInstance().error(`Worker-${this.workerId}:stderr`, data.toString().trim());
+      });
+    }
     
     // Handle worker exit
     this.childProcess.on('exit', (code, signal) => {
@@ -59,7 +87,7 @@ class WorkerProxy {
     
     // Handle worker errors
     this.childProcess.on('error', (error) => {
-      console.error(`[WorkerProxy] Worker ${this.workerId} error:`, error);
+      Logger.getInstance().error('WorkerProxy', `Worker ${this.workerId} error: ${error.message}`, error);
       this.state = WorkerState.CRASHED;
       this.eventBus.emit('WORKER:CRASHED', {
         workerId: this.workerId,
@@ -82,10 +110,10 @@ class WorkerProxy {
       } else if (message.type === MESSAGE_TYPES.RESULT) {
         this._handleResult(message);
       } else {
-        console.warn(`[WorkerProxy] Unknown message type from worker: ${message.type}`);
+        Logger.getInstance().warn('WorkerProxy', `Unknown message type from worker: ${message.type}`);
       }
     } catch (error) {
-      console.error(`[WorkerProxy] Error handling message:`, error);
+      Logger.getInstance().error('WorkerProxy', 'Error handling message', error);
     }
   }
   
@@ -95,7 +123,7 @@ class WorkerProxy {
    * @param {Object} message - Ready message
    */
   _handleReady(message) {
-    console.log(`[WorkerProxy] Worker ${this.workerId} is ready (PID: ${message.pid})`);
+    Logger.getInstance().info('WorkerProxy', `Worker ${this.workerId} is ready (PID: ${message.pid})`);
     this.state = WorkerState.IDLE;
     this.eventBus.emit('WORKER:READY', {
       workerId: this.workerId,
@@ -109,7 +137,7 @@ class WorkerProxy {
    * @param {Object} message - Result message
    */
   _handleResult(message) {
-    console.log(`[WorkerProxy] Worker ${this.workerId} completed task`);
+    Logger.getInstance().info('WorkerProxy', `Worker ${this.workerId} completed task`);
     
     const taskId = this.currentTask ? this.currentTask.taskId : null;
     
@@ -146,7 +174,7 @@ class WorkerProxy {
    * @param {string} signal - Exit signal
    */
   _handleExit(code, signal) {
-    console.log(`[WorkerProxy] Worker ${this.workerId} exited (code: ${code}, signal: ${signal})`);
+    Logger.getInstance().info('WorkerProxy', `Worker ${this.workerId} exited (code: ${code}, signal: ${signal})`);
     this.state = WorkerState.CRASHED;
     
     this.eventBus.emit('WORKER:CRASHED', {
@@ -199,6 +227,26 @@ class WorkerProxy {
   }
   
   /**
+   * Send initialization payload with titleRegistry to worker
+   * @async
+   * @param {Object} titleRegistry - ID-to-title map
+   * @returns {Promise<void>}
+   */
+  async sendInitialization(titleRegistry) {
+    if (this.state === WorkerState.CRASHED) {
+      Logger.getInstance().warn('WorkerProxy', `Cannot initialize crashed worker ${this.workerId}`);
+      return;
+    }
+    
+    this.childProcess.send({
+      type: MESSAGE_TYPES.INIT,
+      payload: {
+        titleRegistry: titleRegistry || {}
+      }
+    });
+  }
+  
+  /**
    * Broadcast cookies to this worker
    * @async
    * @param {Array<Object>} cookies - Cookie objects
@@ -206,7 +254,7 @@ class WorkerProxy {
    */
   async broadcastCookies(cookies) {
     if (this.state === WorkerState.CRASHED) {
-      console.warn(`[WorkerProxy] Cannot send cookies to crashed worker ${this.workerId}`);
+      Logger.getInstance().warn('WorkerProxy', `Cannot send cookies to crashed worker ${this.workerId}`);
       return;
     }
     
@@ -222,7 +270,7 @@ class WorkerProxy {
    * @returns {Promise<void>}
    */
   async terminate() {
-    console.log(`[WorkerProxy] Terminating worker ${this.workerId}`);
+    Logger.getInstance().info('WorkerProxy', `Terminating worker ${this.workerId}`);
     
     try {
       // Send shutdown command
@@ -238,7 +286,7 @@ class WorkerProxy {
         this.childProcess.kill('SIGTERM');
       }
     } catch (error) {
-      console.error(`[WorkerProxy] Error terminating worker:`, error);
+      Logger.getInstance().error('WorkerProxy', 'Error terminating worker', error);
       this.childProcess.kill('SIGKILL');
     }
   }
