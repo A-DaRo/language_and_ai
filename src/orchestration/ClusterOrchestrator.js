@@ -233,6 +233,15 @@ class ClusterOrchestrator {
         continue;
       }
       
+      // Emit discovery progress
+      const stats = this.queueManager.getStatistics();
+      this.eventBus.emit('DISCOVERY:PROGRESS', {
+        pagesFound: stats.discovered,
+        inQueue: stats.pending,
+        conflicts: stats.conflicts || 0,
+        currentDepth: task.pageContext.depth
+      });
+      
       // Check depth limit
       if (task.pageContext.depth >= maxDepth) {
         this.logger.info('DISCOVERY', `Depth limit reached for: ${task.pageContext.title}`);
@@ -241,13 +250,19 @@ class ClusterOrchestrator {
       }
       
       // Execute discovery task
-      await this.browserManager.execute(MESSAGE_TYPES.DISCOVER, {
+      const workerId = await this.browserManager.execute(MESSAGE_TYPES.DISCOVER, {
         url: task.pageContext.url,
         pageId: task.pageContext.id,
         parentId: task.pageContext.parentId,
         depth: task.pageContext.depth,
         isFirstPage: false,
         cookies: this.cookies
+      });
+      
+      // Emit worker busy event
+      this.eventBus.emit('WORKER:BUSY', {
+        workerId,
+        task: { description: `Discovering '${task.pageContext.title}'` }
       });
     }
     
@@ -376,10 +391,20 @@ class ClusterOrchestrator {
         continue;
       }
       
+      // Emit execution progress
+      const stats = this.queueManager.getStatistics();
+      this.eventBus.emit('EXECUTION:PROGRESS', {
+        pending: stats.pending,
+        active: this.browserManager.getBusyCount(),
+        completed: stats.downloaded,
+        total: canonicalContexts.length,
+        failed: stats.failed
+      });
+      
       const { context, savePath } = downloadTask;
       
       // Execute download task with absolute savePath
-      await this.browserManager.execute(MESSAGE_TYPES.DOWNLOAD, {
+      const workerId = await this.browserManager.execute(MESSAGE_TYPES.DOWNLOAD, {
         url: context.url,
         pageId: context.id,
         parentId: context.parentId,
@@ -387,6 +412,14 @@ class ClusterOrchestrator {
         savePath: savePath, // Absolute path from GlobalQueueManager
         cookies: this.cookies,
         linkRewriteMap: Object.fromEntries(linkRewriteMap)
+      });
+      
+      // Emit worker busy event
+      const titleRegistry = this.queueManager.getTitleRegistry();
+      const title = titleRegistry[context.id] || context.title || 'Untitled';
+      this.eventBus.emit('WORKER:BUSY', {
+        workerId,
+        task: { description: `Downloading '${title}'` }
       });
     }
     

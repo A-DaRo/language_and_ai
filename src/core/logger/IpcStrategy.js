@@ -18,7 +18,7 @@ class IpcStrategy extends LogStrategy {
 
   log(level, category, message, meta) {
     // specific check to avoid circular JSON errors or massive payloads
-    const safeMeta = meta ? JSON.parse(JSON.stringify(meta, this._replacer)) : null;
+    const safeMeta = meta ? this._sanitizeMeta(meta) : null;
 
     if (process.send) {
       process.send({
@@ -34,7 +34,37 @@ class IpcStrategy extends LogStrategy {
     }
   }
 
-  // Helper to handle circular references in errors
+  /**
+   * Sanitize metadata to remove circular references and convert Errors
+   * @private
+   * @param {*} meta - Metadata to sanitize
+   * @returns {*} Sanitized metadata
+   */
+  _sanitizeMeta(meta) {
+    const seen = new WeakSet();
+    return JSON.parse(JSON.stringify(meta, (key, value) => {
+      // Handle Error objects
+      if (value instanceof Error) {
+        return {
+          message: value.message,
+          stack: value.stack,
+          name: value.name
+        };
+      }
+      
+      // Handle circular references
+      if (typeof value === 'object' && value !== null) {
+        if (seen.has(value)) {
+          return '[Circular]';
+        }
+        seen.add(value);
+      }
+      
+      return value;
+    }));
+  }
+
+  // Helper to handle circular references in errors (kept for backwards compatibility)
   _replacer(key, value) {
     if (value instanceof Error) {
       return {

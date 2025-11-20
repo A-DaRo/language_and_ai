@@ -10,6 +10,7 @@
 const path = require('path');
 const SystemEventBus = require('../core/SystemEventBus');
 const PageContext = require('../domain/PageContext');
+const Logger = require('../core/Logger');
 
 /**
  * @class GlobalQueueManager
@@ -18,6 +19,7 @@ const PageContext = require('../domain/PageContext');
 class GlobalQueueManager {
   constructor() {
     this.eventBus = SystemEventBus.getInstance();
+    this.logger = Logger.getInstance();
     
     // Discovery phase queues
     this.discoveryQueue = []; // Array of { pageContext, isFirstPage }
@@ -120,7 +122,7 @@ class GlobalQueueManager {
     
     const parentContext = this.allContexts.get(pageId);
     if (!parentContext) {
-      console.warn(`[GlobalQueueManager] Parent context not found: ${pageId}`);
+      this.logger.warn('GlobalQueueManager', `Parent context not found: ${pageId}`);
       return [];
     }
     
@@ -175,7 +177,7 @@ class GlobalQueueManager {
     this.pendingDiscovery--;
     this.stats.failed++;
     
-    console.error(`[GlobalQueueManager] Discovery failed for ${pageId}:`, error.message);
+    this.logger.error('GlobalQueueManager', `Discovery failed for ${pageId}: ${error.message}`, error);
   }
   
   /**
@@ -184,7 +186,7 @@ class GlobalQueueManager {
    * @returns {number} Number of pages queued for download
    */
   buildDownloadQueue(contexts) {
-    console.log(`[GlobalQueueManager] Building download queue from ${contexts.length} context(s)`);
+    this.logger.debug('GlobalQueueManager', `Building download queue from ${contexts.length} context(s)`);
     
     this.downloadQueue = [];
     this.pendingDownloads.clear();
@@ -289,7 +291,7 @@ class GlobalQueueManager {
   failDownload(pageId, error) {
     this.stats.failed++;
     
-    console.error(`[GlobalQueueManager] Download failed for ${pageId}:`, error.message);
+    this.logger.error('GlobalQueueManager', `Download failed for ${pageId}: ${error.message}`, error);
     
     this.eventBus.emit('QUEUE:DOWNLOAD_FAILED_ITEM', {
       pageId,

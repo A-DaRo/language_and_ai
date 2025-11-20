@@ -9,6 +9,7 @@
 
 const SystemEventBus = require('../core/SystemEventBus');
 const { WorkerState } = require('./WorkerProxy');
+const Logger = require('../core/Logger');
 
 /**
  * @class BrowserManager
@@ -20,6 +21,7 @@ class BrowserManager {
     this.idleWorkers = []; // Array of idle worker IDs (LIFO stack)
     this.busyWorkers = new Map(); // workerId -> taskInfo
     this.eventBus = SystemEventBus.getInstance();
+    this.logger = Logger.getInstance();
     this.cachedTitleRegistry = {}; // Cache for respawned workers
     
     this._setupEventListeners();
@@ -68,10 +70,10 @@ class BrowserManager {
   registerWorkers(workerProxies) {
     for (const proxy of workerProxies) {
       this.workers.set(proxy.workerId, proxy);
-      console.log(`[BrowserManager] Registered worker: ${proxy.workerId}`);
+      this.logger.debug('BrowserManager', `Registered worker: ${proxy.workerId}`);
     }
     
-    console.log(`[BrowserManager] Registered ${this.workers.size} worker(s)`);
+    this.logger.info('BrowserManager', `Registered ${this.workers.size} worker(s)`);
   }
   
   /**
@@ -81,7 +83,7 @@ class BrowserManager {
    * @returns {Promise<void>}
    */
   async initializeWorkers(titleRegistry) {
-    console.log(`[BrowserManager] Initializing ${this.workers.size} worker(s) with title registry`);
+    this.logger.debug('BrowserManager', `Initializing ${this.workers.size} worker(s) with title registry`);
     
     // Cache the title registry for respawned workers
     this.cachedTitleRegistry = titleRegistry || {};
@@ -92,7 +94,7 @@ class BrowserManager {
     }
     
     await Promise.all(initPromises);
-    console.log(`[BrowserManager] All workers initialized with ${Object.keys(this.cachedTitleRegistry).length} title(s)`);
+    this.logger.info('BrowserManager', `All workers initialized with ${Object.keys(this.cachedTitleRegistry).length} title(s)`);
   }
   
   /**
@@ -154,7 +156,7 @@ class BrowserManager {
    * @param {string} workerId - ID of crashed worker
    */
   _handleWorkerCrash(workerId) {
-    console.error(`[BrowserManager] Worker ${workerId} crashed`);
+    this.logger.error('BrowserManager', `Worker ${workerId} crashed`);
     
     // Remove from idle workers
     const idleIndex = this.idleWorkers.indexOf(workerId);
@@ -171,7 +173,7 @@ class BrowserManager {
     // this.workers.set(workerId, newWorker);
     
     // For now, just log the crash
-    console.warn(`[BrowserManager] Worker pool now has ${this.getAvailableCount()} available workers`);
+    this.logger.warn('BrowserManager', `Worker pool now has ${this.getAvailableCount()} available workers`);
   }
   
   /**
@@ -181,7 +183,7 @@ class BrowserManager {
    * @returns {Promise<void>}
    */
   async broadcastCookies(cookies) {
-    console.log(`[BrowserManager] Broadcasting cookies to ${this.workers.size} worker(s)`);
+    this.logger.debug('BrowserManager', `Broadcasting cookies to ${this.workers.size} worker(s)`);
     
     const promises = [];
     for (const worker of this.workers.values()) {
@@ -233,7 +235,7 @@ class BrowserManager {
    * @returns {Promise<void>}
    */
   async shutdown() {
-    console.log(`[BrowserManager] Shutting down ${this.workers.size} worker(s)...`);
+    this.logger.info('BrowserManager', `Shutting down ${this.workers.size} worker(s)...`);
     
     const promises = [];
     for (const worker of this.workers.values()) {
@@ -246,7 +248,7 @@ class BrowserManager {
     this.idleWorkers = [];
     this.busyWorkers.clear();
     
-    console.log('[BrowserManager] All workers terminated');
+    this.logger.info('BrowserManager', 'All workers terminated');
   }
 }
 

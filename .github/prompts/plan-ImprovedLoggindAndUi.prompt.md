@@ -1,237 +1,286 @@
-### 1. Architectural Overview
+# **Plan: High-Fidelity Terminal Dashboard Implementation**
 
-We will introduce a new package `src/ui` and refactor `src/core/Logger.js`.
-
-**Data Flow:**
-1.  **Master/Workers** do work and emit events via `SystemEventBus`.
-2.  **Master/Workers** call `Logger.info()`, `Logger.error()` for verbose details.
-3.  **Logger** routes text:
-    *   → **Strategy A (File)**: Appends to `logs/run-XYZ.md` (Verbose).
-    *   → **Strategy B (UI)**: Updates the "Recent Logs" section of the dashboard (Brief).
-4.  **Dashboard** listens to `SystemEventBus`:
-    *   Updates Progress Bars (on `JOB:COMPLETED`).
-    *   Updates Worker Status Rows (on `WORKER:BUSY`/`IDLE`).
+**Objective:**
+Refactor the system's logging and UI to implement a persistent, multi-line "System Monitor" dashboard. This will replace all verbose console output during execution, routing it to a file instead. The implementation must strictly adhere to the Observer and Strategy design patterns to maintain separation of concerns.
 
 ---
 
-### 2. New Modules & Classes
+### **Developer Guidelines & Best Practices for UI/Logging Implementation**
 
-#### A. Refactored Logger (Strategy Pattern)
-We transform `Logger` from a basic console wrapper into a multi-transport dispatcher.
+#### **1. Guiding Principle: "The Worker is Blind and Mute"**
 
-**File:** `src/core/logger/LoggerStrategies.js`
-*   **`LogStrategy` (Interface)**: Defines `log(level, category, message)`.
-*   **`ConsoleStrategy`**: Standard `console.log` (used in debug mode or if UI disabled).
-*   **`FileStrategy`**: Writes markdown-formatted logs to a stream.
-*   **`DashboardStrategy`**: Sends the latest log line to the UI component for display in a "ticker".
+*   **Core Concept:** A Worker process should have zero awareness of the UI. It should never call `console.log` for status updates.
+*   **Implementation Rule:**
+    *   **NEVER** instantiate `ConsoleStrategy` inside a Worker. The *only* logging strategy a worker should ever have is `IpcStrategy`.
+    *   **DO** use the logger (`logger.info`, `logger.debug`) liberally within worker modules (`TaskRunner`, `Pipeline Steps`). These calls will be converted into IPC messages automatically.
+    *   **TEST:** After implementation, search the entire `src/worker` directory for `console.log`. Any instance found is a bug and must be replaced with `logger.info`.
 
-**File:** `src/core/Logger.js`
-*   Maintains an array of active strategies.
-*   `Logger.init({ file: true, dashboard: true })` sets up the strategies.
+#### **2. Guiding Principle: "The Master is the Single Source of Truth"**
 
-#### B. The Terminal Dashboard (The UI)
-**File:** `src/ui/TerminalDashboard.js`
-We will use `cli-progress` (specifically `MultiBar`) to handle the rendering complexity.
+*   **Core Concept:** The Master process dictates all state, including what is displayed. The UI is a passive "view" that only renders the state it is given.
+*   **Implementation Rule:**
+    *   The `TerminalDashboard` class should contain **NO application logic**. It should not calculate percentages, decide colors, or track progress. Its only job is to take strings and numbers and pass them to the `cli-progress` library.
+    *   All stateful logic (e.g., "what is the current progress percentage?", "which worker is busy?") belongs in the `DashboardController`, which derives this state from `SystemEventBus` events.
+    *   **TEST:** Review `TerminalDashboard.js`. If you see any logic like `this.completedTasks++`, it's a bug. That state belongs in the controller.
 
-*   **Visual Layout:**
-    1.  **Global Status**: Phase (Discovery/Download), Elapsed Time.
-    2.  **Global Progress**: [====================] 45/100 (45%)
-    3.  **Worker Slots**:
-        *   Worker 1: [IDLE]
-        *   Worker 2: [BUSY] Downloading assets for "Intro to AI"...
-        *   Worker 3: [BUSY] Processing CSS...
-    4.  **Recent Activity**: (The last 3 log messages).
+#### **3. On Event-Driven Integrity**
 
-#### C. The Dashboard Controller
-**File:** `src/ui/DashboardController.js`
-*   **Responsibility**: Connects `SystemEventBus` to `TerminalDashboard`.
-*   **Reasoning**: Keeps the UI rendering logic dumb. This controller interprets events like `WORKER:BUSY` and tells the UI "Update Row 2 to text 'Processing...'".
+*   **Core Concept:** The UI must be 100% reactive to `SystemEventBus` events. Do not use timers (`setInterval`) to poll for state changes.
+*   **Implementation Rule:**
+    *   **DO** add a `setInterval` *only* for the "Elapsed Time" display in the header. This is a purely cosmetic timer and is acceptable.
+    *   For all other dynamic data (progress, worker status), the update must be triggered by an event handler in `DashboardController`.
+    *   **Instruction:** The developer must identify every piece of information displayed on the two dashboard "Looks" and ensure a corresponding event is emitted by the `ClusterOrchestrator` or `GlobalQueueManager` to drive its updates. If an event is missing (e.g., `CONFLICT:DETECTED`), it must be added.
+
+#### **4. On Code Consistency & Style**
+
+*   **Instruction:** All new UI-related modules must strictly adhere to the project's existing coding standards.
+*   **Action Checklist:**
+    *   Does every new file (`TerminalDashboard.js`, `DashboardController.js`, `IpcStrategy.js`, etc.) have a file-level JSDoc header (`@fileoverview`, `@module`)?
+    *   Does every class and method have a complete JSDoc block?
+    *   Are all class methods and properties `camelCase`? Are constants `UPPER_SNAKE_CASE`?
+    *   Are all dependencies (`require` statements) at the top of the file?
+
+#### **5. The "Halt and Clear" User Experience**
+
+*   **Core Concept:** The transition from the verbose discovery phase to the clean dashboard must be seamless and deliberate.
+*   **Implementation Rule:**
+    *   The sequence in `main-cluster.js` is critical and must be followed precisely:
+        1.  Discovery phase runs (verbose `ConsoleStrategy` active).
+        2.  After discovery, the `PlanDisplayer` shows the site tree.
+        3.  The `UserPrompt` waits for input.
+        4.  **CRITICAL:** Before initializing the dashboard, you **must** call `console.clear()`. This is a native Node.js command that wipes the terminal screen.
+        5.  Immediately after clearing, initialize the `DashboardController` and switch the logger to `DashboardStrategy`. The dashboard will appear on a fresh screen.
+
+#### **6. IMPORTANT REMINDERS**
+
+*   **Reminder 1: Update the Architecture Document (`ARCHITECTURE.md`)**
+    *   **Instruction:** After the code is implemented and working, the developer **must** update the architecture documentation.
+    *   **Specific Sections to Update:**
+        1.  **`High-Level Architecture Overview`**: Add a new sub-section explaining the logging architecture (the Strategy Pattern, `IpcStrategy`, and the role of the Master logger).
+        2.  **`Package Structure`**: Add the new `src/ui` package and its components (`TerminalDashboard`, `DashboardController`).
+        3.  **`Core Package`**: Update the `Logger.js` section to describe the new `switchMode` method and the multi-strategy system.
+        4.  **`Data Flow Diagram`**: Add a new "Logging Flow" diagram or note showing how worker logs are piped through IPC to the Master's `FileStrategy` and `DashboardStrategy`.
+
+*   **Reminder 2: Update the Testing Suite (`tests/`)**
+    *   **Instruction:** The new UI components are critical and must be unit tested.
+    *   **Specific Tests to Add/Update:**
+        1.  **`tests/unit/core/Logger.test.js`**: Add tests for the `switchMode` method. Verify that it correctly removes `ConsoleStrategy` and adds `DashboardStrategy` while leaving `FileStrategy` untouched.
+        2.  **`tests/unit/ui/DashboardController.test.js` (New)**: This is a crucial test.
+            *   Use a `MockSystemEventBus` and a mocked `TerminalDashboard`.
+            *   Emit a `WORKER:BUSY` event on the mock bus.
+            *   Assert that `dashboard.updateWorkerStatus` was called with the correct arguments.
+            *   Test all event-to-UI mappings.
+        3.  **`tests/unit/core/logger/IpcStrategy.test.js` (New)**:
+            *   Mock `process.send`.
+            *   Call `strategy.log()`.
+            *   Assert that `process.send` was called with a correctly formatted `IPC_LOG` message.
 
 ---
 
-### 3. Implementation Steps
+## **Plan Implementation Steps**
 
-#### Step 1: Create Log Strategies
-Move the current console logging logic into a strategy and add the file writer.
+### **Phase 1: Refactor the Core Logging System**
 
-**Dependencies**: `mkdirp` (for creating /logs), `moment` (for timestamping).
+**Goal:** Transform the `Logger` from a simple dispatcher into a flexible system that supports different output modes without destructive re-initialization.
+
+#### **Step 1.1: Refine `FileStrategy.js` for "As-Is" Verbose Logging**
+
+*   **Instruction:** The `FileStrategy` should no longer format output as a Markdown table. It must produce a clean, verbose log file that mirrors what the `ConsoleStrategy` would output.
+*   **File:** `src/core/logger/FileStrategy.js`
+*   **Action:**
+    *   Remove the Markdown table header (`| Time | Level | ...`) from the constructor.
+    *   Modify the `log()` method to write a simple, formatted string:
+        ```javascript
+        // Inside FileStrategy.log()
+        const time = new Date().toLocaleTimeString();
+        const levelTag = `[${level.toUpperCase()}]`;
+        const categoryTag = `[${category}]`;
+        let line = `${time} ${levelTag} ${categoryTag} ${message}\n`;
+
+        if (meta && (level === 'error' || level === 'debug')) {
+            line += `  └─ ${JSON.stringify(meta, null, 2).replace(/\n/g, '\n     ')}\n`;
+        }
+        this.stream.write(line);
+        ```
+
+#### **Step 1.2: Update `Config.js` for Log Configuration**
+
+*   **Instruction:** Add configuration options to control the logging behavior.
+*   **File:** `src/core/Config.js`
+*   **Action:**
+    *   Add `this.LOG_DIR = './logs'`.
+    *   Add `this.LOG_FILE_ENABLED = true`.
+
+#### **Step 1.3: Introduce `IpcStrategy` for Worker Logging**
+
+*   **Instruction:** Create a new logging strategy for workers that sends log data to the Master via IPC instead of writing to stdout. This is the **key** to cleaning up the terminal.
+*   **File:** `src/core/logger/IpcStrategy.js` (New)
+*   **Action:** Implement the class as detailed in the previous response. It should have a single `log()` method that calls `process.send()`.
+
+#### **Step 1.4: Refactor `Logger.js` for Safe Mode Switching**
+
+*   **Instruction:** Replace the destructive `reinit` logic with a safe `switchMode` method.
+*   **File:** `src/core/Logger.js`
+*   **Action:**
+    *   Remove the `reinit` option from the `init()` method's JSDoc and logic.
+    *   Add the new `switchMode(mode, context)` method as detailed in the previous response. This method will be responsible for removing the `ConsoleStrategy` and adding the `DashboardStrategy`.
+
+---
+
+### **Phase 2: Build the UI Components**
+
+**Goal:** Create the "dumb" rendering components that will display the dashboard.
+
+#### **Step 2.1: Implement `TerminalDashboard.js`**
+
+*   **Instruction:** Implement the renderer for both "Discovery" and "Download" modes. This class should only manage `cli-progress` bars and have no business logic.
+*   **File:** `src/ui/TerminalDashboard.js` (New)
+*   **Action:** Implement the JSDoc and class structure below.
 
 ```javascript
-// src/core/logger/FileStrategy.js
-class FileStrategy {
-  constructor(baseDir) {
-    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-    this.filepath = path.join(baseDir, 'logs', `run-${timestamp}.md`);
-    this.stream = fs.createWriteStream(this.filepath, { flags: 'a' });
-    this.stream.write(`# Run Log - ${timestamp}\n\n`);
-  }
+/**
+ * @fileoverview Renderer for the Multi-Bar Terminal Dashboard
+ * @module ui/TerminalDashboard
+ */
 
-  log(level, category, message, meta) {
-    const time = new Date().toISOString().split('T')[1].slice(0, -1);
-    const icon = level === 'error' ? '❌' : (level === 'warn' ? '⚠️' : 'ℹ️');
-    let line = `| ${time} | ${icon} **${category}** | ${message} |\n`;
-    
-    if (meta && (level === 'error' || level === 'debug')) {
-      line += `\`\`\`json\n${JSON.stringify(meta, null, 2)}\n\`\`\`\n`;
-    }
-    this.stream.write(line);
-  }
-}
-```
-
-#### Step 2: Implement Terminal Dashboard
-Use `cli-progress` to create a multi-bar interface.
-
-```javascript
-// src/ui/TerminalDashboard.js
 const cliProgress = require('cli-progress');
 
+/**
+ * @class TerminalDashboard
+ * @description Encapsulates the rendering logic for the terminal UI. It is a "dumb"
+ * component that receives data and updates its visual state. It does not contain
+ * any application logic.
+ */
 class TerminalDashboard {
-  constructor(totalWorkers) {
+  /**
+   * @constructor
+   * @param {number} workerCount - The number of worker slots to create.
+   */
+  constructor(workerCount) {
     this.multibar = new cliProgress.MultiBar({
       clearOnComplete: false,
       hideCursor: true,
-      format: '{bar} {percentage}% | {value}/{total} | {phase} | {status}'
+      format: '{bar} | {label}', // A generic format
     }, cliProgress.Presets.shades_classic);
 
-    // 1. Main Bar
-    this.mainBar = this.multibar.create(100, 0, { phase: 'INIT', status: 'Starting...' });
+    // Header and Footer for static text
+    this.header = this.multibar.create(1, 1, { label: 'Initializing...' });
+    this.header.setFormat('{label}');
 
-    // 2. Worker Bars (Bars used as status text holders)
+    this.footer = this.multibar.create(1, 1, { label: 'System is starting...' });
+    this.footer.setFormat('  └─ {label}');
+
+    // Dynamic bars for progress and workers
+    this.progressBars = new Map();
     this.workerBars = new Map();
-    for(let i=0; i<totalWorkers; i++) {
-      // Using a bar formatted to just show text
-      const bar = this.multibar.create(1, 0, { 
-        phase: `Worker ${i+1}`, 
-        status: 'Waiting...' 
-      });
-      // Hack: Set format specifically for workers to look like rows
-      bar.setFormat(`  {phase} | {status}`); 
+
+    for (let i = 0; i < workerCount; i++) {
+      const bar = this.multibar.create(1, 0, { label: `Worker ${i + 1}: [IDLE]` });
+      bar.setFormat('   {label}');
       this.workerBars.set(i, bar);
     }
   }
 
-  updateMain(current, total, phase, status) {
-    this.mainBar.setTotal(total);
-    this.mainBar.update(current, { phase, status });
+  /**
+   * @method setMode
+   * @summary Reconfigures the dashboard layout for a specific phase.
+   * @param {'discovery' | 'download'} mode - The phase to display.
+   * @param {Object} [initialData={}] - Initial data for the mode.
+   */
+  setMode(mode, initialData = {}) {
+    this.progressBars.forEach(bar => this.multibar.remove(bar));
+    this.progressBars.clear();
+
+    if (mode === 'discovery') {
+      const bar = this.multibar.create(1, 0, { label: 'Pages Found: 0 | In Queue: 0 | Conflicts: 0' });
+      bar.setFormat('  Progress: {label}');
+      this.progressBars.set('discoveryStats', bar);
+    } else if (mode === 'download') {
+      const bar = this.multibar.create(initialData.total || 1, initialData.completed || 0, {
+        label: `[Pending: ${initialData.pending || 0}] [Active: 0] [Complete: 0/${initialData.total || 0}] [Failed: 0]`
+      });
+      bar.setFormat('  Progress: {label}');
+      this.progressBars.set('downloadStats', bar);
+    }
   }
 
-  updateWorker(workerIndex, status) {
-    const bar = this.workerBars.get(workerIndex);
-    if(bar) bar.update(0, { status });
+  /**
+   * @method updateHeader
+   * @param {string} title - The main title to display.
+   */
+  updateHeader(title) {
+    this.header.update(1, { label: title });
   }
-  
+
+  /**
+   * @method updateDiscoveryStats
+   * @param {Object} stats - Discovery statistics.
+   * @param {number} stats.pagesFound
+   * @param {number} stats.inQueue
+   * @param {number} stats.conflicts
+   * @param {number} stats.currentDepth
+   */
+  updateDiscoveryStats({ pagesFound, inQueue, conflicts, currentDepth }) {
+    const bar = this.progressBars.get('discoveryStats');
+    if (bar) {
+      bar.update(1, { label: `Pages Found: ${pagesFound} | In Queue: ${inQueue} | Conflicts: ${conflicts} | Current Depth: ${currentDepth}` });
+    }
+  }
+
+  /**
+   * @method updateDownloadStats
+   * @param {Object} stats - Download statistics.
+   * @param {number} stats.pending
+   * @param {number} stats.active
+   * @param {number} stats.completed
+   * @param {number} stats.total
+   * @param {number} stats.failed
+   */
+  updateDownloadStats({ pending, active, completed, total, failed }) {
+    const bar = this.progressBars.get('downloadStats');
+    if (bar) {
+        bar.setTotal(total);
+        bar.update(completed, { label: `[Pending: ${pending}] [Active: ${active}] [Complete: ${completed}/${total}] [Failed: ${failed}]` });
+    }
+  }
+
+  /**
+   * @method updateWorkerStatus
+   * @param {number} slotIndex - The visual slot for the worker.
+   * @param {string} statusText - The text to display.
+   */
+  updateWorkerStatus(slotIndex, statusText) {
+    const bar = this.workerBars.get(slotIndex);
+    if (bar) {
+      bar.update(1, { label: `Worker ${slotIndex + 1}: ${statusText}` });
+    }
+  }
+
+  /**
+   * @method updateFooter
+   * @param {string} text - The text for the log ticker.
+   */
+  updateFooter(text) {
+    this.footer.update(1, { label: text });
+  }
+
+  /**
+   * @method stop
+   * @description Stops the renderer and restores the cursor.
+   */
   stop() {
     this.multibar.stop();
   }
 }
+
+module.exports = TerminalDashboard;
 ```
 
-#### Step 3: Connect Events (The Controller)
+#### **Step 2.2: Implement `DashboardController.js`**
 
-```javascript
-// src/ui/DashboardController.js
-class DashboardController {
-  constructor(eventBus, browserManager) {
-    this.bus = eventBus;
-    this.manager = browserManager;
-    this.dashboard = null;
-    
-    // Map Worker IDs (UUIDs) to UI Slots (0, 1, 2, 3)
-    this.workerSlotMap = new Map(); 
-  }
-
-  init() {
-    const workerCount = this.manager.getTotalCount();
-    this.dashboard = new TerminalDashboard(workerCount);
-    
-    // Map worker IDs to slots
-    const workerIds = this.manager.getAllWorkerIds();
-    workerIds.forEach((id, index) => this.workerSlotMap.set(id, index));
-
-    this._attachListeners();
-  }
-
-  _attachListeners() {
-    // Progress Updates
-    this.bus.on('DISCOVERY:COMPLETE', (payload) => {
-        this.dashboard.updateMain(0, payload.totalPages, 'EXECUTION', 'Starting downloads...');
-    });
-    
-    this.bus.on('EXECUTION:PROGRESS', (payload) => {
-        this.dashboard.updateMain(payload.completed, payload.total, 'EXECUTION', 'Downloading...');
-    });
-
-    // Worker Status Updates
-    this.bus.on('WORKER:BUSY', ({ workerId, taskId }) => {
-        const slot = this.workerSlotMap.get(workerId);
-        this.dashboard.updateWorker(slot, `Processing Task ${taskId.substring(0,6)}...`);
-    });
-
-    this.bus.on('WORKER:AVAILABLE', ({ workerId }) => {
-        const slot = this.workerSlotMap.get(workerId);
-        this.dashboard.updateWorker(slot, 'IDLE');
-    });
-  }
-}
-```
-
----
-
-### 4. JSDocs for New Modules
-
-#### `src/core/logger/LogStrategy.js`
-
-```javascript
-/**
- * @interface LogStrategy
- * @description Interface for log output destinations.
- */
-
-/**
- * @method log
- * @param {string} level - 'info', 'warn', 'error', 'debug'
- * @param {string} category - The source module name.
- * @param {string} message - The log text.
- * @param {Object} [meta] - Optional JSON metadata (errors, objects).
- */
-```
-
-#### `src/ui/TerminalDashboard.js`
-
-```javascript
-/**
- * @fileoverview Terminal UI Renderer
- * @module ui/TerminalDashboard
- */
-
-/**
- * @class TerminalDashboard
- * @description Encapsulates `cli-progress` logic to render the multi-bar UI.
- * It purely handles rendering; it does not contain business logic.
- */
-
-/**
- * @constructor
- * @param {number} workerCount - Number of worker rows to initialize.
- */
-
-/**
- * @method updateProgress
- * @param {number} current - Current completed items.
- * @param {number} total - Total items.
- * @param {string} phaseLabel - E.g., "DISCOVERY" or "DOWNLOAD".
- */
-
-/**
- * @method setWorkerStatus
- * @param {number} slotIndex - Visual slot index (0 to N-1).
- * @param {string} statusText - Text to display (e.g., "Downloading image.png").
- * @param {boolean} [isError=false] - If true, formats text red.
- */
-```
-
-#### `src/ui/DashboardController.js`
+*   **Instruction:** Create the controller that listens to the `SystemEventBus` and calls the appropriate rendering methods on the `TerminalDashboard`.
+*   **File:** `src/ui/DashboardController.js` (New)
+*   **Action:** Implement the JSDoc and class structure below.
 
 ```javascript
 /**
@@ -241,54 +290,125 @@ class DashboardController {
 
 /**
  * @class DashboardController
- * @implements {Observer}
- * @description Acts as the bridge between the SystemEventBus and the Visual Dashboard.
- * It translates system events (WORKER:BUSY, JOB:COMPLETED) into visual updates.
+ * @description The "brain" of the UI. It translates system events into visual
+ * updates on the dashboard, keeping the rendering logic simple.
  */
+class DashboardController {
+  /**
+   * @constructor
+   * @param {SystemEventBus} eventBus - The master event bus.
+   * @param {BrowserManager} browserManager - For mapping worker IDs to slots.
+   */
+  constructor(eventBus, browserManager) {
+    this.bus = eventBus;
+    this.manager = browserManager;
+    this.dashboard = null;
+    this.workerSlotMap = new Map();
+  }
 
-/**
- * @constructor
- * @param {SystemEventBus} eventBus - Singleton event bus.
- * @param {BrowserManager} browserManager - Needed to map Worker IDs to UI slots.
- */
+  /**
+   * @method start
+   * @summary Initializes the dashboard and attaches all event listeners.
+   */
+  start() {
+    const workerIds = this.manager.getAllWorkerIds();
+    workerIds.forEach((id, index) => this.workerSlotMap.set(id, index));
 
-/**
- * @method start
- * @summary Initializes the Dashboard and attaches event listeners.
- * @description Should be called after the System Init phase when worker count is known.
- */
+    this.dashboard = new TerminalDashboard(workerIds.length);
+    this._attachListeners();
+  }
+
+  /**
+   * @method getDashboard
+   * @returns {TerminalDashboard} The raw dashboard instance for the logger.
+   */
+  getDashboard() {
+    return this.dashboard;
+  }
+  
+  /**
+   * @method stop
+   * @description Stops the dashboard renderer.
+   */
+  stop() {
+    if (this.dashboard) this.dashboard.stop();
+  }
+
+  /**
+   * @private
+   * @method _attachListeners
+   * @description Subscribes to all relevant SystemEventBus events.
+   */
+  _attachListeners() {
+    this.bus.on('PHASE:CHANGED', ({ phase, data }) => {
+      this.dashboard.setMode(phase, data);
+      this.dashboard.updateHeader(`JBC090 Language & AI | ${phase.toUpperCase()} Phase | Elapsed: ...`); // Elapsed time needs a ticker
+    });
+
+    this.bus.on('DISCOVERY:PROGRESS', (stats) => {
+        this.dashboard.updateDiscoveryStats(stats);
+    });
+
+    this.bus.on('EXECUTION:PROGRESS', (stats) => {
+        this.dashboard.updateDownloadStats(stats);
+    });
+
+    this.bus.on('WORKER:BUSY', ({ workerId, task }) => {
+      const slot = this.workerSlotMap.get(workerId);
+      this.dashboard.updateWorkerStatus(slot, `[BUSY] ${task.description}`);
+    });
+
+    this.bus.on('WORKER:AVAILABLE', ({ workerId }) => {
+      const slot = this.workerSlotMap.get(workerId);
+      this.dashboard.updateWorkerStatus(slot, `[IDLE] Waiting for task...`);
+    });
+  }
+}
+
+module.exports = DashboardController;
 ```
 
-### 5. Integration Point
+---
 
-In `main-cluster.js`:
+### **Phase 3: Integration into the Main Application**
 
-```javascript
-// 1. Init Logger with File Strategy
-const logger = Logger.getInstance();
-logger.addStrategy(new FileStrategy(config.outputDir));
+**Goal:** Modify the application's entry point (`main-cluster.js`) and core components to support and drive the new UI system.
 
-// 2. Init System
-// ... (BrowserInitializer spawns workers) ...
+#### **Step 3.1: Update `main-cluster.js`**
 
-// 3. Init UI
-const dashboardCtrl = new DashboardController(SystemEventBus.getInstance(), browserManager);
-dashboardCtrl.start(); // Will hijack stdout
+*   **Instruction:** Implement the new workflow: Init with Console -> Discover -> Halt -> Prompt -> Clear & Switch to Dashboard -> Execute -> Shutdown.
+*   **File:** `main-cluster.js`
+*   **Action:**
+    1.  At startup, initialize `Logger` with **both** `FileStrategy` and `ConsoleStrategy`.
+    2.  After the `orchestrator.start()` call for discovery completes, **halt**.
+    3.  Call `logger.removeStrategy(consoleStrategy)` to silence console logs.
+    4.  Display the site tree and use `UserPrompt`.
+    5.  If user says "yes":
+        *   Call `console.clear()`.
+        *   Instantiate `DashboardController` and call `start()`.
+        *   Call `logger.switchMode('dashboard', { dashboardInstance: dashboardCtrl.getDashboard() })`.
+        *   Proceed with the execution phase (`orchestrator.execute()`).
+    6.  At the very end, call `dashboardCtrl.stop()` before printing the final summary.
 
-// 4. Start Orchestrator
-orchestrator.start();
-```
+#### **Step 3.2: Update `ClusterOrchestrator.js` to Emit Progress Events**
 
-### 6. Key Benefits of this Approach
+*   **Instruction:** The orchestrator must emit new events for the dashboard to consume.
+*   **File:** `src/orchestration/ClusterOrchestrator.js`
+*   **Action:**
+    *   In the discovery loop, after processing links, emit `DISCOVERY:PROGRESS` with stats from `GlobalQueueManager`.
+    *   In the execution loop, after a job completes, emit `EXECUTION:PROGRESS` with stats from `GlobalQueueManager`.
+    *   When dispatching a task to a worker, include a user-friendly `description` in the `WORKER:BUSY` event payload.
+        ```javascript
+        // When dispatching a discovery task
+        this.bus.emit('WORKER:BUSY', { workerId, task: { description: `Discovering '${title}'...` } });
+        // When dispatching a download task
+        this.bus.emit('WORKER:BUSY', { workerId, task: { description: `Downloading '${title}'...` } });
+        ```
 
-1.  **Decoupling:** The `ClusterOrchestrator` doesn't know a progress bar exists. It just emits events.
-2.  **Separation of Concerns:**
-    *   `FileStrategy` handles Markdown formatting and I/O.
-    *   `TerminalDashboard` handles ANSI codes and bar rendering.
-    *   `DashboardController` handles logic (mapping IDs to slots).
-3.  **Observability:** You get a beautiful real-time UI *and* a permanent, searchable Markdown log file for debugging.
-4.  **Stability:** If the UI crashes, the File Strategy keeps logging. If the User runs in a CI environment (non-interactive), we can simply not initialize `DashboardController` and fall back to `ConsoleStrategy`.
+#### **Step 3.3: Update Worker Infrastructure**
 
-### 7. Update Docs/ARCHITECTURE.md after Implementation completion
-
-### 8. ADD UNIT TESTS for Logger Strategies and Dashboard Controller
+*   **Instruction:** Ensure all workers use `IpcStrategy` for logging.
+*   **File:** `src/worker/WorkerEntrypoint.js`
+*   **Action:** As planned, inside the `IPC_INIT` handler, initialize the worker's logger instance with **only** the `IpcStrategy`.
+*   **File:** `src/cluster/WorkerProxy.js`
+*   **Action:** Ensure the `IPC_LOG` message handler is implemented to forward worker logs to the Master's logger instance.

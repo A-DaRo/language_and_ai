@@ -113,12 +113,13 @@ The application is divided into the following packages, organized by runtime con
 #### Master Process Packages
 
 *   **`src/core`**: Fundamental infrastructure (Configuration, Logging, Event Bus, Protocol Definitions)
+    *   **`src/core/logger`**: Logging strategy implementations (Console, File, Dashboard, IPC)
 *   **`src/cluster`**: Worker process lifecycle management (Initialization, Proxy, Pool Management)
 *   **`src/orchestration`**: High-level workflow coordination and state machines
-    *   **`src/orchestration/ui`**: User interface components for CLI interaction
     *   **`src/orchestration/analysis`**: Graph analysis and conflict resolution
+*   **`src/ui`**: Terminal dashboard components for real-time monitoring
 *   **`src/domain`**: Serializable domain entities (PageContext)
-*   **`src/utils`**: Shared utility functions (FileSystem, Integrity)
+*   **`src/utils`**: Shared utility functions (FileSystem, Integrity, UserPrompt)
 
 #### Worker Process Packages
 
@@ -2350,6 +2351,162 @@ logFinalStatistics() {
 
 ---
 
+### 5.3 UI Package (`src/ui`) - Terminal Dashboard
+
+**Runtime Context**: Master Process Only  
+**Design Pattern**: MVC (Model-View-Controller) + Observer  
+**Responsibility**: Real-time visual monitoring of system state
+
+**Package Description**:
+
+The UI package provides a real-time terminal dashboard for monitoring the scraping workflow. It implements a clean separation between data (SystemEventBus events), presentation (TerminalDashboard), and coordination logic (DashboardController).
+
+#### 5.3.1 `TerminalDashboard.js` - UI Renderer (View)
+
+**Class Description**:
+A "dumb" rendering component that manages the `cli-progress` multi-bar display. It receives structured data and updates the visual representation without containing any business logic.
+
+**Constructor Signature**:
+```javascript
+/**
+ * @constructor
+ * @param {number} workerCount - Number of worker slots to display
+ */
+constructor(workerCount)
+```
+
+**Public Methods**:
+
+```javascript
+/**
+ * @method setMode
+ * @summary Switches dashboard between discovery and download phases
+ * @param {'discovery' | 'download'} mode - The phase to display
+ * @param {Object} [initialData={}] - Initial statistics for the mode
+ */
+setMode(mode, initialData = {})
+
+/**
+ * @method updateHeader
+ * @summary Updates the dashboard title bar
+ * @param {string} title - Title text to display
+ */
+updateHeader(title)
+
+/**
+ * @method updateDiscoveryStats
+ * @summary Updates discovery phase progress indicators
+ * @param {Object} stats - Discovery statistics
+ * @param {number} stats.pagesFound - Total pages discovered
+ * @param {number} stats.inQueue - Pages waiting to be processed
+ * @param {number} stats.conflicts - Duplicate pages detected
+ * @param {number} stats.currentDepth - Current BFS depth level
+ */
+updateDiscoveryStats({ pagesFound, inQueue, conflicts, currentDepth })
+
+/**
+ * @method updateDownloadStats
+ * @summary Updates download phase progress indicators
+ * @param {Object} stats - Download statistics
+ * @param {number} stats.pending - Pages waiting for download
+ * @param {number} stats.active - Pages currently being downloaded
+ * @param {number} stats.completed - Successfully downloaded pages
+ * @param {number} stats.total - Total pages to download
+ * @param {number} stats.failed - Failed downloads
+ */
+updateDownloadStats({ pending, active, completed, total, failed })
+
+/**
+ * @method updateWorkerStatus
+ * @summary Updates individual worker status line
+ * @param {number} slotIndex - Worker visual slot (0-based)
+ * @param {string} statusText - Status message to display
+ */
+updateWorkerStatus(slotIndex, statusText)
+
+/**
+ * @method updateFooter
+ * @summary Updates the footer log ticker with recent log message
+ * @param {string} text - Log message text
+ */
+updateFooter(text)
+
+/**
+ * @method stop
+ * @summary Stops the dashboard renderer and restores cursor
+ */
+stop()
+```
+
+**Dependencies**: `cli-progress`  
+**Used By**: `DashboardController`
+
+---
+
+#### 5.3.2 `DashboardController.js` - UI Logic Coordinator (Controller)
+
+**Class Description**:
+The "brain" of the UI system. Subscribes to SystemEventBus events and translates them into visual updates on the TerminalDashboard. Contains all stateful logic (worker slot mapping, elapsed time calculation).
+
+**Constructor Signature**:
+```javascript
+/**
+ * @constructor
+ * @param {SystemEventBus} eventBus - The master event bus
+ * @param {BrowserManager} browserManager - For worker ID to slot mapping
+ */
+constructor(eventBus, browserManager)
+```
+
+**Public Methods**:
+
+```javascript
+/**
+ * @method start
+ * @summary Initializes dashboard and attaches event listeners
+ * @description Creates TerminalDashboard, maps worker IDs to visual slots,
+ *              subscribes to all relevant events, starts elapsed time timer
+ */
+start()
+
+/**
+ * @method getDashboard
+ * @summary Returns the dashboard instance for logger integration
+ * @returns {TerminalDashboard} The dashboard instance
+ */
+getDashboard()
+
+/**
+ * @method stop
+ * @summary Stops dashboard renderer and elapsed time timer
+ */
+stop()
+```
+
+**Event Subscriptions**:
+
+- `PHASE:CHANGED({ phase, data })`: Switches dashboard mode and updates header
+- `DISCOVERY:PROGRESS(stats)`: Updates discovery statistics display
+- `EXECUTION:PROGRESS(stats)`: Updates download statistics display
+- `WORKER:BUSY({ workerId, task })`: Shows worker as busy with task description
+- `WORKER:IDLE({ workerId })`: Shows worker as idle and available
+- `WORKER:READY({ workerId })`: Shows worker as ready after initialization
+
+**Internal State**:
+
+- `workerSlotMap`: Maps worker IDs to visual slot indices (0-based)
+- `startTime`: Dashboard initialization timestamp for elapsed time calculation
+- `timerInterval`: 1-second interval for updating elapsed time in header
+
+**Dependencies**: `TerminalDashboard`, `SystemEventBus`, `BrowserManager`  
+**Used By**: `main-cluster.js` (application entry point)
+
+---
+
+**Source**: [`src/ui/TerminalDashboard.js`](../src/ui/TerminalDashboard.js), [`src/ui/DashboardController.js`](../src/ui/DashboardController.js)
+
+---
+
 ### 6. Scraping, Processing & Extraction Packages - Content Handling
 
 These packages run in the **Worker Process** context and handle the actual interaction with Notion pages, content manipulation, and data extraction.
@@ -4234,12 +4391,17 @@ The system implements a **multi-transport logging architecture** with a **real-t
 │                  [Multi-Transport Dispatcher]               │
 └────────────────────┬────────────────────────────────────────┘
                      │ dispatch(level, category, message, meta)
-         ┌───────────┼───────────┬────────────────────┐
-         │           │           │                    │
-┌────────▼──────┐ ┌─▼─────────┐ ┌▼──────────────┐ ┌─▼─────────────┐
-│ ConsoleStrategy│ │FileStrategy│ │DashboardStrategy│ │CustomStrategy│
-│ [stdout/stderr]│ │ [Markdown] │ │ [UI Ticker]  │ │  [External]  │
-└────────────────┘ └────────────┘ └───────────────┘ └──────────────┘
+         ┌───────────┼───────────┬────────────────────┬────────────┐
+         │           │           │                    │            │
+┌────────▼──────┐ ┌─▼─────────┐ ┌▼──────────────┐ ┌─▼──────────┐ │
+│ ConsoleStrategy│ │FileStrategy│ │DashboardStrategy│ │IpcStrategy │ │
+│ [stdout/stderr]│ │ [Log File] │ │ [UI Ticker]  │ │[Worker IPC]│ │
+└────────────────┘ └────────────┘ └───────────────┘ └────────────┘ │
+                                                                    │
+                                                    ┌───────────────▼─────┐
+                                                    │ Custom Strategies   │
+                                                    │ (e.g., Remote APIs) │
+                                                    └─────────────────────┘
 ```
 
 #### Logger Strategies
@@ -4251,17 +4413,25 @@ The system implements a **multi-transport logging architecture** with a **real-t
 - Filters debug messages based on `DEBUG` environment variable
 
 **FileStrategy** (`src/core/logger/FileStrategy.js`):
-- Writes markdown-formatted logs to timestamped files
+- Writes verbose logs to timestamped files
 - Location: `{outputDir}/logs/run-{timestamp}.md`
-- Table format: `| Time | Level | Category | Message |`
-- Includes JSON metadata blocks for errors
+- Format: `[HH:MM:SS] [LEVEL] [Category] Message`
+- Includes formatted JSON metadata blocks for errors and debug logs
 - Automatically closes stream on process exit
+- Persistent logging across the entire application lifecycle
+
+**IpcStrategy** (`src/core/logger/IpcStrategy.js`):
+- Used exclusively by Worker processes
+- Sends log entries to Master via Node.js IPC (`process.send`)
+- Prevents Worker stdout pollution
+- Handles circular references and large objects safely
+- Master's WorkerProxy forwards these logs to its Logger instance
 
 **DashboardStrategy** (`src/core/logger/DashboardStrategy.js`):
-- Sends log messages to TerminalDashboard for real-time display
+- Sends log messages to TerminalDashboard footer for real-time display
 - Maintains circular buffer of recent logs (default: 5 lines)
 - Skips debug messages to reduce UI clutter
-- Includes level icons (❌ error, ⚠️ warn, ℹ️ info)
+- Includes level icons ([ERROR], [WARN], [OK], [INFO])
 
 #### Logger Initialization
 

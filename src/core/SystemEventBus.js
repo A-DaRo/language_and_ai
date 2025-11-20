@@ -87,9 +87,8 @@ class SystemEventBus extends EventEmitter {
    */
   emit(eventName, ...args) {
     const hasListeners = this.listenerCount(eventName) > 0;
-    if (!hasListeners && !eventName.startsWith('SYSTEM:')) {
-      console.warn(`[SystemEventBus] No listeners for event: ${eventName}`);
-    }
+    // Suppress warnings - events can be emitted before listeners are attached
+    // This is normal during initialization phase
     return super.emit(eventName, ...args);
   }
 }
