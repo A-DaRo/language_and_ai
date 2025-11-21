@@ -58,6 +58,19 @@ class LinkExtractor {
       // Find all links
       const allLinks = document.querySelectorAll('a[href]');
       
+      // Helper to find section context
+      const findSection = (el) => {
+        let current = el.parentElement;
+        while (current) {
+          if (current.classList && current.classList.contains('notion-header-block') || 
+              current.tagName === 'H1' || current.tagName === 'H2') {
+            return current.innerText ? current.innerText.trim() : null;
+          }
+          current = current.parentElement;
+        }
+        return null;
+      };
+
       allLinks.forEach(link => {
         const href = link.getAttribute('href');
         
@@ -96,8 +109,8 @@ class LinkExtractor {
           return;
         }
         
-        // Step 1: Remove everything after '?' (query params and fragments)
-        const cleanUrl = absoluteUrl.split('?')[0];
+        // Step 1: Remove everything after '?' (query params) and '#' (fragments)
+        const cleanUrl = absoluteUrl.split('?')[0].split('#')[0];
         
         // Step 2: Extract raw page ID - everything after first '29' appearance
         // This handles both /Page-Name-29abc... and /29abc... formats
@@ -125,11 +138,20 @@ class LinkExtractor {
         
         seenUrls.add(rawPageId);
         
-        // Return raw page ID as URL (will be resolved by server later)
+        // Extract title from anchor text
+        let linkTitle = link.innerText || link.textContent || '';
+        linkTitle = linkTitle.trim();
+        
+        // Fallback to raw ID if title is empty
+        if (!linkTitle) {
+          linkTitle = rawPageId;
+        }
+        
+        // Return the cleaned absolute URL (preserves slug)
         results.push({
-          url: baseUrl + '/' + rawPageId,
-          title: rawPageId,  // Use raw ID as placeholder, will be resolved later
-          section: null,
+          url: cleanUrl,
+          title: linkTitle,
+          section: findSection(link),
           subsection: null,
           isInternal: true
         });

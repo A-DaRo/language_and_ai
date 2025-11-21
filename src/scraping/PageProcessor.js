@@ -155,7 +155,9 @@ class PageProcessor {
         await this.cookieHandler.handle(page);
       }
       
-      await this.contentExpander.expandAll(page);
+      // Modified: Use preparePage instead of expandAll to avoid clicking content
+      // await this.contentExpander.expandAll(page);
+      await this.contentExpander.preparePage(page);
       
       const links = await this.linkExtractor.extractLinks(page, url);
       

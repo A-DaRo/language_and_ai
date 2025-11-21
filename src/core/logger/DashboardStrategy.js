@@ -38,6 +38,11 @@ class DashboardStrategy extends LogStrategy {
       return;
     }
 
+    // Filter out navigation logs from the footer to prevent banner-like artifacts
+    if (message && message.includes('Navigating to:')) {
+      return;
+    }
+
     // Format the log entry
     const time = new Date().toLocaleTimeString();
     const icon = this._getLevelIcon(level);

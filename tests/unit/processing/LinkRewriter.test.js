@@ -149,4 +149,47 @@ describe('LinkRewriter', () => {
       expect.stringContaining('Localized')
     );
   });
+
+  test('resolves links by Notion ID when full URL match fails', async () => {
+    const parentContext = createMockPageContext({
+      url: 'https://notion.so/Parent-29' + 'a'.repeat(30),
+      title: 'Parent',
+      depth: 0
+    });
+    parentContext.htmlFilePath = '/tmp/output/Parent/index.html';
+    
+    const childId = '29' + 'b'.repeat(30);
+    const childContext = createMockPageContext({
+      url: `https://notion.so/Child-${childId}`,
+      title: 'Child',
+      depth: 1
+    });
+    childContext.htmlFilePath = '/tmp/output/Parent/Child/index.html';
+    parentContext.addChild(childContext);
+    
+    // HTML contains links with just the ID or different URL format but same ID
+    const html = `
+      <html>
+        <body>
+          <a href="/${childId}">Short ID Link</a>
+          <a href="https://notion.so/Different-Title-${childId}">Different Title Link</a>
+        </body>
+      </html>
+    `;
+    
+    fs.readFile = jest.fn().mockResolvedValue(html);
+    fs.writeFile = jest.fn().mockResolvedValue();
+    
+    const urlMap = new Map([
+      [childContext.url, childContext]
+    ]);
+    
+    const count = await linkRewriter.rewriteLinksInFile(parentContext, urlMap);
+    
+    expect(count).toBe(2);
+    const savedHtml = fs.writeFile.mock.calls[0][1];
+    // Both links should point to the same relative path
+    const matches = savedHtml.match(/href="(\.\.\/)Child\/index\.html"/g);
+    expect(matches).toHaveLength(2);
+  });
 });

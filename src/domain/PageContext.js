@@ -96,7 +96,8 @@ class PageContext {
     let current = this;
     while (current) {
       // Add current page's folder name (including Main_Page)
-      if (current.title && current.title !== 'untitled') {
+      // FIX: Skip root page (depth 0) to prevent duplicating the root folder name
+      if (current.title && current.title !== 'untitled' && current.depth > 0) {
         parts.unshift(current.title);
       }
       current = current.parentContext;

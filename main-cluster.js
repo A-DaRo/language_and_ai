@@ -65,12 +65,31 @@ Example:
     // Create orchestrator (this initializes browserManager)
     const orchestrator = new ClusterOrchestrator(config, logger);
 
-    // Phase 2: Create and start Dashboard Controller (now that browserManager exists)
-    const dashboardController = new DashboardController(eventBus, orchestrator.browserManager);
-    dashboardController.start();
+    // Set up dashboard to start after bootstrap completes
+    let dashboardController = null;
+    eventBus.once('BOOTSTRAP:COMPLETE', ({ workerCount }) => {
+      // Phase 2: Create and start Dashboard Controller (now that workers exist)
+      dashboardController = new DashboardController(eventBus, orchestrator.browserManager);
+      dashboardController.start();
 
-    // Phase 3: Switch logger from console to dashboard mode (removes console strategy)
-    logger.switchMode('dashboard', { dashboardInstance: dashboardController.getDashboard() });
+      // Phase 3: Switch logger from console to dashboard mode (removes console strategy)
+      logger.switchMode('dashboard', { dashboardInstance: dashboardController.getDashboard() });
+      
+      // Listen for phase change to switch back to dashboard mode if needed
+      // Registered here to ensure it runs AFTER DashboardController has handled the event (and restarted)
+      eventBus.on('PHASE:CHANGED', ({ phase }) => {
+        if (phase === 'download' && dashboardController) {
+          // Switch logger back to dashboard mode
+          logger.switchMode('dashboard', { dashboardInstance: dashboardController.getDashboard() });
+        }
+      });
+    });
+
+    // Listen for dashboard stop signal (user confirmation phase)
+    eventBus.on('PHASE:STOPPING_DASHBOARD', () => {
+      // Switch logger back to console mode for user confirmation
+      logger.switchMode('console');
+    });
 
     // Run the full workflow
     // The orchestrator handles all phases internally
@@ -81,7 +100,9 @@ Example:
     );
 
     // Stop the dashboard before showing final stats
-    dashboardController.stop();
+    if (dashboardController) {
+      dashboardController.stop();
+    }
     
     // Switch back to console for final output
     logger.switchMode('console');

@@ -17,26 +17,32 @@ class TerminalDashboard {
    * @param {number} workerCount - The number of worker slots to create.
    */
   constructor(workerCount) {
+    // Clear terminal for clean dashboard display (ANSI reset)
+    process.stdout.write('\x1Bc');
+    
     this.multibar = new cliProgress.MultiBar({
       clearOnComplete: false,
       hideCursor: true,
       format: '{bar} | {label}',
     }, cliProgress.Presets.shades_classic);
 
-    // Header and Footer for static text
-    this.header = this.multibar.create(1, 1, { label: 'Initializing...' });
-    this.header.setFormat('{label}');
+    // Header and Footer for static text (use 1/1 progress to display as static text)
+    this.header = this.multibar.create(1, 1, { label: 'Initializing...' }, {
+      format: '{label}'
+    });
 
-    this.footer = this.multibar.create(1, 1, { label: 'System is starting...' });
-    this.footer.setFormat('  \u2514\u2500 {label}');
+    this.footer = this.multibar.create(1, 1, { label: 'System is starting...' }, {
+      format: '  \u2514\u2500 {label}'
+    });
 
     // Dynamic bars for progress and workers
     this.progressBars = new Map();
     this.workerBars = new Map();
 
     for (let i = 0; i < workerCount; i++) {
-      const bar = this.multibar.create(1, 0, { label: `Worker ${i + 1}: [IDLE]` });
-      bar.setFormat('   {label}');
+      const bar = this.multibar.create(1, 0, { label: `[IDLE] Worker ${i + 1}: Waiting for task...` }, {
+        format: '  {label}'
+      });
       this.workerBars.set(i, bar);
     }
   }
@@ -52,14 +58,16 @@ class TerminalDashboard {
     this.progressBars.clear();
 
     if (mode === 'discovery') {
-      const bar = this.multibar.create(1, 0, { label: 'Pages Found: 0 | In Queue: 0 | Conflicts: 0' });
-      bar.setFormat('  Progress: {label}');
+      const bar = this.multibar.create(1, 0, { label: '[Pages Found: 0] [In Queue: 0] [Conflicts: 0] [Current Depth: 0]' }, {
+        format: ' Progress: {label}'
+      });
       this.progressBars.set('discoveryStats', bar);
     } else if (mode === 'download') {
       const bar = this.multibar.create(initialData.total || 1, initialData.completed || 0, {
         label: `[Pending: ${initialData.pending || 0}] [Active: 0] [Complete: 0/${initialData.total || 0}] [Failed: 0]`
+      }, {
+        format: ' Progress: {label}'
       });
-      bar.setFormat('  Progress: {label}');
       this.progressBars.set('downloadStats', bar);
     }
   }
@@ -83,7 +91,7 @@ class TerminalDashboard {
   updateDiscoveryStats({ pagesFound, inQueue, conflicts, currentDepth }) {
     const bar = this.progressBars.get('discoveryStats');
     if (bar) {
-      bar.update(1, { label: `Pages Found: ${pagesFound} | In Queue: ${inQueue} | Conflicts: ${conflicts} | Current Depth: ${currentDepth}` });
+      bar.update(1, { label: `[Pages Found: ${pagesFound}] [In Queue: ${inQueue}] [Conflicts: ${conflicts || 0}] [Current Depth: ${currentDepth}]` });
     }
   }
 
@@ -112,7 +120,7 @@ class TerminalDashboard {
   updateWorkerStatus(slotIndex, statusText) {
     const bar = this.workerBars.get(slotIndex);
     if (bar) {
-      bar.update(1, { label: `Worker ${slotIndex + 1}: ${statusText}` });
+      bar.update(1, { label: statusText });
     }
   }
 

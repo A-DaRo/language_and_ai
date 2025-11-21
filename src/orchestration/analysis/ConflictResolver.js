@@ -8,6 +8,8 @@
  * the linkRewriteMap to correctly rewrite links in a single pass.
  */
 
+const Logger = require('../../core/Logger');
+
 /**
  * @class ConflictResolver
  * @classdesc Detects duplicate pages and generates canonical download paths
@@ -28,11 +30,12 @@ class ConflictResolver {
    * console.log(`Found ${canonicalContexts.length} unique pages`);
    */
   static resolve(allContexts, titleRegistry = {}) {
-    console.log(`[ConflictResolver] Analyzing ${allContexts.length} discovered page(s)`);
+    const logger = Logger.getInstance();
+    logger.debug('ConflictResolver', `Analyzing ${allContexts.length} discovered page(s)`);
     
     // First pass: Update all context titles from the title registry
     // This ensures file paths use human-readable names instead of raw IDs
-    console.log(`[ConflictResolver] Updating context titles from title registry...`);
+    logger.debug('ConflictResolver', 'Updating context titles from title registry...');
     let updatedCount = 0;
     for (const context of allContexts) {
       const humanReadableTitle = titleRegistry[context.id];
@@ -41,7 +44,7 @@ class ConflictResolver {
         updatedCount++;
       }
     }
-    console.log(`[ConflictResolver] Updated ${updatedCount} context title(s) from registry`);
+    logger.debug('ConflictResolver', `Updated ${updatedCount} context title(s) from registry`);
     
     const urlToContexts = new Map(); // url -> Array of PageContext
     const canonicalContexts = [];
@@ -65,7 +68,7 @@ class ConflictResolver {
       if (contexts.length > 1) {
         duplicateCount += contexts.length - 1;
         const displayTitle = titleRegistry[canonical.id] || canonical.title || 'Untitled';
-        console.log(`[ConflictResolver] Found ${contexts.length} references to: ${displayTitle}`);
+        logger.debug('ConflictResolver', `Found ${contexts.length} references to: ${displayTitle}`);
       }
       
       // Calculate target file path for this page
@@ -87,9 +90,9 @@ class ConflictResolver {
       duplicates: duplicateCount
     };
     
-    console.log(`[ConflictResolver] Resolution complete:`);
-    console.log(`  - Unique pages: ${stats.uniquePages}`);
-    console.log(`  - Duplicates removed: ${stats.duplicates}`);
+    logger.info('ConflictResolver', 'Resolution complete');
+    logger.info('ConflictResolver', `  - Unique pages: ${stats.uniquePages}`);
+    logger.info('ConflictResolver', `  - Duplicates removed: ${stats.duplicates}`);
     
     return {
       canonicalContexts,

@@ -21,21 +21,35 @@ class DashboardController {
     this.manager = browserManager;
     this.dashboard = null;
     this.workerSlotMap = new Map();
+    this.workerTaskCounts = new Map(); // Track tasks per worker
     this.startTime = Date.now();
     this.timerInterval = null;
+    this.currentPhaseLabel = '';
+    this.isRunning = false;
+    
+    // Initialize worker slot map immediately
+    const workerIds = this.manager.getAllWorkerIds();
+    workerIds.forEach((id, index) => this.workerSlotMap.set(id, index));
+    
+    // Attach listeners once
+    this._attachListeners();
   }
 
   /**
    * @method start
-   * @summary Initializes the dashboard and attaches all event listeners.
+   * @summary Initializes the dashboard.
    */
   start() {
+    if (this.isRunning) return;
+    
+    // Re-initialize worker slot map in case workers changed (e.g. restart)
     const workerIds = this.manager.getAllWorkerIds();
+    this.workerSlotMap.clear();
     workerIds.forEach((id, index) => this.workerSlotMap.set(id, index));
 
     this.dashboard = new TerminalDashboard(workerIds.length);
-    this._attachListeners();
     this._startElapsedTimer();
+    this.isRunning = true;
   }
 
   /**
@@ -58,6 +72,7 @@ class DashboardController {
     if (this.dashboard) {
       this.dashboard.stop();
     }
+    this.isRunning = false;
   }
 
   /**
@@ -70,10 +85,11 @@ class DashboardController {
       const elapsed = Math.floor((Date.now() - this.startTime) / 1000);
       const minutes = Math.floor(elapsed / 60);
       const seconds = elapsed % 60;
-      const timeStr = `${minutes}:${seconds.toString().padStart(2, '0')}`;
+      const timeStr = `${minutes}m ${seconds}s`;
       
       if (this.dashboard) {
-        this.dashboard.updateHeader(`JBC090 Language & AI | Elapsed: ${timeStr}`);
+        const phasePart = this.currentPhaseLabel ? ` | ${this.currentPhaseLabel}` : '';
+        this.dashboard.updateHeader(` JBC090 Language & AI${phasePart} | Elapsed: ${timeStr}`);
       }
     }, 1000);
   }
@@ -85,40 +101,72 @@ class DashboardController {
    */
   _attachListeners() {
     this.bus.on('PHASE:CHANGED', ({ phase, data }) => {
-      this.dashboard.setMode(phase, data);
-      const elapsed = Math.floor((Date.now() - this.startTime) / 1000);
-      const minutes = Math.floor(elapsed / 60);
-      const seconds = elapsed % 60;
-      const timeStr = `${minutes}:${seconds.toString().padStart(2, '0')}`;
-      this.dashboard.updateHeader(`JBC090 Language & AI | ${phase.toUpperCase()} Phase | Elapsed: ${timeStr}`);
+      // If entering download phase and dashboard is stopped, restart it
+      if (phase === 'download' && !this.isRunning) {
+        this.start();
+      }
+      
+      if (this.dashboard) {
+        this.dashboard.setMode(phase, data);
+        this.currentPhaseLabel = phase === 'discovery' ? 'Discovery Phase' : 'Download Phase';
+        
+        const elapsed = Math.floor((Date.now() - this.startTime) / 1000);
+        const minutes = Math.floor(elapsed / 60);
+        const seconds = elapsed % 60;
+        const timeStr = `${minutes}m ${seconds}s`;
+        this.dashboard.updateHeader(` JBC090 Language & AI | ${this.currentPhaseLabel} | Elapsed: ${timeStr}`);
+      }
+    });
+
+    this.bus.on('PHASE:STOPPING_DASHBOARD', () => {
+      // Stop the dashboard and clear terminal before user confirmation
+      this.stop();
+      // Clear terminal with ANSI reset sequence
+      process.stdout.write('\x1Bc');
+      // Reset worker task counts for next phase or run
+      this.workerTaskCounts.clear();
     });
 
     this.bus.on('DISCOVERY:PROGRESS', (stats) => {
-      this.dashboard.updateDiscoveryStats(stats);
+      if (this.dashboard) {
+        this.dashboard.updateDiscoveryStats(stats);
+      }
     });
 
     this.bus.on('EXECUTION:PROGRESS', (stats) => {
-      this.dashboard.updateDownloadStats(stats);
+      if (this.dashboard) {
+        this.dashboard.updateDownloadStats(stats);
+      }
     });
 
     this.bus.on('WORKER:BUSY', ({ workerId, task }) => {
+      if (!this.dashboard) return;
+      
       const slot = this.workerSlotMap.get(workerId);
       if (slot !== undefined) {
-        this.dashboard.updateWorkerStatus(slot, `[BUSY] ${task.description}`);
+        // Increment task count for this worker
+        const currentCount = (this.workerTaskCounts.get(workerId) || 0) + 1;
+        this.workerTaskCounts.set(workerId, currentCount);
+        
+        this.dashboard.updateWorkerStatus(slot, `[BUSY] Worker ${slot + 1}: ${task.description} [PagesAssigned: ${currentCount}]`);
       }
     });
 
     this.bus.on('WORKER:IDLE', ({ workerId }) => {
+      if (!this.dashboard) return;
+
       const slot = this.workerSlotMap.get(workerId);
       if (slot !== undefined) {
-        this.dashboard.updateWorkerStatus(slot, `[IDLE] Waiting for task...`);
+        this.dashboard.updateWorkerStatus(slot, `[IDLE] Worker ${slot + 1}: Waiting for task...`);
       }
     });
     
     this.bus.on('WORKER:READY', ({ workerId }) => {
+      if (!this.dashboard) return;
+
       const slot = this.workerSlotMap.get(workerId);
       if (slot !== undefined) {
-        this.dashboard.updateWorkerStatus(slot, `[IDLE] Waiting for task...`);
+        this.dashboard.updateWorkerStatus(slot, `[IDLE] Worker ${slot + 1}: Waiting for task...`);
       }
     });
   }

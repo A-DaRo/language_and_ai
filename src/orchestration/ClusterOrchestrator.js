@@ -223,6 +223,12 @@ class ClusterOrchestrator {
     this.currentPhase = Phase.DISCOVERY;
     this.logger.separator('Phase 2: Discovery');
     
+    // Emit phase change for dashboard
+    this.eventBus.emit('PHASE:CHANGED', { 
+      phase: 'discovery', 
+      data: {} 
+    });
+    
     // Process discovery queue
     while (!this.queueManager.isDiscoveryComplete()) {
       const task = this.queueManager.nextDiscovery();
@@ -235,9 +241,11 @@ class ClusterOrchestrator {
       
       // Emit discovery progress
       const stats = this.queueManager.getStatistics();
+      const queueLength = this.queueManager.discoveryQueue ? this.queueManager.discoveryQueue.length : 0;
+      const pendingTasks = stats.pending && stats.pending.discovery ? stats.pending.discovery : 0;
       this.eventBus.emit('DISCOVERY:PROGRESS', {
         pagesFound: stats.discovered,
-        inQueue: stats.pending,
+        inQueue: queueLength + pendingTasks,
         conflicts: stats.conflicts || 0,
         currentDepth: task.pageContext.depth
       });
@@ -260,9 +268,17 @@ class ClusterOrchestrator {
       });
       
       // Emit worker busy event
+      const titleRegistry = this.queueManager.getTitleRegistry();
+      let title = titleRegistry[task.pageContext.id] || task.pageContext.title || 'Untitled';
+      
+      // Format raw IDs to be more readable if title resolution failed
+      if (title.match(/^[a-f0-9]{32}$/i)) {
+        title = `Page ${title.substring(0, 6)}...`;
+      }
+
       this.eventBus.emit('WORKER:BUSY', {
         workerId,
-        task: { description: `Discovering '${task.pageContext.title}'` }
+        task: { description: `Discovering '${title}'...` }
       });
     }
     
@@ -304,6 +320,13 @@ class ClusterOrchestrator {
    */
   async _phaseUserConfirmation() {
     this.currentPhase = Phase.USER_CONFIRMATION;
+    
+    // Signal to stop dashboard and switch back to console mode
+    this.eventBus.emit('PHASE:STOPPING_DASHBOARD', {});
+    
+    // Allow dashboard to stop and terminal to clear
+    await new Promise(resolve => setTimeout(resolve, 100));
+    
     this.logger.separator('Phase 3: User Confirmation');
     
     // Get discovery statistics
@@ -378,6 +401,12 @@ class ClusterOrchestrator {
     this.currentPhase = Phase.DOWNLOAD;
     this.logger.separator('Phase 5: Download');
     
+    // Emit phase change for dashboard
+    this.eventBus.emit('PHASE:CHANGED', { 
+      phase: 'download', 
+      data: { total: canonicalContexts.length } 
+    });
+    
     // Build download queue
     this.queueManager.buildDownloadQueue(canonicalContexts);
     
@@ -394,8 +423,8 @@ class ClusterOrchestrator {
       // Emit execution progress
       const stats = this.queueManager.getStatistics();
       this.eventBus.emit('EXECUTION:PROGRESS', {
-        pending: stats.pending,
-        active: this.browserManager.getBusyCount(),
+        pending: stats.pending.download || 0,
+        active: this.browserManager.getAllocatedCount(),
         completed: stats.downloaded,
         total: canonicalContexts.length,
         failed: stats.failed
@@ -416,10 +445,16 @@ class ClusterOrchestrator {
       
       // Emit worker busy event
       const titleRegistry = this.queueManager.getTitleRegistry();
-      const title = titleRegistry[context.id] || context.title || 'Untitled';
+      let title = titleRegistry[context.id] || context.title || 'Untitled';
+      
+      // Format raw IDs to be more readable
+      if (title.match(/^[a-f0-9]{32}$/i)) {
+        title = `Page ${title.substring(0, 6)}...`;
+      }
+
       this.eventBus.emit('WORKER:BUSY', {
         workerId,
-        task: { description: `Downloading '${title}'` }
+        task: { description: `Downloading '${title}'...` }
       });
     }
     

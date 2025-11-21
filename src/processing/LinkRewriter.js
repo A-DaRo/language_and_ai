@@ -67,6 +67,14 @@ class LinkRewriter {
       const dom = new JSDOM(html);
       const document = dom.window.document;
       
+      // Create ID-to-Context map for robust lookup
+      const idToContextMap = new Map();
+      for (const context of urlToContextMap.values()) {
+        if (context.id) {
+          idToContextMap.set(context.id, context);
+        }
+      }
+
       let rewriteCount = 0;
       let modified = false;
       const pageDir = path.dirname(htmlFilePath);
@@ -98,15 +106,38 @@ class LinkRewriter {
             continue;
           }
           
-          absoluteUrl = absoluteUrl.split('?')[0].split('#')[0];
+          // Preserve hash for internal anchors
+          const urlParts = absoluteUrl.split('#');
+          const urlWithoutHash = urlParts[0].split('?')[0];
+          const hash = urlParts.length > 1 ? '#' + urlParts[1] : '';
           
-          const targetContext = urlToContextMap.get(absoluteUrl);
+          let targetContext = urlToContextMap.get(urlWithoutHash);
+          
+          // Fallback: Try to find by ID if URL lookup failed
+          if (!targetContext) {
+            const idMatch = urlWithoutHash.match(/29[a-f0-9]{30}/i);
+            if (idMatch) {
+              const id = idMatch[0];
+              targetContext = idToContextMap.get(id);
+            }
+          }
           
           if (targetContext) {
-            const relativePath = pageContext.getRelativePathTo(targetContext);
-            link.setAttribute('href', relativePath);
+            let newHref;
+            
+            // If target is the same page, only use hash (if present)
+            // This prevents reloading the page when clicking internal anchors
+            if (targetContext.id === pageContext.id) {
+              newHref = hash || 'index.html';
+            } else {
+              // Different page: resolve full relative path + hash
+              const relativePath = pageContext.getRelativePathTo(targetContext);
+              newHref = relativePath + hash;
+            }
+
+            link.setAttribute('href', newHref);
             rewriteCount++;
-            this.logger.debug('LINK-REWRITE', `${pageContext.title}: ${href} -> ${relativePath}`);
+            this.logger.debug('LINK-REWRITE', `${pageContext.title}: ${href} -> ${newHref}`);
           }
         } catch (error) {
           continue;

@@ -37,9 +37,25 @@ class ContentExpander {
    */
   async expandAll(page) {
     await this._scrollToBottom(page);
-    await this._expandToggles(page);
+    // Aggressive expansion disabled
+    // await this._expandToggles(page);
   }
   
+  /**
+   * @summary Prepare page for scraping (scroll and close overlays).
+   * 
+   * @description Replaces the aggressive expansion with a gentler approach:
+   * 1. Scrolls to bottom to trigger lazy-loading
+   * 2. Attempts to close any open overlays/modals that might obscure content
+   * 
+   * @param {Page} page - Puppeteer page instance.
+   * @returns {Promise<void>}
+   */
+  async preparePage(page) {
+    await this._scrollToBottom(page);
+    await this._closeOverlays(page);
+  }
+
   /**
    * @summary Scroll to the bottom of the page to trigger lazy-loading.
    * 
@@ -74,6 +90,47 @@ class ContentExpander {
     await new Promise(resolve => setTimeout(resolve, this.config.WAIT_AFTER_SCROLL));
   }
   
+  /**
+   * @summary Attempt to close any open overlays, modals, or sidebars.
+   * 
+   * @description Checks for common overlay selectors and attempts to close them
+   * by clicking close buttons or pressing Escape.
+   * 
+   * @param {Page} page - Puppeteer page instance.
+   * @returns {Promise<void>}
+   * @private
+   */
+  async _closeOverlays(page) {
+    this.logger.info('CLEANUP', 'Checking for open overlays or sidebars...');
+    
+    try {
+      // Try pressing Escape first (common way to close modals)
+      await page.keyboard.press('Escape');
+      
+      // Check for specific close buttons if Escape didn't work or as backup
+      await page.evaluate(() => {
+        const closeSelectors = [
+          '[role="dialog"] button[aria-label="Close"]',
+          '.notion-overlay-container [role="button"]',
+          '.notion-help-button', // Sometimes help button opens things
+          '[aria-modal="true"] button'
+        ];
+        
+        closeSelectors.forEach(selector => {
+          const el = document.querySelector(selector);
+          if (el) {
+            el.click();
+          }
+        });
+      });
+      
+      // Wait a bit for animations
+      await new Promise(resolve => setTimeout(resolve, 500));
+    } catch (error) {
+      this.logger.debug('CLEANUP', `Error closing overlays: ${error.message}`);
+    }
+  }
+
   /**
    * @summary Aggressively expand ALL toggles, buttons, tabs, and interactive elements.
    * 

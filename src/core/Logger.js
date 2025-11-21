@@ -117,6 +117,18 @@ class Logger {
   }
 
   /**
+   * Get current active UI strategy name (for debugging)
+   * @returns {string|null} The name of the current UI strategy or null if none
+   */
+  getCurrentUIStrategy() {
+    const uiStrategy = this.strategies.find(s => {
+      const name = s.constructor.name;
+      return name === 'ConsoleStrategy' || name === 'DashboardStrategy';
+    });
+    return uiStrategy ? uiStrategy.constructor.name : null;
+  }
+
+  /**
    * Log an informational message
    * @param {string} category - Message category
    * @param {string} message - Log message

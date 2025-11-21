@@ -41,7 +41,7 @@ class FileDownloader {
       '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx',
       '.zip', '.rar', '.7z', '.tar', '.gz',
       '.py', '.js', '.ts', '.java', '.cpp', '.c', '.h',
-      '.ipynb', '.json', '.xml', '.csv', '.txt', '.md',
+      '.ipynb', '.json', '.xml', '.txt', '.md',
       '.mp4', '.avi', '.mov', '.mp3', '.wav',
       '.jpg', '.jpeg', '.png', '.gif', '.svg'
     ];

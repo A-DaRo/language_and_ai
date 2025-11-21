@@ -99,7 +99,9 @@ class TaskRunner {
    */
   async execute(taskType, payload) {
     try {
-      this.logger.info('TaskRunner', `Executing ${taskType} task for: ${payload.url}`);
+      // Log only the ID to keep the terminal clean (as requested)
+      const targetId = payload.pageId || (payload.url ? payload.url.split('/').pop() : 'unknown');
+      this.logger.info('TaskRunner', `Executing ${taskType} task for: ${targetId}`);
       
       let result;
       

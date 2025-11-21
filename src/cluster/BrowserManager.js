@@ -216,6 +216,14 @@ class BrowserManager {
   getTotalCount() {
     return this.workers.size;
   }
+
+  /**
+   * Get all worker IDs
+   * @returns {Array<string>} Array of worker IDs
+   */
+  getAllWorkerIds() {
+    return Array.from(this.workers.keys());
+  }
   
   /**
    * Get pool statistics
