@@ -8,25 +8,17 @@
  * It's a proxy/handle for IPC communication with a child process.
  */
 
-const { MESSAGE_TYPES, validateMessage } = require('../core/ProtocolDefinitions');
+const { MESSAGE_TYPES } = require('../core/ProtocolDefinitions');
 const SystemEventBus = require('../core/SystemEventBus');
 const Logger = require('../core/Logger');
-
-/**
- * Worker state constants
- * @enum {string}
- */
-const WorkerState = {
-  INITIALIZING: 'INITIALIZING',
-  IDLE: 'IDLE',
-  BUSY: 'BUSY',
-  CRASHED: 'CRASHED'
-};
+const { WorkerStateManager, WorkerState } = require('./proxy/WorkerStateManager');
+const WorkerMessageHandler = require('./proxy/WorkerMessageHandler');
+const WorkerLifecycleManager = require('./proxy/WorkerLifecycleManager');
 
 /**
  * @class WorkerProxy
  * @classdesc Master-side handle for a Worker child process.
- * Manages IPC communication, state tracking, and lifecycle.
+ * Delegates state management, message handling, and lifecycle operations.
  */
 class WorkerProxy {
   /**
@@ -35,155 +27,28 @@ class WorkerProxy {
    */
   constructor(workerId, childProcess) {
     this.workerId = workerId;
-    this.childProcess = childProcess;
-    this.state = WorkerState.INITIALIZING;
-    this.currentTask = null;
     this.eventBus = SystemEventBus.getInstance();
-    
+
+    // Initialize component managers
+    this.stateManager = new WorkerStateManager();
+    this.messageHandler = new WorkerMessageHandler(workerId);
+    this.lifecycleManager = new WorkerLifecycleManager(workerId, childProcess);
+
     this._setupListeners();
   }
-  
+
   /**
    * Setup IPC and process event listeners
    * @private
    */
   _setupListeners() {
-    // Listen for messages from worker
-    this.childProcess.on('message', (message) => {
-      if (message.type === 'IPC_LOG') {
-        // Forward Worker logs to Master Logger
-        // The Master Logger will then write to File and/or Dashboard
-        const { level, category, message: logMsg, meta } = message.payload;
-        const logger = Logger.getInstance();
-        const workerCategory = `Worker-${this.workerId}:${category}`;
-        
-        if (typeof logger[level] === 'function') {
-            logger[level](workerCategory, logMsg, meta);
-        } else {
-            logger.info(workerCategory, logMsg, meta);
-        }
-        return;
-      }
-      this._handleMessage(message);
-    });
-    
-    // Capture worker stdout/stderr and route through Logger
-    if (this.childProcess.stdout) {
-      this.childProcess.stdout.on('data', (data) => {
-        Logger.getInstance().info(`Worker-${this.workerId}:stdout`, data.toString().trim());
-      });
-    }
-    
-    if (this.childProcess.stderr) {
-      this.childProcess.stderr.on('data', (data) => {
-        Logger.getInstance().error(`Worker-${this.workerId}:stderr`, data.toString().trim());
-      });
-    }
-    
-    // Handle worker exit
-    this.childProcess.on('exit', (code, signal) => {
-      this._handleExit(code, signal);
-    });
-    
-    // Handle worker errors
-    this.childProcess.on('error', (error) => {
-      Logger.getInstance().error('WorkerProxy', `Worker ${this.workerId} error: ${error.message}`, error);
-      this.state = WorkerState.CRASHED;
-      this.eventBus.emit('WORKER:CRASHED', {
-        workerId: this.workerId,
-        error: error.message
-      });
-    });
+    this.lifecycleManager.setupListeners(
+      (message) => this.messageHandler.handleMessage(message, this.stateManager),
+      (code, signal) => this.messageHandler.handleExit(code, signal, this.stateManager),
+      (error) => this.messageHandler.handleError(error, this.stateManager)
+    );
   }
-  
-  /**
-   * Handle IPC message from worker
-   * @private
-   * @param {Object} message - IPC message
-   */
-  _handleMessage(message) {
-    try {
-      validateMessage(message);
-      
-      if (message.type === MESSAGE_TYPES.READY) {
-        this._handleReady(message);
-      } else if (message.type === MESSAGE_TYPES.RESULT) {
-        this._handleResult(message);
-      } else {
-        Logger.getInstance().warn('WorkerProxy', `Unknown message type from worker: ${message.type}`);
-      }
-    } catch (error) {
-      Logger.getInstance().error('WorkerProxy', 'Error handling message', error);
-    }
-  }
-  
-  /**
-   * Handle READY signal from worker
-   * @private
-   * @param {Object} message - Ready message
-   */
-  _handleReady(message) {
-    Logger.getInstance().info('WorkerProxy', `Worker ${this.workerId} is ready (PID: ${message.pid})`);
-    this.state = WorkerState.IDLE;
-    this.eventBus.emit('WORKER:READY', {
-      workerId: this.workerId,
-      pid: message.pid
-    });
-  }
-  
-  /**
-   * Handle task result from worker
-   * @private
-   * @param {Object} message - Result message
-   */
-  _handleResult(message) {
-    Logger.getInstance().info('WorkerProxy', `Worker ${this.workerId} completed task`);
-    
-    const taskId = this.currentTask ? this.currentTask.taskId : null;
-    
-    if (message.error) {
-      // Task failed
-      this.eventBus.emit('TASK:FAILED', {
-        workerId: this.workerId,
-        taskId: taskId,
-        taskType: message.taskType,
-        error: message.error
-      });
-    } else {
-      // Task succeeded
-      this.eventBus.emit('TASK:COMPLETE', {
-        workerId: this.workerId,
-        taskId: taskId,
-        taskType: message.taskType,
-        result: message.data
-      });
-    }
-    
-    // Mark worker as idle
-    this.currentTask = null;
-    this.state = WorkerState.IDLE;
-    this.eventBus.emit('WORKER:IDLE', {
-      workerId: this.workerId
-    });
-  }
-  
-  /**
-   * Handle worker process exit
-   * @private
-   * @param {number} code - Exit code
-   * @param {string} signal - Exit signal
-   */
-  _handleExit(code, signal) {
-    Logger.getInstance().info('WorkerProxy', `Worker ${this.workerId} exited (code: ${code}, signal: ${signal})`);
-    this.state = WorkerState.CRASHED;
-    
-    this.eventBus.emit('WORKER:CRASHED', {
-      workerId: this.workerId,
-      exitCode: code,
-      signal: signal
-    });
-  }
-  
+
   /**
    * Send a command to the worker
    * @async
@@ -191,41 +56,27 @@ class WorkerProxy {
    * @param {Object} payload - Command payload
    * @returns {Promise<void>}
    * @throws {Error} If worker is not available or send fails
-   * @example
-   * await workerProxy.sendCommand(MESSAGE_TYPES.DISCOVER, {
-   *   url: 'https://notion.so/page',
-   *   pageId: 'abc123',
-   *   depth: 1
-   * });
    */
   async sendCommand(messageType, payload) {
-    if (this.state === WorkerState.CRASHED) {
+    if (this.stateManager.isCrashed()) {
       throw new Error(`Worker ${this.workerId} has crashed`);
     }
-    
-    if (this.state === WorkerState.BUSY) {
+
+    if (this.stateManager.isBusy()) {
       throw new Error(`Worker ${this.workerId} is busy`);
     }
-    
-    this.state = WorkerState.BUSY;
-    this.currentTask = {
-      taskId: `${this.workerId}-${Date.now()}`,
-      type: messageType,
-      payload: payload
-    };
-    
-    this.childProcess.send({
-      type: messageType,
-      payload: payload
-    });
-    
+
+    const task = this.stateManager.markBusy(this.workerId, messageType, payload);
+
+    this.lifecycleManager.sendCommand(messageType, payload);
+
     this.eventBus.emit('TASK:STARTED', {
       workerId: this.workerId,
-      taskId: this.currentTask.taskId,
+      taskId: task.taskId,
       taskType: messageType
     });
   }
-  
+
   /**
    * Send initialization payload with titleRegistry to worker
    * @async
@@ -233,19 +84,14 @@ class WorkerProxy {
    * @returns {Promise<void>}
    */
   async sendInitialization(titleRegistry) {
-    if (this.state === WorkerState.CRASHED) {
+    if (this.stateManager.isCrashed()) {
       Logger.getInstance().warn('WorkerProxy', `Cannot initialize crashed worker ${this.workerId}`);
       return;
     }
-    
-    this.childProcess.send({
-      type: MESSAGE_TYPES.INIT,
-      payload: {
-        titleRegistry: titleRegistry || {}
-      }
-    });
+
+    this.lifecycleManager.sendInitialization(titleRegistry);
   }
-  
+
   /**
    * Broadcast cookies to this worker
    * @async
@@ -253,52 +99,31 @@ class WorkerProxy {
    * @returns {Promise<void>}
    */
   async broadcastCookies(cookies) {
-    if (this.state === WorkerState.CRASHED) {
+    if (this.stateManager.isCrashed()) {
       Logger.getInstance().warn('WorkerProxy', `Cannot send cookies to crashed worker ${this.workerId}`);
       return;
     }
-    
-    this.childProcess.send({
-      type: MESSAGE_TYPES.SET_COOKIES,
-      payload: { cookies }
-    });
+
+    this.lifecycleManager.broadcastCookies(cookies);
   }
-  
+
   /**
    * Terminate the worker process
    * @async
    * @returns {Promise<void>}
    */
   async terminate() {
-    Logger.getInstance().info('WorkerProxy', `Terminating worker ${this.workerId}`);
-    
-    try {
-      // Send shutdown command
-      this.childProcess.send({
-        type: MESSAGE_TYPES.SHUTDOWN
-      });
-      
-      // Wait a bit for graceful shutdown
-      await new Promise(resolve => setTimeout(resolve, 1000));
-      
-      // Force kill if still alive
-      if (!this.childProcess.killed) {
-        this.childProcess.kill('SIGTERM');
-      }
-    } catch (error) {
-      Logger.getInstance().error('WorkerProxy', 'Error terminating worker', error);
-      this.childProcess.kill('SIGKILL');
-    }
+    await this.lifecycleManager.terminate();
   }
-  
+
   /**
    * Check if worker is available for tasks
    * @returns {boolean} True if worker is idle and ready
    */
   isAvailable() {
-    return this.state === WorkerState.IDLE;
+    return this.stateManager.isAvailable();
   }
-  
+
   /**
    * Get worker status
    * @returns {Object} Status object
@@ -306,9 +131,9 @@ class WorkerProxy {
   getStatus() {
     return {
       workerId: this.workerId,
-      state: this.state,
-      pid: this.childProcess.pid,
-      currentTask: this.currentTask
+      state: this.stateManager.getState(),
+      pid: this.lifecycleManager.getPid(),
+      currentTask: this.stateManager.getCurrentTask()
     };
   }
 }

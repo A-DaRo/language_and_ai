@@ -115,20 +115,28 @@ The application is divided into the following packages, organized by runtime con
 *   **`src/core`**: Fundamental infrastructure (Configuration, Logging, Event Bus, Protocol Definitions)
     *   **`src/core/logger`**: Logging strategy implementations (Console, File, Dashboard, IPC)
 *   **`src/cluster`**: Worker process lifecycle management (Initialization, Proxy, Pool Management)
+    *   **`src/cluster/proxy`**: WorkerProxy component decomposition (StateManager, MessageHandler, LifecycleManager)
 *   **`src/orchestration`**: High-level workflow coordination and state machines
+    *   **`src/orchestration/phases`**: Phase Strategy pattern implementations (6 concrete phases: Bootstrap, Discovery, UserConfirmation, ConflictResolution, Download, Completion)
+    *   **`src/orchestration/queues`**: Queue component separation (TitleRegistry, DiscoveryQueue, ExecutionQueue)
     *   **`src/orchestration/analysis`**: Graph analysis and conflict resolution
 *   **`src/ui`**: Terminal dashboard components for real-time monitoring
 *   **`src/domain`**: Serializable domain entities (PageContext)
+    *   **`src/domain/path`**: Path calculation strategy (PathCalculator)
 *   **`src/utils`**: Shared utility functions (FileSystem, Integrity, UserPrompt)
 
 #### Worker Process Packages
 
 *   **`src/worker`**: Worker entrypoint and task routing
+    *   **`src/worker/handlers`**: Task handler delegation (DiscoveryHandler, DownloadHandler)
+    *   **`src/worker/io`**: File system abstraction and I/O safety
+    *   **`src/worker/pipeline`**: Scraping pipeline orchestration and step implementations
 *   **`src/scraping`**: Puppeteer interaction for page navigation and saving
 *   **`src/processing`**: Content manipulation (expansion, cookies, link rewriting)
 *   **`src/extraction`**: Data extraction from DOM (Links)
 *   **`src/download`**: Resource downloading (Assets, CSS, Files)
-    *   **`src/download/css`**: Specialized CSS processing components
+    *   **`src/download/css`**: Specialized CSS processing components (PuppeteerCssStrategy, JsdomCssStrategy)
+    *   **`src/download/file`**: File downloader component decomposition (FileTypeDetector, FileDownloadStrategy, FileNameExtractor)
 
 #### Shared Packages
 
@@ -289,7 +297,7 @@ _displayPageTree(rootContext) {
 _handleTaskComplete(workerId, taskType, result) {
   const titleRegistry = this.queueManager.getTitleRegistry();
   const displayTitle = result.resolvedTitle || titleRegistry[result.pageId];
-  this.logger.info('TASK', `✓ Discovered: ${displayTitle}`);
+  this.logger.info('TASK', `[+] Discovered: ${displayTitle}`);
 }
 ```
 
@@ -404,10 +412,10 @@ async _executeDownload(payload) {
 - **Memory**: Eliminates N×2 redundant IPC copies (1KB × 200 = 200KB saved for 100 pages)
 
 **Architectural Guarantees Maintained**:
-- ✅ Master owns authoritative state (`GlobalQueueManager.idToTitleMap`)
-- ✅ Workers remain stateless (cache is ephemeral, not persisted)
-- ✅ Separation of concerns preserved (workers cache read-only data)
-- ✅ No synchronization issues (registry is append-only during scraping)
+- Master owns authoritative state (`GlobalQueueManager.idToTitleMap`)
+- Workers remain stateless (cache is ephemeral, not persisted)
+- Separation of concerns preserved (workers cache read-only data)
+- No synchronization issues (registry is append-only during scraping)
 
 ---
 
@@ -1033,14 +1041,21 @@ export function deserializeError(serialized)
 
 The domain package defines the core data structures that represent the scraped content. These objects must be JSON-serializable to cross IPC boundaries.
 
-#### 2.1 `PageContext.js` - Page Metadata Model
+#### 2.1 `PageContext.js` (REFACTORED - Path Calculation Delegation)
 
 **Runtime Context**: Both Master and Worker  
-**Design Pattern**: Data Transfer Object + Value Object  
+**Design Pattern**: Data Transfer Object + Delegation to PathCalculator  
 **Serialization**: JSON-compatible (no circular references)
 
 **Class Description**:
-Represents a single Notion page within the hierarchical structure. It is the **Single Source of Truth** for file paths, relationships, and metadata. Must be fully serializable for IPC transmission between Master and Worker processes.
+Represents a single Notion page within the hierarchical structure. It is the **Single Source of Truth** for page relationships and metadata. Has been refactored to delegate all path calculations to a specialized `PathCalculator` component, improving separation of concerns and testability.
+
+**Refactoring Overview**:
+
+PageContext was reduced from 260 lines to 184 lines (29% reduction) by delegating path calculation logic to `PathCalculator.js`:
+
+- **Before**: PageContext mixed domain properties with 7 path calculation methods
+- **After**: PageContext focuses on domain (page ID, title, hierarchy); PathCalculator handles all path operations
 
 **Constructor Signature**:
 ```javascript
@@ -1051,184 +1066,174 @@ Represents a single Notion page within the hierarchical structure. It is the **S
  * @param {number} depth - BFS depth level (0 = root)
  * @param {string|null} parentId - ID of parent PageContext (not reference)
  */
-constructor(url, title, depth, parentId = null)
+constructor(url, title, depth, parentId = null) {
+  // Domain properties
+  this.id = generateIdFromUrl(url);
+  this.url = url;
+  this.title = title;
+  this.displayTitle = sanitizeForFilesystem(title);
+  this.depth = depth;
+  this.parentId = parentId;
+  this.childIds = [];
+  
+  // Delegation
+  this.pathCalculator = new PathCalculator();
+}
 ```
 
-**Properties**:
+**Core Domain Properties**:
 ```javascript
 /**
  * @property {string} id - Unique identifier (generated from URL hash)
  * @property {string} url - Canonical page URL
  * @property {string} title - Page title
- * @property {string} displayTitle - Sanitized title for display
+ * @property {string} displayTitle - Sanitized title for display/filesystem
  * @property {number} depth - BFS depth level
- * @property {string|null} parentId - Parent context ID (serializable)
+ * @property {string|null} parentId - Parent context ID (serializable, not reference)
  * @property {Array<string>} childIds - Array of child context IDs
- * @property {string|null} section - Hierarchical section metadata
- * @property {string|null} subsection - Hierarchical subsection metadata
- * @property {string} relativePath - Path relative to output root
  * @property {number} timestamp - Creation timestamp
  */
 ```
 
-**Public Methods**:
-
+**Domain Methods** (Unchanged):
 ```javascript
 /**
- * @method setSection
- * @summary Sets the hierarchical section metadata
- * @description Assigns section information extracted from page structure.
- *              Used for organizing pages into logical groupings.
- * @param {string} section - Section identifier
- * @returns {void}
- * @note Human-readable titles stored in GlobalQueueManager.idToTitleMap
- */
-setSection(section)
-
-/**
- * @method setSubsection
- * @summary Sets the hierarchical subsection metadata
- * @description Assigns subsection information for deeper hierarchy.
- * @param {string} subsection - Subsection identifier
- * @returns {void}
- */
-setSubsection(subsection)
-
-/**
  * @method addChild
- * @summary Adds a child page to the hierarchy
- * @description Registers a child PageContext by storing its ID (not reference).
- *              Maintains serialization compatibility.
+ * @description Registers a child PageContext by storing its ID
  * @param {PageContext} childContext - Child context to add
- * @returns {void}
- * @throws {TypeError} If childContext is not a PageContext instance
  */
 addChild(childContext)
 
 /**
- * @method getRelativePath
- * @summary Calculates the relative path from the root
- * @description Traverses parent chain to build hierarchical path.
- *              Used for determining directory structure.
- * @returns {string} Relative path (e.g., "Parent/Child/Grandchild")
- * @example
- * // Given hierarchy: Root > Projects > WebApp
- * context.getRelativePath() // Returns "Projects/WebApp"
- */
-getRelativePath()
-
-/**
- * @method getDirectoryPath
- * @summary Returns the absolute directory path for saving the page
- * @description Combines base directory with relative path to create full filesystem path.
- * @param {string} baseDir - Base output directory
- * @returns {string} Absolute directory path
- * @example
- * context.getDirectoryPath("/output")
- * // Returns "/output/Projects/WebApp"
- */
-getDirectoryPath(baseDir)
-
-/**
- * @method getFilePath
- * @summary Returns the absolute path to the index.html file
- * @description Convenience method that combines directory path with index.html filename.
- * @param {string} baseDir - Base output directory
- * @returns {string} Absolute file path
- * @example
- * context.getFilePath("/output")
- * // Returns "/output/Projects/WebApp/index.html"
- */
-getFilePath(baseDir)
-
-/**
- * @method getRelativePathTo
- * @summary Calculates the relative file path from this page to another page
- * @description Used for link rewriting to convert absolute URLs to relative filesystem paths.
- *              Handles different directory depths correctly.
- * @param {PageContext} targetContext - Target page context
- * @returns {string} Relative path (e.g., "../../Other/Page/index.html")
- * @example
- * // From: /output/Projects/WebApp/index.html
- * // To: /output/Docs/API/index.html
- * context.getRelativePathTo(docsContext)
- * // Returns "../../Docs/API/index.html"
- */
-getRelativePathTo(targetContext)
-
-/**
  * @method isRoot
- * @summary Checks if this is the root page
- * @description Convenience method for determining if page is at depth 0.
- * @returns {boolean} True if root page
+ * @description Returns true if this is the root page
+ * @returns {boolean}
  */
 isRoot()
 
 /**
- * @method getDepthLabel
- * @summary Returns a human-readable depth indicator
- * @description Generates visual depth representation for logging.
- * @returns {string} Depth label (e.g., "  L1" for depth 1)
- */
-getDepthLabel()
-
-/**
  * @method toJSON
- * @summary Serializes context to JSON-compatible object
- * @description Converts PageContext to plain object for IPC transmission.
- *              Removes circular references and non-serializable properties.
- * @returns {Object} Serialized representation
- * @example
- * process.send({
- *   type: 'IPC_RESULT',
- *   payload: { context: pageContext.toJSON() }
- * })
+ * @description Serializes context to JSON for IPC transmission
+ * @returns {Object}
  */
 toJSON()
 
 /**
  * @static
  * @method fromJSON
- * @summary Reconstructs PageContext from serialized form
- * @description Creates a new PageContext instance from plain object.
- *              Used when receiving contexts from Worker processes.
+ * @description Reconstructs PageContext from serialized form
  * @param {Object} json - Serialized context
- * @returns {PageContext} Reconstructed context instance
- * @example
- * const context = PageContext.fromJSON(message.payload.context)
+ * @returns {PageContext}
  */
 static fromJSON(json)
 ```
 
-**Serialization Requirements**:
+**Path Calculation Methods** (Delegated to PathCalculator):
 
-The PageContext must be fully JSON-serializable to cross IPC boundaries. Key constraints:
-
-1. **No Circular References**: `parent` property replaced with `parentId` string
-2. **No Function References**: Methods are not serialized, only data
-3. **Reconstructable**: `fromJSON()` static method rebuilds instance with methods
-4. **Child Storage**: Children stored as array of IDs, not object references
-
-**Example Serialization Flow**:
 ```javascript
-// Master Process
-const context = new PageContext("https://notion.so/page", "Page Title", 1, "parent-id")
-const proxy = getWorkerProxy()
-proxy.sendCommand('DOWNLOAD', {
-  context: context.toJSON() // Serializes to plain object
-})
+/**
+ * @method getRelativePath
+ * @description Calculates path from output root via PathCalculator
+ * @returns {string} Relative path (e.g., "Projects/WebApp")
+ * @note Delegates to: pathCalculator.calculateRelativePath(this)
+ */
+getRelativePath()
 
-// Worker Process receives message
+/**
+ * @method getDirectoryPath
+ * @description Returns absolute directory path via PathCalculator
+ * @param {string} baseDir - Base output directory
+ * @returns {string} Absolute directory path
+ * @note Delegates to: pathCalculator.calculateDirectoryPath(baseDir, this)
+ */
+getDirectoryPath(baseDir)
+
+/**
+ * @method getFilePath
+ * @description Returns absolute path to index.html via PathCalculator
+ * @param {string} baseDir - Base output directory
+ * @returns {string} Absolute file path to index.html
+ * @note Delegates to: pathCalculator.calculateFilePath(baseDir, this)
+ */
+getFilePath(baseDir)
+
+/**
+ * @method getRelativePathTo
+ * @description Calculates relative path from this page to another via PathCalculator
+ * @param {PageContext} targetContext - Target page context
+ * @returns {string} Relative path (e.g., "../../Other/Page/index.html")
+ * @note Delegates to: pathCalculator.calculateRelativePathBetween(this, targetContext)
+ * @used-for Link rewriting to convert absolute URLs to relative filesystem paths
+ */
+getRelativePathTo(targetContext)
+```
+
+**PathCalculator Component** (`src/domain/path/PathCalculator.js` - 105 lines):
+
+The `PathCalculator` encapsulates all path calculation logic:
+
+1. **calculateRelativePath(pageContext)**: Build hierarchical path from parent chain
+2. **calculateDirectoryPath(baseDir, pageContext)**: Full directory path for saving page
+3. **calculateFilePath(baseDir, pageContext)**: Full path to index.html file
+4. **calculateRelativePathBetween(source, target)**: Path for link rewriting
+
+Features:
+- Handles multi-level hierarchy with proper parent chain traversal
+- Windows/Unix compatible path handling
+- Proper path normalization and sanitization
+- Safe directory creation paths
+
+**Integration Example**:
+
+```javascript
+// Master Process - Create page context
+const root = new PageContext('https://notion.so/root', 'Course', 0, null);
+const module1 = new PageContext('https://notion.so/mod1', 'Module 1', 1, root.id);
+module1.parentContext = root; // Set parent reference for path calculations
+
+// Path calculations via PathCalculator delegation
+module1.getRelativePath();           // → "Module 1"
+module1.getDirectoryPath('/output'); // → "/output/Module 1"
+module1.getFilePath('/output');      // → "/output/Module 1/index.html"
+
+// Link rewriting example
+const otherModule = new PageContext(...);
+module1.getRelativePathTo(otherModule);
+// → "../../Other Module/index.html" (calculated by PathCalculator)
+```
+
+**Serialization Across IPC**:
+
+PageContext remains fully JSON-serializable for Master-Worker communication:
+
+```javascript
+// Master sends to Worker
+const payload = {
+  context: pageContext.toJSON() // Plain object, no functions
+}
+process.send({ type: 'IPC_TASK', payload })
+
+// Worker reconstructs with methods
 process.on('message', (msg) => {
-  const context = PageContext.fromJSON(msg.payload.context)
-  // Now has full PageContext instance with methods
-  const path = context.getFilePath("/output")
+  const context = PageContext.fromJSON(msg.payload.context);
+  // Now can call: context.getFilePath(baseDir), etc.
+  const pathCalculator = new PathCalculator();
+  const filePath = pathCalculator.calculateFilePath(baseDir, context);
 })
 ```
 
-**Dependencies**: `FileSystemUtils` (for path sanitization)  
-**Used By**: All components that handle page metadata  
-**Source**: [`src/domain/PageContext.js`](../src/domain/PageContext.js)
+**Benefits of PageContext Decomposition**:
+
+1. **Cleaner Separation**: Domain model separated from path logic
+2. **Improved Testability**: PathCalculator independently testable without PageContext
+3. **Reduced Complexity**: 260 lines → 184 lines (29% reduction)
+4. **Code Reuse**: PathCalculator can be used for other path operations
+5. **Maintainability**: Single responsibility for each component
+6. **Extensibility**: Path logic extensible without modifying domain model
+
+**Dependencies**: `PathCalculator` (path calculation strategy)  
+**Used By**: All components handling page metadata and file operations  
+**Source**: [`src/domain/PageContext.js`](../src/domain/PageContext.js) and [`src/domain/path/PathCalculator.js`](../src/domain/path/PathCalculator.js)
 
 ---
 
@@ -1470,7 +1475,168 @@ The manager exposes real-time statistics:
 
 ---
 
-### 4. Worker Package (`src/worker`) - Execution Environment (NEW)
+#### 3.4 `WorkerProxy.js` - IPC Adapter (REFACTORED - Component Decomposition)
+
+**Runtime Context**: Master Process Only  
+**Design Pattern**: Proxy + Delegation Pattern + Facade  
+**Responsibility**: Master-side handle for worker process, bridging IPC and event communication
+
+**Behavioral Description**:
+
+WorkerProxy has been refactored from a 312-line monolithic class into a lightweight 123-line proxy that delegates state management, message handling, and lifecycle operations to specialized components.
+
+**Architecture Change**:
+
+**Before (Monolithic)**:
+- Single 312-line class with all worker coordination logic
+- Methods: `_setupListeners()`, `_handleMessage()`, `_handleResult()`, `_handleExit()`, etc.
+- Mixed concerns: IPC listening, message handling, state management, process lifecycle
+- Complex nested callback logic
+
+**After (Component Decomposition)**:
+- Lightweight 123-line proxy facade
+- 3 component files:
+  - WorkerStateManager: State tracking and transitions
+  - WorkerMessageHandler: IPC message processing
+  - WorkerLifecycleManager: Process lifecycle and stream management
+- Each component has single responsibility
+- Clean delegation pattern with dependency injection
+
+**Component Decomposition Pattern**:
+
+```javascript
+class WorkerProxy {
+  constructor(workerId, childProcess) {
+    this.workerId = workerId;
+    
+    // Initialize component managers
+    this.stateManager = new WorkerStateManager();
+    this.messageHandler = new WorkerMessageHandler(workerId);
+    this.lifecycleManager = new WorkerLifecycleManager(workerId, childProcess);
+    
+    this._setupListeners();
+  }
+  
+  async sendCommand(messageType, payload) {
+    // Delegate state validation
+    if (this.stateManager.isCrashed()) {
+      throw new Error(`Worker ${this.workerId} has crashed`);
+    }
+    if (this.stateManager.isBusy()) {
+      throw new Error(`Worker ${this.workerId} is busy`);
+    }
+    
+    // Delegate state transition
+    const task = this.stateManager.markBusy(this.workerId, messageType, payload);
+    
+    // Delegate command sending
+    this.lifecycleManager.sendCommand(messageType, payload);
+    
+    this.eventBus.emit('TASK:STARTED', {
+      workerId: this.workerId,
+      taskId: task.taskId,
+      taskType: messageType
+    });
+  }
+}
+```
+
+**Component Implementations**:
+
+1. **WorkerStateManager.js** (85 lines)
+   - Purpose: Track worker state transitions
+   - Responsibilities:
+     - `markIdle()`: Transition to IDLE
+     - `markBusy(workerId, messageType, payload)`: Transition to BUSY with task tracking
+     - `markCrashed()`: Transition to CRASHED
+     - State validation: `isAvailable()`, `isBusy()`, `isCrashed()`
+     - State queries: `getState()`, `getCurrentTask()`
+   - States:
+     - INITIALIZING: Worker process spawning
+     - IDLE: Ready for tasks
+     - BUSY: Executing task
+     - CRASHED: Unrecoverable failure
+   - Key invariant: Only one state at a time
+
+2. **WorkerMessageHandler.js** (112 lines)
+   - Purpose: Process inbound IPC messages
+   - Responsibilities:
+     - `handleMessage(message, stateManager)`: Route message based on type
+     - `handleExit(code, signal, stateManager)`: Handle process exit
+     - `handleError(error, stateManager)`: Handle process error
+   - Message types:
+     - IPC_LOG: Forward worker logs to Master Logger
+     - IPC_READY: Transition worker to IDLE
+     - IPC_RESULT: Task completion, emit task result events
+   - Features:
+     - Log forwarding with worker namespace
+     - Event emission for task completion/failure
+     - Error serialization handling
+     - Automatic state transitions
+
+3. **WorkerLifecycleManager.js** (97 lines)
+   - Purpose: Manage process lifecycle and I/O streams
+   - Responsibilities:
+     - `setupListeners(messageHandler, exitHandler, errorHandler)`: Initialize event handlers
+     - `sendCommand(messageType, payload)`: Send IPC message to worker
+     - `sendInitialization(titleRegistry)`: Send initialization message
+     - `broadcastCookies(cookies)`: Send cookies to worker
+     - `terminate()`: Gracefully shut down worker
+   - Features:
+     - Stdout/stderr capture and routing through Logger
+     - Graceful shutdown with timeout and force-kill
+     - Stream setup for log forwarding
+     - IPC message sending with error handling
+
+**Integration with Master**:
+
+```javascript
+// In ClusterOrchestrator or BrowserManager
+const proxy = new WorkerProxy(workerId, childProcess);
+
+// Send command
+try {
+  await proxy.sendCommand(MESSAGE_TYPES.DISCOVER, {
+    url: 'https://notion.so/...',
+    pageId: '...',
+    depth: 1
+  });
+} catch (error) {
+  // Worker unavailable or crashed
+  logger.error('PROXY', `Failed to send command: ${error.message}`);
+}
+
+// Send initialization
+await proxy.sendInitialization(titleRegistry);
+
+// Broadcast cookies
+await proxy.broadcastCookies(cookies);
+
+// Check availability
+if (proxy.isAvailable()) {
+  // Can send command
+}
+
+// Get status
+const status = proxy.getStatus();
+console.log(`Worker ${status.workerId}: ${status.state} (PID: ${status.pid})`);
+
+// Terminate
+await proxy.terminate();
+```
+
+**Benefits of WorkerProxy Decomposition**:
+
+1. **Reduced Complexity**: 312 lines → 123 lines (61% reduction)
+2. **Improved Testability**: Each component can be unit tested independently
+3. **Single Responsibility**: Proxy routes, StateManager tracks, Handler processes, LifecycleManager manages
+4. **Code Reuse**: Components can be used in different proxy configurations
+5. **Maintainability**: Smaller focused files easier to understand and modify
+6. **Extensibility**: New message types can be added to handler without modifying proxy
+
+**Source**: [`src/cluster/WorkerProxy.js`](../src/cluster/WorkerProxy.js) and [`src/cluster/proxy/`](../src/cluster/proxy/)
+
+---
 
 The worker package defines the code that runs **inside child processes**. This code has zero knowledge of the Master's state, orchestration logic, or other workers. It is purely reactive, responding to commands over IPC.
 
@@ -1571,166 +1737,160 @@ function handleFatalError(error) {
 
 ---
 
-#### 4.2 `TaskRunner.js` - Command Router (REFACTORED)
+#### 4.2 `TaskRunner.js` - Command Router (REFACTORED - Handler Delegation Pattern)
 
 **Runtime Context**: Worker Process Only  
-**Design Pattern**: Command Pattern + Strategy Pattern + Pipeline Coordinator  
-**Responsibility**: Message routing, task execution coordination, and pipeline orchestration
+**Design Pattern**: Router + Delegation Pattern + Stateless Factory  
+**Responsibility**: Route IPC messages to appropriate handlers, manage handler lifecycle
 
 **Behavioral Description**:
 
-TaskRunner is the **switchboard** inside the worker. It receives IPC messages, routes them to appropriate handlers, and returns results.
+TaskRunner has been refactored from a 322-line monolithic class with inline task execution into a lightweight 111-line router that delegates to specialized task handlers.
+
+**Architecture Change**:
+
+**Before (Monolithic)**:
+- Single 322-line class with inline execution logic
+- Methods: `_executeDiscovery()` and `_executeDownload()` contained all business logic
+- Complex initialization of multiple processing components per task
+- Difficult to test discovery and download logic independently
+
+**After (Handler Delegation)**:
+- Lightweight 111-line router
+- 2 handler strategy files (DiscoveryHandler, DownloadHandler)
+- Each handler implements `handle(payload)` method with complete task logic
+- TaskRunner instantiates handlers and delegates based on message type
+- Clean separation: router handles dispatching, handlers handle execution
+- Handlers are single-responsibility and independently testable
+
+**Handler Delegation Pattern**:
+
+```javascript
+class TaskRunner {
+  constructor(browser) {
+    this.browser = browser;
+    
+    // Initialize handlers
+    this.discoveryHandler = new DiscoveryHandler(browser, context);
+    this.downloadHandler = new DownloadHandler(browser, context);
+  }
+  
+  async execute(taskType, payload) {
+    try {
+      let result;
+      
+      if (taskType === MESSAGE_TYPES.DISCOVER) {
+        result = await this.discoveryHandler.handle(payload);
+      } else if (taskType === MESSAGE_TYPES.DOWNLOAD) {
+        result = await this.downloadHandler.handle(payload);
+      } else {
+        throw new Error(`Unknown task type: ${taskType}`);
+      }
+      
+      return {
+        type: MESSAGE_TYPES.RESULT,
+        taskType,
+        data: result
+      };
+    } catch (error) {
+      return {
+        type: MESSAGE_TYPES.RESULT,
+        taskType,
+        error: serializeError(error)
+      };
+    }
+  }
+}
+```
+
+**Task Handler Implementations**:
+
+1. **DiscoveryHandler.js** (114 lines)
+   - Purpose: Lightweight page metadata extraction
+   - Behavior:
+     - Navigate to URL with `domcontentloaded` wait
+     - Extract page title from DOM or resolved title
+     - Extract all internal links via LinkExtractor
+     - Capture cookies on first page if flagged
+   - Output: `{ success, pageId, url, resolvedTitle, links, cookies?, metadata }`
+   - Performance: ~1-2 seconds per page
+
+2. **DownloadHandler.js** (170 lines)
+   - Purpose: Full page scraping with all resources
+   - Behavior:
+     - Validate payload structure (absolute paths via `_validatePayload()`)
+     - Initialize pipeline context
+     - Construct ScrapingPipeline with sequential steps:
+       - NavigationStep: Apply cookies, navigate with `networkidle0`
+       - CookieConsentStep: Handle consent overlays
+       - ExpansionStep: Expand collapsible content
+       - AssetDownloadStep: Download images, CSS, files
+       - LinkRewriterStep: Rewrite internal links to relative paths
+       - HtmlWriteStep: Save HTML to absolute path
+     - Execute pipeline with error isolation per step
+     - Return truthful statistics from actual operations
+   - Output: `{ success, pageId, url, savedPath, assetsDownloaded, linksRewritten }`
+   - Performance: ~10-30 seconds per page (depends on assets)
+   - Critical: Replaces inline logic that caused "Ghost Execution" failures
 
 **Message Routing**:
 
 ```javascript
-async handleMessage(message) {
-  const { type, payload } = message
+async execute(taskType, payload) {
+  const targetId = payload.pageId || 'unknown';
+  this.logger.info('TaskRunner', `Executing ${taskType} task for: ${targetId}`);
   
-  try {
-    let result
-    
-    switch (type) {
-      case 'IPC_DISCOVER':
-        result = await this.handleDiscover(payload)
-        break
-      
-      case 'IPC_DOWNLOAD':
-        result = await this.handleDownload(payload)
-        break
-      
-      case 'IPC_SET_COOKIES':
-        result = await this.handleSetCookies(payload)
-        break
-      
-      case 'IPC_SHUTDOWN':
-        await this.handleShutdown()
-        return // Don't send result, just exit
-      
-      default:
-        throw new Error(`Unknown message type: ${type}`)
-    }
-    
-    // Send success result
-    process.send({
-      type: 'IPC_RESULT',
-      payload: { success: true, taskId: payload.taskId, ...result }
-    })
-    
-  } catch (error) {
-    // Send error result
-    process.send({
-      type: 'IPC_RESULT',
-      payload: { 
-        success: false, 
-        taskId: payload.taskId, 
-        error: serializeError(error) 
-      }
-    })
+  let result;
+  
+  if (taskType === MESSAGE_TYPES.DISCOVER) {
+    result = await this.discoveryHandler.handle(payload);
+  } else if (taskType === MESSAGE_TYPES.DOWNLOAD) {
+    result = await this.downloadHandler.handle(payload);
+  } else {
+    throw new Error(`Unknown task type: ${taskType}`);
   }
-}
-```
-
-**Task Handlers**:
-
-**Discovery Handler** (`handleDiscover`):
-- Purpose: Lightweight page metadata extraction
-- Behavior:
-  1. Navigate to URL with `domcontentloaded` wait (fast)
-  2. Handle cookie consent if `isFirstPage`
-  3. Extract page title from DOM
-  4. Extract all internal links (no external resources)
-  5. Return cookies if first page (for broadcast)
-- Output: `{ title, links, cookies? }`
-- Performance: ~1-2 seconds per page
-
-**Download Handler** (`handleDownload`):
-- Purpose: Full page scraping with all resources using Pipeline Pattern
-- Behavior:
-  1. Validate payload structure (enforce absolute paths via `_validateDownloadPayload()`)
-  2. Create or reuse Puppeteer page
-  3. Initialize pipeline context with browser, page, config, logger, payload, fileSystem
-  4. Construct ScrapingPipeline with 5 sequential steps:
-     - **NavigationStep**: Apply cookies, navigate to URL with `networkidle0`
-     - **ExpansionStep**: Expand all collapsible content via ContentExpander
-     - **AssetDownloadStep**: Download images, CSS (via `downloadFromPuppeteer`), files
-     - **LinkRewriterStep**: Rewrite internal links to relative paths
-     - **HtmlWriteStep**: Save HTML to absolute path using WorkerFileSystem
-  5. Execute pipeline sequentially with error isolation per step
-  6. Return truthful statistics from actual operations (not fake success)
-- Output: `{ success: true, pageId, url, savedPath, assetsDownloaded, linksRewritten }`
-- Performance: ~10-30 seconds per page (depends on assets)
-- Critical: Replaces 27-line stub that caused "Ghost Execution" failure
-
-**Cookie Broadcast Handler** (`handleSetCookies`):
-- Purpose: Synchronize authentication state across all workers
-- Behavior:
-  1. Receive cookies array from Master
-  2. Apply cookies to worker's browser context
-  3. Persist cookies for all future navigations
-- Output: `{ success: true }`
-- Critical: Ensures all workers share same session
-
-**Payload Validation** (`_validateDownloadPayload`):
-- Purpose: Prevent "Ghost Execution" by enforcing absolute paths
-- Validation Rules:
-  1. Required fields: `url`, `pageId`, `savePath`
-  2. **Critical**: `savePath` must be absolute (via `path.isAbsolute()`)
-  3. Throws descriptive error if validation fails
-- Rationale: Workers in child processes have different working directories than Master
-- Error Example: `Invalid download payload: savePath must be absolute. Received: course_material/Page/index.html`
-- Guarantees: All file writes use Master-calculated absolute paths
-
-**Shutdown Handler** (`handleShutdown`):
-- Purpose: Graceful worker termination
-- Behavior:
-  1. Close all Puppeteer pages
-  2. Close browser instance
-  3. Flush logs
-  4. Exit process with code 0
-- Output: None (process terminates)
-
-**Error Serialization**:
-
-Worker errors must be JSON-serializable for IPC transmission:
-```javascript
-function serializeError(error) {
+  
   return {
-    name: error.name,
-    message: error.message,
-    stack: error.stack,
-    code: error.code,
-    // Include Puppeteer-specific properties
-    isTimeout: error.name === 'TimeoutError',
-    isNavigation: error.message?.includes('navigation')
-  }
+    type: MESSAGE_TYPES.RESULT,
+    taskType,
+    data: result
+  };
 }
 ```
 
-**Page State Management**:
+**Handler Context Management**:
 
-Between tasks, the worker must reset page state:
+Handlers receive shared context for configuration and logging:
+
 ```javascript
-async resetPage() {
-  // Clear existing cookies (except those set by SET_COOKIES)
-  const currentCookies = await this.page.cookies()
-  await this.page.deleteCookie(...currentCookies.filter(c => !c.persistent))
-  
-  // Clear cache
-  await this.page._client.send('Network.clearBrowserCache')
-  
-  // Reset viewport
-  await this.page.setViewport({ width: 1920, height: 1080 })
-  
-  // Close any popup windows
-  const pages = await this.browser.pages()
-  for (const p of pages.slice(1)) {
-    await p.close()
-  }
-}
+this.discoveryHandler = new DiscoveryHandler(browser, {
+  config: this.config,
+  cookies: this.cookies,
+  titleRegistry: this.titleRegistry
+});
+
+this.downloadHandler = new DownloadHandler(browser, {
+  config: this.config,
+  cookies: this.cookies,
+  titleRegistry: this.titleRegistry
+});
 ```
 
-**Source**: [`src/worker/TaskRunner.js`](../src/worker/TaskRunner.js)
+**Cookie and Registry Management**:
+
+- `setCookies(cookies)`: Updates both handlers with authentication state
+- `setTitleRegistry(titleRegistry, isDelta)`: Updates both handlers with title mappings
+
+**Benefits of Handler Delegation Refactoring**:
+
+1. **Reduced Complexity**: 322 lines → 111 lines (65% reduction)
+2. **Improved Testability**: Each handler can be unit tested independently
+3. **Single Responsibility**: TaskRunner routes, handlers execute
+4. **Extensibility**: New task types can be added with new handlers
+5. **Code Reuse**: Handler logic can be reused in different contexts
+6. **Error Isolation**: Handler errors don't affect router
+
+**Source**: [`src/worker/TaskRunner.js`](../src/worker/TaskRunner.js) and [`src/worker/handlers/`](../src/worker/handlers/)
 
 ---
 
@@ -1738,116 +1898,129 @@ async resetPage() {
 
 The orchestration package contains the **brain** of the Master Process. It implements the high-level workflow, state machines, and decision-making logic.
 
-#### 5.1 `ClusterOrchestrator.js` - Master State Machine (NEW/REFACTORED)
+#### 5.1 `ClusterOrchestrator.js` - Master State Machine (REFACTORED - Phase Strategy Pattern)
 
 **Runtime Context**: Master Process Only  
-**Design Pattern**: State Machine + Mediator + Coordinator  
-**Responsibility**: Top-level workflow coordination, connecting queue to workers
+**Design Pattern**: State Machine + Mediator + Coordinator + Strategy Pattern  
+**Responsibility**: Top-level workflow coordination, delegating to phase strategies
 
 **Behavioral Description**:
 
-ClusterOrchestrator is the **conductor** of the distributed scraping symphony. It coordinates between the GlobalQueueManager (what to do), BrowserManager (who does it), and ConflictResolver (how to optimize it).
+ClusterOrchestrator is the **conductor** of the distributed scraping symphony. It has been refactored from a 670-line monolithic class into a lightweight 178-line orchestrator that delegates each of the 6 workflow phases to specialized strategy implementations.
 
-**State Machine**:
+**Architecture Change**:
 
-The orchestrator operates in three distinct phases:
+**Before (Monolithic)**:
+- Single 670-line class with all phase logic inline
+- Methods: `_phaseBootstrap()`, `_phaseDiscovery()`, `_phaseUserConfirmation()`, `_phasePruning()`, `_phaseExecution()`, `_phaseCompletion()`
+- Phase-specific complexity mixed with orchestration logic
+- Difficult to test individual phases in isolation
+
+**After (Strategy Pattern)**:
+- Lightweight 178-line orchestrator
+- 6 phase strategy files (BootstrapPhase, DiscoveryPhase, UserConfirmationPhase, ConflictResolutionPhase, DownloadPhase, CompletionPhase)
+- Each phase implements `PhaseStrategy.execute(context)` interface
+- Orchestrator instantiates and delegates to strategies sequentially
+- Clean separation of concerns: orchestrator handles workflow control, strategies handle phase logic
+- Improved testability and maintainability
+
+**Phase Strategy Pattern**:
+
+```javascript
+/**
+ * @abstract PhaseStrategy - Base class for all phase implementations
+ */
+class PhaseStrategy {
+  /**
+   * Execute this phase with given context
+   * @abstract
+   * @async
+   * @param {Object} context - Orchestrator context with browser, queue, config, etc.
+   * @returns {Promise<void>}
+   */
+  async execute(context) {
+    throw new Error('Must implement execute()');
+  }
+}
+
+/**
+ * ClusterOrchestrator orchestrates by delegating to strategies
+ */
+class ClusterOrchestrator {
+  async start() {
+    const context = { browserManager, queueManager, config, logger, eventBus };
+    
+    // Execute 6 phases sequentially using strategy pattern
+    await new BootstrapPhase().execute(context);
+    await new DiscoveryPhase().execute(context);
+    await new UserConfirmationPhase().execute(context);
+    await new ConflictResolutionPhase().execute(context);
+    await new DownloadPhase().execute(context);
+    await new CompletionPhase().execute(context);
+  }
+}
+```
+
+**Phase Strategy Implementations**:
+
+1. **BootstrapPhase.js** (127 lines)
+   - Spawns worker processes
+   - Initializes browser manager
+   - Initializes global queue manager with root URL
+   - Sends titleRegistry to workers via `BrowserManager.initializeWorkers()`
+
+2. **DiscoveryPhase.js** (90 lines)
+   - Implements BFS page discovery
+   - Coordinates between worker availability and task dispatch
+   - Emits progress events for dashboard
+   - Returns when all discovery complete
+
+3. **UserConfirmationPhase.js** (87 lines)
+   - Displays discovered page tree structure
+   - Shows statistics (page count, max depth, conflicts)
+   - Prompts user for yes/no confirmation
+   - Handles timeout and non-interactive mode detection
+   - Aborts process if user declines
+
+4. **ConflictResolutionPhase.js** (40 lines)
+   - Invokes ConflictResolver to prune duplicate pages
+   - Builds canonical link map for download phase
+   - Calculates absolute save paths for all pages
+
+5. **DownloadPhase.js** (92 lines)
+   - Implements parallel download execution
+   - Respects parent-child dependency ordering
+   - Tracks download statistics
+   - Returns when all downloads complete
+
+6. **CompletionPhase.js** (76 lines)
+   - Shuts down browser manager
+   - Runs integrity auditor
+   - Displays final statistics and summary
+   - Handles both successful and aborted scenarios
+
+**Orchestration Flow**:
+
+The orchestrator maintains simple event-driven control flow:
 
 ```
-INIT → DISCOVERY → USER_CONFIRMATION → PRUNING → EXECUTION → COMPLETE
+START → Bootstrap → Discovery → UserConfirmation → ConflictResolution → Download → Completion → END
+                      ↓                                                    ↓
+                    WORKER:AVAILABLE                            WORKER:AVAILABLE
+                    → TASK:STARTED → TASK:COMPLETE              → TASK:STARTED → TASK:COMPLETE
+                    (repeat until queue empty)                   (repeat until queue empty)
 ```
 
-**Phase 1: INIT**
+**Benefits of Phase Strategy Refactoring**:
 
-**Phase 1: INIT**
-- Emit `SYSTEM:INIT` event
-- BrowserInitializer spawns worker pool
-- BrowserManager registers workers
-- GlobalQueueManager initializes with root URL
-- **Initialize workers with titleRegistry** (sent once via IPC_INIT)
-- Transition to DISCOVERY
+1. **Reduced Complexity**: 670 lines → 178 lines (73% reduction)
+2. **Improved Testability**: Each phase can be unit tested independently
+3. **Single Responsibility**: ClusterOrchestrator only orchestrates, doesn't implement phase logic
+4. **Extensibility**: New phases can be added without modifying orchestrator
+5. **Reusability**: Phase strategies can be composed differently for different workflows
+6. **Maintainability**: Each phase file is focused and under 150 lines
 
-**Phase 2: DISCOVERY** (Lightweight BFS)
-- Event Loop:
-  ```javascript
-  on('WORKER:AVAILABLE') → {
-    if (queueManager.hasDiscoveryTasks()) {
-      task = queueManager.nextDiscovery()
-      browserManager.execute('DISCOVER', task)
-    }
-  }
-  
-  on('JOB:COMPLETED') → {
-    result = event.payload
-    if (result.links) {
-      queueManager.enqueueDiscoveredLinks(result.links)
-    }
-    if (result.cookies && !cookiesCaptured) {
-      this.broadcastCookies(result.cookies)
-      cookiesCaptured = true
-    }
-  }
-  ```
-- Termination: When `queueManager.isDiscoveryComplete()`
-- Output: Complete PageContext tree with all URLs discovered
-- Transition to USER_CONFIRMATION
-
-**Phase 3: USER_CONFIRMATION** (Interactive Prompt)
-- Display discovered site structure via `_displayPageTree()`
-- Show summary statistics (total pages, max depth, conflicts)
-- Prompt user with yes/no confirmation (60-second timeout)
-- Handle user input:
-  - 'y/yes' → Proceed to PRUNING phase
-  - 'n/no' → Abort and transition to COMPLETE
-  - Timeout → Abort and transition to COMPLETE
-  - Ctrl+C (SIGINT) → Abort and transition to COMPLETE
-- Non-interactive mode detection (CI/CD environments)
-- Edge cases:
-  - Zero pages discovered → Auto-abort
-  - Very large trees (>100 pages) → Display truncated tree with summary
-- Transition to PRUNING (if confirmed) or COMPLETE (if aborted)
-
-**Phase 4: PRUNING** (Graph Optimization)
-- Pause all workers (stop dispatching tasks)
-- Invoke `ConflictResolver.prune(rootContext)`
-- Build canonical URL → Local Path mapping
-- Generate download plan (only canonical instances)
-- Transition to EXECUTION
-
-**Phase 5: EXECUTION** (Full Scraping)
-- Reset worker states (clear partial data)
-- Event Loop (similar to discovery):
-  ```javascript
-  on('WORKER:AVAILABLE') → {
-    if (queueManager.hasDownloadTasks()) {
-      task = queueManager.nextDownload()
-      task.linkMap = this.canonicalLinkMap
-      browserManager.execute('DOWNLOAD', task)
-    }
-  }
-  
-  on('JOB:COMPLETED') → {
-    queueManager.markDownloadComplete(task.url)
-    // If this page had parent, check if parent now ready
-    if (task.parentUrl) {
-      queueManager.decrementPendingChildren(task.parentUrl)
-    }
-  }
-  ```
-- Termination: When `queueManager.isDownloadComplete()`
-- Transition to COMPLETE
-
-**Phase 6: COMPLETE**
-- Accepts optional `aborted` parameter (true if user declined or dry run)
-- If aborted:
-  - Log "Scraping process aborted. Cleaning up..."
-  - Display discovered pages (no download statistics)
-  - Show page tree structure
-- If successful:
-  - Emit `EXECUTION:COMPLETE` event
-  - Trigger `IntegrityAuditor.audit()`
-  - Display full statistics (discovered/downloaded/failed)
-- `BrowserManager.shutdown()`
-- Display statistics
+**Source**: [`src/orchestration/ClusterOrchestrator.js`](../src/orchestration/ClusterOrchestrator.js) and [`src/orchestration/phases/`](../src/orchestration/phases/)
 
 **Cookie Management Strategy**:
 
@@ -1949,140 +2122,146 @@ function isRetryableError(error) {
 
 ---
 
-#### 5.2 `GlobalQueueManager.js` - BFS Frontier Management (NEW)
+#### 5.2 `GlobalQueueManager.js` - BFS Frontier Management (REFACTORED - Queue Component Separation)
 
 **Runtime Context**: Master Process Only  
-**Design Pattern**: Queue + Monitor + Dependency Tracker  
-**Responsibility**: BFS queue management with dependency-aware scheduling
+**Design Pattern**: Facade + Delegation Pattern  
+**Responsibility**: Coordinate between specialized queue components (DiscoveryQueue, ExecutionQueue, TitleRegistry)
 
 **Behavioral Description**:
 
-GlobalQueueManager maintains the **frontier** of the BFS traversal and ensures proper ordering constraints are met. It operates in two modes corresponding to the Discovery and Execution phases.
+GlobalQueueManager has been refactored from a 404-line monolithic class that managed discovery queue, execution queue, and title registry into a lightweight 212-line facade that delegates to three specialized components.
 
-**Discovery Mode** (Simple BFS):
+**Architecture Change**:
+
+**Before (Monolithic)**:
+- Single 404-line class with all queueing logic
+- Methods: `enqueueDiscovery()`, `nextDiscovery()`, `buildDownloadQueue()`, `nextDownload()`, etc.
+- Mixed concerns: BFS discovery logic, download dependency tracking, and title registry management
+- Complex state management across multiple queue modes
+
+**After (Component Decomposition)**:
+- Lightweight 212-line facade
+- 3 specialized components:
+  - TitleRegistry: ID-to-title mapping
+  - DiscoveryQueue: BFS discovery frontier management
+  - ExecutionQueue: Download dependency-aware scheduling
+- Each component has single responsibility
+- Improved testability and state clarity
+
+**Queue Component Pattern**:
 
 ```javascript
 class GlobalQueueManager {
-  constructor() {
-    this.currentLevel = []      // Current BFS level queue
-    this.nextLevel = []          // Next BFS level queue
-    this.visitedUrls = new Set() // Deduplication
-    this.urlToContext = new Map() // URL → PageContext mapping
-    this.currentDepth = 0
+  constructor(config, logger) {
+    this.titleRegistry = new TitleRegistry();
+    this.discoveryQueue = new DiscoveryQueue(logger);
+    this.executionQueue = new ExecutionQueue(config, logger);
   }
   
-  enqueueDiscovery(url, depth, parentUrl, linkMetadata) {
-    // Deduplication
-    if (this.visitedUrls.has(url)) return
-    this.visitedUrls.add(url)
-    
-    // Create PageContext
-    const context = new PageContext(url, linkMetadata.title, depth, parentUrl)
-    this.urlToContext.set(url, context)
-    
-    // Add to appropriate level
-    if (depth === this.currentDepth) {
-      this.currentLevel.push({ url, context, depth, parentUrl })
-    } else {
-      this.nextLevel.push({ url, context, depth, parentUrl })
-    }
+  // Facade methods delegate to components
+  enqueueDiscovery(pageContext, isRoot = false) {
+    this.titleRegistry.register(pageContext.id, pageContext.title);
+    this.discoveryQueue.enqueue(pageContext, isRoot);
   }
   
   nextDiscovery() {
-    if (this.currentLevel.length === 0) {
-      // Level complete, advance
-      this.currentLevel = this.nextLevel
-      this.nextLevel = []
-      this.currentDepth++
-      emit('DISCOVERY:LEVEL_COMPLETE', { level: this.currentDepth - 1 })
-    }
-    
-    return this.currentLevel.shift() // FIFO
+    const task = this.discoveryQueue.next();
+    return task;
   }
   
-  isDiscoveryComplete() {
-    return this.currentLevel.length === 0 && this.nextLevel.length === 0
+  buildDownloadQueue(contexts) {
+    return this.executionQueue.build(contexts);
+  }
+  
+  nextDownload(outputDir) {
+    const task = this.executionQueue.next(outputDir);
+    return task;
   }
 }
 ```
 
-**Key Invariants**:
-- All URLs in `currentLevel` have same depth
-- No URL appears in both `currentLevel` and `nextLevel`
-- `visitedUrls` is superset of all queued URLs
-- Level transition happens atomically
+**Queue Component Implementations**:
 
-**Execution Mode** (Dependency-Aware):
+1. **TitleRegistry.js** (60 lines)
+   - Purpose: Centralized ID-to-title mapping
+   - Responsibilities:
+     - `register(id, title)`: Associate page ID with title
+     - `get(id)`: Retrieve title by ID
+     - `has(id)`: Check if title registered
+     - `serialize()`: Export as plain object for IPC
+   - Benefits:
+     - Single source of truth for titles
+     - Efficient serialization for worker initialization
+     - Supports lazy initialization (send once via IPC_INIT)
 
-After pruning, the queue switches to execution mode where ordering constraints matter:
+2. **DiscoveryQueue.js** (130 lines)
+   - Purpose: BFS discovery frontier management
+   - Responsibilities:
+     - `enqueue(context, isRoot)`: Add to appropriate BFS level
+     - `next()`: Return next task with incremented pending count
+     - `complete()`: Mark task complete
+     - `isComplete()`: Check if discovery finished
+   - Features:
+     - Level-based BFS (all tasks at depth N before depth N+1)
+     - Automatic level transitions
+     - Visited URL deduplication
+     - Progress emission for dashboard
+   - Key invariants:
+     - All currentLevel tasks have same depth
+     - No URL appears multiple times
+     - visitedUrls prevents cycles
+
+3. **ExecutionQueue.js** (170 lines)
+   - Purpose: Download dependency-aware scheduling
+   - Responsibilities:
+     - `build(contexts)`: Initialize queue from canonical contexts
+     - `next(outputDir)`: Return task with calculated absolute path
+     - `markComplete(pageId)`: Update dependency counts
+     - `isComplete()`: Check if all downloads finished
+   - Features:
+     - Parent-child dependency tracking
+     - Leaf-node-first scheduling (downloads can't start until children done)
+     - Absolute path calculation in Master (prevents Ghost Execution)
+     - Automatic parent queueing when children complete
+   - Key invariants:
+     - All pending tasks have satisfied dependencies
+     - pendingChildrenCount accurately reflects children
+     - absolute paths prevent working directory issues
+
+**Benefits of Queue Component Refactoring**:
+
+1. **Reduced Complexity**: 404 lines → 212 lines (48% reduction)
+2. **Improved Testability**: Each queue can be tested independently
+3. **Single Responsibility**: Each component has one concern
+4. **State Clarity**: Separate data structures reduce cognitive load
+5. **Reusability**: Components can be used in different orchestration patterns
+6. **Maintainability**: Smaller files focused on specific tasks
+
+**Integration with ClusterOrchestrator**:
 
 ```javascript
-buildDownloadQueue(canonicalContexts, dependencyGraph) {
-  // canonicalContexts = output of ConflictResolver
-  // dependencyGraph = Map<parentId, childIds[]>
-  
-  this.downloadQueue = []
-  this.pendingChildrenCount = new Map()
-  
-  // Initialize dependency counts
-  for (const [parentId, childIds] of dependencyGraph) {
-    this.pendingChildrenCount.set(parentId, childIds.length)
-  }
-  
-  // Seed queue with leaf nodes (no children)
-  const leafNodes = canonicalContexts.filter(ctx => {
-    const childCount = this.pendingChildrenCount.get(ctx.id) || 0
-    return childCount === 0
-  })
-  
-  this.downloadQueue.push(...leafNodes)
+// Discovery phase
+while (!queueManager.isDiscoveryComplete()) {
+  const task = queueManager.nextDiscovery();
+  await browserManager.execute('DISCOVER', task);
+  // Worker sends results back
+  queueManager.completeDiscovery(result);
 }
 
-nextDownload() {
-  const context = this.downloadQueue.shift()
-  if (!context) return null
-  
-  // Calculate absolute path in Master process (prevents Ghost Execution)
-  const relativePath = context.getRelativePath()
-  const absolutePath = this._calculateAbsolutePath(relativePath)
-  
-  return {
-    url: context.url,
-    pageId: context.id,
-    savePath: absolutePath,  // Absolute path sent to worker
-    depth: context.depth,
-    parentId: context.parentId
-  }
-}
+// Build execution queue after pruning
+queueManager.buildDownloadQueue(canonicalContexts);
 
-_calculateAbsolutePath(relativePath) {
-  // Resolve relative path against output directory
-  const absoluteOutputDir = path.resolve(process.cwd(), this.config.outputDir)
-  const absolutePath = path.resolve(absoluteOutputDir, relativePath)
-  return absolutePath
+// Execution phase
+while (!queueManager.isDownloadComplete()) {
+  const task = queueManager.nextDownload(baseDir);
+  await browserManager.execute('DOWNLOAD', task);
+  // Worker sends results back
+  queueManager.markDownloadComplete(result.pageId);
 }
+```
 
-markDownloadComplete(pageId) {
-  const context = this.urlToContext.get(pageId)
-  const parentId = context.parentId
-  
-  if (parentId) {
-    // Decrement parent's pending count
-    const currentCount = this.pendingChildrenCount.get(parentId)
-    const newCount = currentCount - 1
-    this.pendingChildrenCount.set(parentId, newCount)
-    
-    // If parent now ready, add to queue
-    if (newCount === 0) {
-      const parentContext = this.urlToContext.get(parentId)
-      this.downloadQueue.push(parentContext)
-    }
-  }
-}
-
-isDownloadComplete() {
-  return this.downloadQueue.length === 0 && 
-         Array.from(this.pendingChildrenCount.values()).every(count => count === 0)
+**Source**: [`src/orchestration/GlobalQueueManager.js`](../src/orchestration/GlobalQueueManager.js) and [`src/orchestration/queues/`](../src/orchestration/queues/)
 }
 ```
 
@@ -2336,7 +2515,7 @@ logFinalStatistics() {
   logger.info('GRAPH', `  Cross edges: ${this.crossEdges.length} (inter-branch)`)
   
   if (this.backEdges.length > 0) {
-    logger.warn('GRAPH', `⚠️  Detected ${this.backEdges.length} cycles in page graph`)
+    logger.warn('GRAPH', `[WARN] Detected ${this.backEdges.length} cycles in page graph`)
     this.backEdges.forEach(edge => {
       logger.warn('GRAPH', `  ${edge.from} → ${edge.to}`)
     })
@@ -2607,8 +2786,8 @@ async scrapePage(page, pageContext, cookies, linkMap) {
   // 3. Handle cookie consent (idempotent)
   await this.cookieHandler.ensureConsent(page, pageContext.title)
   
-  // 4. Expand all content
-  await this.contentExpander.expandAll(page)
+  // 4. Prepare page (scroll & close overlays)
+  await this.contentExpander.preparePage(page)
   
   // 5. Download images and rewrite img tags
   const imageCount = await this.assetDownloader.downloadAndRewriteImages(
@@ -2673,124 +2852,48 @@ The refactoring plan identified a major anti-pattern: Workers should NOT send HT
 
 ---
 
-#### 6.2 `ContentExpander.js` - Interactive Content Expansion
+#### 6.2 `ContentExpander.js` - Page Preparation and Cleanup
 
 **Runtime Context**: Worker Process Only  
-**Design Pattern**: Strategy + Iterator  
-**Responsibility**: Reveal all hidden/collapsible content on Notion pages
+**Design Pattern**: Strategy  
+**Responsibility**: Prepare the page for scraping by ensuring content visibility and removing obstructions.
 
 **Behavioral Description**:
 
-Notion pages heavily use progressive disclosure (toggles, accordions, lazy-loaded databases). ContentExpander ensures ALL content is visible before scraping.
+ContentExpander ensures that the page is ready for scraping. Previously, it used an aggressive strategy to expand toggles and accordions. This has been changed to a **non-intrusive strategy** that performs scrolling to trigger lazy-loading and actively closes overlays/modals, without clicking on content elements to avoid unintended side effects.
 
-**Expansion Strategy** (Multi-Pass Iterative):
+**Preparation Strategy**:
 
 ```javascript
-async expandAll(page) {
+async preparePage(page) {
   // 1. Scroll to bottom (triggers lazy-loading)
-  await this.scrollToBottom(page)
-  await page.waitForTimeout(1000) // Allow lazy content to load
+  await this._scrollToBottom(page)
   
-  // 2. Iterative expansion (nested toggles require multiple passes)
-  let previousHeight = 0
-  let iterationCount = 0
-  const maxIterations = 10
+  // 2. Close overlays (modals, sidebars, help buttons)
+  await this._closeOverlays(page)
   
-  while (iterationCount < maxIterations) {
-    // Expand all expandable elements
-    const expandedCount = await this.expandToggles(page)
-    
-    // Check if page height changed (new content revealed)
-    const currentHeight = await page.evaluate(() => document.body.scrollHeight)
-    
-    if (expandedCount === 0 || currentHeight === previousHeight) {
-      break // No more content to expand
-    }
-    
-    previousHeight = currentHeight
-    iterationCount++
-    await page.waitForTimeout(500) // Allow animations/rendering
-  }
-  
-  logger.debug('EXPAND', `Expansion complete after ${iterationCount} iterations`)
+  logger.debug('PREPARE', `Page preparation complete`)
 }
 ```
 
-**Toggle Expansion Logic**:
+**Overlay Cleanup**:
 
 ```javascript
-async expandToggles(page) {
-  return await page.evaluate(() => {
-    let expandedCount = 0
-    
-    // Selector priority (most specific to most general)
-    const selectors = [
-      '[aria-expanded="false"]',           // ARIA-compliant toggles
-      '.notion-toggle-block:not(.open)',   // Notion-specific toggles
-      'button[aria-label*="Expand"]',      // Explicit expand buttons
-      'details:not([open])',               // HTML5 details/summary
-      '.accordion:not(.expanded)'          // Generic accordions
+async _closeOverlays(page) {
+  // Attempt to close common overlays via Escape key and selectors
+  await page.keyboard.press('Escape')
+  
+  await page.evaluate(() => {
+    const closeSelectors = [
+      '[role="dialog"] button[aria-label="Close"]',
+      '.notion-overlay-container [role="button"]',
+      '.notion-help-button',
+      '[aria-modal="true"] button'
     ]
-    
-    for (const selector of selectors) {
-      const elements = document.querySelectorAll(selector)
-      
-      for (const el of elements) {
-        // Safety check: Don't click destructive actions
-        const text = el.textContent.toLowerCase()
-        if (text.includes('delete') || text.includes('remove')) {
-          continue
-        }
-        
-        // Click to expand
-        try {
-          el.click()
-          expandedCount++
-        } catch (e) {
-          // Element not clickable, skip
-        }
-      }
-    }
-    
-    return expandedCount
+    // Click found close buttons...
   })
 }
 ```
-
-**Scroll Strategy** (Lazy-Loading Trigger):
-
-```javascript
-async scrollToBottom(page) {
-  await page.evaluate(async () => {
-    await new Promise((resolve) => {
-      let totalHeight = 0
-      const distance = 100 // Pixels per scroll
-      const timer = setInterval(() => {
-        window.scrollBy(0, distance)
-        totalHeight += distance
-        
-        if (totalHeight >= document.body.scrollHeight) {
-          clearInterval(timer)
-          resolve()
-        }
-      }, 100) // 100ms between scrolls
-    })
-  })
-}
-```
-
-**Why Iterative?**
-
-Notion uses nested toggles:
-```
-Toggle A (collapsed)
-  └─ Content
-      └─ Toggle B (collapsed)
-          └─ More content
-```
-
-- First pass: Expands A, reveals B
-- Second pass: Expands B, reveals more content
 
 **Source**: [`src/processing/ContentExpander.js`](../src/processing/ContentExpander.js)
 
@@ -3016,7 +3119,7 @@ pageContext.setSubsection('API Reference')
 
 **Behavioral Description**:
 
-LinkRewriter is invoked AFTER HTML is saved to disk. It loads the HTML, rewrites links, and saves back.
+LinkRewriter is invoked AFTER HTML is saved to disk. It loads the HTML, rewrites links, and saves back. It now supports **ID-based resolution** to handle cases where URL strings don't match exactly (e.g., different titles or short links).
 
 **Refactored Behavior** (Hot Rewriting):
 
@@ -3032,34 +3135,56 @@ async rewriteLinksInFile(htmlPath, pageContext, linkMap) {
   
   let rewriteCount = 0
   
-  // 2. Find all internal links
+  // 2. Build ID-to-Context Map for fallback resolution
+  // This allows resolving links by their 32-char Notion ID even if the URL title differs
+  const idToContextMap = new Map()
+  for (const [url, ctx] of this.contextMap.entries()) {
+    if (ctx.id) {
+      idToContextMap.set(ctx.id.replace(/-/g, ''), ctx)
+    }
+  }
+  
+  // 3. Find all internal links
   const anchors = document.querySelectorAll('a[href]')
   
   for (const anchor of anchors) {
     const href = anchor.getAttribute('href')
     const absoluteUrl = this.resolveUrl(href, pageContext.url)
     
-    // Check if this URL has a local mapping
+    let targetRelativePath = null
+    
+    // Strategy A: Exact URL Match
     if (linkMap.has(absoluteUrl)) {
-      const targetRelativePath = linkMap.get(absoluteUrl)
-      
-      // Calculate relative path from current page to target
+      targetRelativePath = linkMap.get(absoluteUrl)
+    } 
+    // Strategy B: Notion ID Match (Fallback)
+    else {
+      const idMatch = absoluteUrl.match(/([a-f0-9]{32}|[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})/)
+      if (idMatch) {
+        const id = idMatch[1].replace(/-/g, '')
+        const targetContext = idToContextMap.get(id)
+        if (targetContext) {
+          targetRelativePath = targetContext.getRelativePath()
+        }
+      }
+    }
+    
+    // Apply Rewrite
+    if (targetRelativePath) {
       const relativePath = pageContext.getRelativePathTo(targetRelativePath)
-      
-      // Rewrite
       anchor.setAttribute('href', relativePath)
       rewriteCount++
     }
   }
   
-  // 3. Download and localize CSS
+  // 4. Download and localize CSS
   await this.cssDownloader.downloadAndRewriteCss(
     dom,
     path.dirname(htmlPath),
     pageContext.url
   )
   
-  // 4. Save modified HTML
+  // 5. Save modified HTML
   await fs.writeFile(htmlPath, dom.serialize(), 'utf-8')
   
   return rewriteCount
@@ -3413,17 +3538,16 @@ Handles offline link rewriting and CSS localization for scraped pages. Transform
         *   **Workflow**: Load HTML → Identify internal links → Calculate relative paths → Rewrite hrefs → Download CSS → Save.
 
 #### `ContentExpander.js`
-Expands toggles, databases, and other collapsible content on Notion pages using aggressive iterative expansion.
+Prepares pages for scraping by ensuring content visibility through scrolling and removing obstructions.
 *   **Constructor**: `new ContentExpander(config, logger)`
-*   **Expansion Strategy**: Multi-iteration click-and-wait cycles to reveal nested content.
+*   **Strategy**: Passive preparation (scroll + close overlays) instead of aggressive expansion.
 *   **Methods**:
-    *   `expandAll(page)`: Expand all content on the page.
+    *   `preparePage(page)`: Prepare the page for scraping.
         *   `page`: Puppeteer page instance.
-        *   **Workflow**: Scroll to bottom (lazy-loading) → Iterative toggle expansion.
+        *   **Workflow**: Scroll to bottom (lazy-loading) → Close overlays/modals.
     *   `_scrollToBottom(page)`: Scroll to the bottom to trigger lazy-loading. *(Private)*
-    *   `_expandToggles(page)`: Aggressively expand toggles, buttons, and interactive elements. *(Private)*
-        *   **Target Elements**: aria-expanded="false", .notion-toggle-block, buttons, expandable divs.
-        *   **Safety**: Excludes destructive actions (delete, remove, share).
+    *   `_closeOverlays(page)`: Close modals, sidebars, and help buttons. *(Private)*
+        *   **Target Elements**: dialogs, overlays, help buttons.
 
 #### `CookieHandler.js`
 Handles cookie consent banners on Notion pages with intelligent retry and deduplication.
@@ -3494,22 +3618,134 @@ Coordinator for CSS localization. Downloads external CSS stylesheets and rewrite
     *   `_downloadCssFile(cssUrl, outputDir, pageUrl)`: Download and process a single CSS file. *(Private)*
     *   `_cssFileExists(filepath)`: Check if CSS file already downloaded. *(Private)*
 
-#### `FileDownloader.js`
+#### `FileDownloader.js` (REFACTORED - Type Detection Strategy)
+
 Downloads embedded files (PDFs, code files, documents, etc.) from Notion pages.
-*   **Constructor**: `new FileDownloader(config, logger)`
-*   **Supported File Types**:
-    *   Documents: PDF, DOC, DOCX, XLS, XLSX, PPT, PPTX
-    *   Archives: ZIP, RAR, 7Z, TAR, GZ
-    *   Code: PY, JS, TS, JAVA, CPP, C, H, IPYNB
-    *   Data: JSON, XML, CSV, TXT, MD
-    *   Media: MP4, AVI, MOV, MP3, WAV
-*   **Methods**:
-    *   `downloadAndRewriteFiles(page, outputDir)`: Download all embedded files from a page and rewrite their links.
-        *   `page`: Puppeteer page instance.
-        *   `outputDir`: Directory to save files to (files/ subdirectory created).
-    *   `isDownloadableFile(url, linkText)`: Check if a URL is a downloadable file.
-        *   **Detection**: Matches against file extensions and Notion file URL patterns.
-    *   `_downloadFile(url, outputPath)`: Download a single file with retry logic. *(Private)*
+
+FileDownloader has been refactored from a 280-line monolithic class into a lightweight 126-line orchestrator that delegates to three specialized components for file type detection, download logic, and filename extraction.
+
+**Architecture Change**:
+
+**Before (Monolithic)**:
+- Single 280-line class with all file handling logic
+- Methods: `isDownloadableFile()`, `_extractFilename()`, `_downloadFileWithRetry()`, `downloadAndRewriteFiles()`
+- Mixed concerns: File type detection, file naming, download with retry
+- Complex initialization per task
+
+**After (Component Decomposition)**:
+- Lightweight 126-line orchestrator
+- 3 component files:
+  - FileTypeDetector: Identifies downloadable files
+  - FileDownloadStrategy: Handles download with retry logic
+  - FileNameExtractor: Extracts and sanitizes filenames
+- Each component has single responsibility
+- Improved testability and reusability
+
+**Component Implementations**:
+
+1. **FileTypeDetector.js** (66 lines)
+   - Purpose: Identify if a URL points to a downloadable file
+   - Responsibilities:
+     - `isDownloadableFile(url, linkText)`: Check if URL is downloadable
+   - Detection Strategies:
+     - Notion file URL patterns (S3, signed URLs)
+     - File extension matching (.pdf, .doc, .zip, etc.)
+     - Link text analysis (contains "download")
+   - Supported File Types:
+     - Documents: PDF, DOC, DOCX, XLS, XLSX, PPT, PPTX
+     - Archives: ZIP, RAR, 7Z, TAR, GZ
+     - Code: PY, JS, TS, JAVA, CPP, C, H, IPYNB
+     - Data: JSON, XML, TXT, MD
+     - Media: MP4, AVI, MOV, MP3, WAV, JPG, PNG, GIF, SVG
+
+2. **FileDownloadStrategy.js** (102 lines)
+   - Purpose: Handle file downloads with retry logic and caching
+   - Responsibilities:
+     - `downloadFileWithRetry(url, localPath)`: Download with exponential backoff
+     - `recordDownload(url, relativePath)`: Cache downloaded files
+     - `hasDownloaded(url)`: Check if already downloaded
+     - `getDownloadedPath(url)`: Retrieve cached path
+     - `getStats()`: Return download statistics
+     - `reset()`: Clear caches
+   - Features:
+     - Exponential backoff retry (configurable max retries = 3)
+     - Timeout handling (60 seconds per file)
+     - Download cache to prevent duplicates
+     - Safe file writing with directory creation
+   - Error Handling:
+     - Network errors → retry with backoff
+     - Timeout errors → retry with backoff
+     - Max retries exceeded → log error, continue
+
+3. **FileNameExtractor.js** (68 lines)
+   - Purpose: Extract and sanitize filenames from URLs
+   - Responsibilities:
+     - `extractFilename(url, linkText, index)`: Generate safe filename
+   - Logic:
+     - Extract filename from URL pathname
+     - Fall back to link text if URL has UUID
+     - Add extension if missing (guess from URL)
+     - Sanitize using FileSystemUtils
+     - Prepend index for uniqueness
+   - Features:
+     - Handles UUID-like filenames (common in Notion)
+     - Preserves meaningful extensions
+     - Safe for filesystem use
+
+**FileDownloader Integration**:
+
+```javascript
+class FileDownloader {
+  constructor(config, logger) {
+    this.typeDetector = new FileTypeDetector();
+    this.downloadStrategy = new FileDownloadStrategy(config, logger);
+    this.nameExtractor = new FileNameExtractor();
+  }
+  
+  async downloadAndRewriteFiles(page, outputDir) {
+    // Extract all file links from page
+    const fileLinks = await page.evaluate(() => { ... });
+    
+    for (const [index, linkInfo] of fileLinks.entries()) {
+      // Detect if downloadable
+      if (!this.typeDetector.isDownloadableFile(linkInfo.url, linkInfo.text)) {
+        continue;
+      }
+      
+      // Extract filename
+      const filename = this.nameExtractor.extractFilename(linkInfo.url, linkInfo.text, index + 1);
+      const localPath = path.join(filesDir, filename);
+      
+      // Download if not cached
+      if (!this.downloadStrategy.hasDownloaded(fileUrl)) {
+        const success = await this.downloadStrategy.downloadFileWithRetry(fileUrl, localPath);
+        if (success) {
+          this.downloadStrategy.recordDownload(fileUrl, relativePath);
+        }
+      }
+      
+      // Prepare URL mapping for rewriting
+      if (this.downloadStrategy.hasDownloaded(fileUrl)) {
+        urlMap[fileUrl] = this.downloadStrategy.getDownloadedPath(fileUrl);
+      }
+    }
+    
+    // Rewrite links in HTML
+    await page.evaluate(map => { ... }, urlMap);
+  }
+}
+```
+
+**Benefits of FileDownloader Decomposition**:
+
+1. **Reduced Complexity**: 280 lines → 126 lines (55% reduction)
+2. **Improved Testability**: Each component can be unit tested independently
+3. **Single Responsibility**: Detector identifies, Strategy downloads, Extractor names
+4. **Code Reuse**: Components can be used in different contexts
+5. **Maintainability**: Smaller focused files
+6. **Extensibility**: New file types can be added to detector without modifying downloader
+
+**Source**: [`src/download/FileDownloader.js`](../src/download/FileDownloader.js) and [`src/download/file/`](../src/download/file/)
 
 #### Download CSS Subpackage (`src/download/css`)
 
@@ -4331,11 +4567,12 @@ async runExecutionPhase() {
 - Early validation prevents silent failures
 
 **Trade-off**:
-- ❌ Requires Master to compute all paths (cannot delegate to Workers)
-- ❌ Additional abstraction layer for file I/O
-- ✅ Guaranteed correct file locations (no ambiguous resolution)
-- ✅ Explicit error messages when validation fails
-- ✅ Audit trail via logging (every write logged with absolute path)
+-  Requires Master to compute all paths (cannot delegate to Workers)
+-  Additional abstraction layer for file I/O
+**Benefits**:
+-  Guaranteed correct file locations (no ambiguous resolution)
+-  Explicit error messages when validation fails
+-  Audit trail via logging (every write logged with absolute path)
 
 **Implementation Details**:
 - `GlobalQueueManager._calculateAbsolutePath()` computes absolute paths in Master
@@ -4357,11 +4594,12 @@ async runExecutionPhase() {
 - Interface mismatch was causing CSS downloads to fail silently
 
 **Trade-off**:
-- ❌ Two code paths to maintain (downloadFromPuppeteer, downloadAndRewriteCss)
-- ❌ Callers must know which mode to use
-- ✅ Eliminated interface mismatch causing CSS download failures
-- ✅ Proper integration with CssContentProcessor for @import chains
-- ✅ Separation of concerns: browser operations vs Node processing
+- Two code paths to maintain (downloadFromPuppeteer, downloadAndRewriteCss)
+- Callers must know which mode to use
+**Benefits**:
+- Eliminated interface mismatch causing CSS download failures
+- Proper integration with CssContentProcessor for @import chains
+- Separation of concerns: browser operations vs Node processing
 
 **Implementation Details**:
 - `CssDownloader.downloadFromPuppeteer(page, outputDir)` for active scraping
@@ -4504,11 +4742,11 @@ if (enableUI) {
 **Visual Layout**:
 ```
 [████████████░░░░░░░░] 45% | 45/100 | EXECUTION: Downloading...
-  ⚙️ Worker 1: Processing [task-abc1] "Introduction to AI"
-  ⚙️ Worker 2: IDLE
-  ⚙️ Worker 3: Processing [task-def2] "Neural Networks"
-  ⚙️ Worker 4: IDLE
-Recent: 10:32:15 ℹ️ [DOWNLOAD] Image saved | 10:32:16 ℹ️ [CSS] Stylesheet downloaded
+  [Worker 1]: Processing [task-abc1] "Introduction to AI"
+  [Worker 2]: IDLE
+  [Worker 3]: Processing [task-def2] "Neural Networks"
+  [Worker 4]: IDLE
+Recent: 10:32:15 [INFO] [DOWNLOAD] Image saved | 10:32:16 [INFO] [CSS] Stylesheet downloaded
 ```
 
 **Public Methods**:
@@ -4695,18 +4933,18 @@ bus.on('JOB:COMPLETED', ({ pageTitle }) => {
 The **Reactive Event-Driven Micro-Kernel Architecture** with **Multi-Transport Logging and Real-Time Dashboard** represents a complete transformation of the scraper from a monolithic sequential script into a robust, observable, and user-friendly distributed system. Recent refactoring has further strengthened reliability through pipeline-based execution, absolute path enforcement, and comprehensive UI integration.
 
 **Key Achievements**:
-- ✅ **Process Isolation**: Master/Worker separation prevents cascading failures
-- ✅ **Event-Driven Coordination**: SystemEventBus decouples components for flexibility
-- ✅ **Structured Workflows**: Two-phase BFS ensures correctness and deduplication
-- ✅ **Typed Communication**: IPC protocol prevents runtime message errors
-- ✅ **Comprehensive Monitoring**: Event logging provides full system observability
-- ✅ **Code Quality**: Sub-200-line files, extensive JSDoc, clear contracts
-- ✅ **Pipeline Pattern**: Sequential step execution with error isolation eliminates "Ghost Execution" failures
-- ✅ **Absolute Path Validation**: WorkerFileSystem prevents ambiguous path resolution in child processes
-- ✅ **Dual-Mode CSS Processing**: Puppeteer and JSDOM compatibility resolves interface mismatches
-- ✅ **Multi-Transport Logging**: Strategy pattern enables flexible log destinations
-- ✅ **Real-Time Dashboard**: Terminal UI provides live visibility without console clutter
-- ✅ **Lazy Title Registry**: 98% IPC reduction via one-time initialization
+- Process Isolation: Master/Worker separation prevents cascading failures
+- Event-Driven Coordination: SystemEventBus decouples components for flexibility
+- Structured Workflows: Two-phase BFS ensures correctness and deduplication
+- Typed Communication: IPC protocol prevents runtime message errors
+- Comprehensive Monitoring: Event logging provides full system observability
+- Code Quality: Sub-200-line files, extensive JSDoc, clear contracts
+- Pipeline Pattern: Sequential step execution with error isolation eliminates "Ghost Execution" failures
+- Absolute Path Validation: WorkerFileSystem prevents ambiguous path resolution in child processes
+- Dual-Mode CSS Processing: Puppeteer and JSDOM compatibility resolves interface mismatches
+- Multi-Transport Logging: Strategy pattern enables flexible log destinations
+- Real-Time Dashboard: Terminal UI provides live visibility without console clutter
+- Lazy Title Registry: 98% IPC reduction via one-time initialization
 
 **Recent Enhancements (v2.2 - Logging & UI)**:
 1. **Logger Strategy Pattern**: Console, File, and Dashboard strategies with pluggable architecture

@@ -1,208 +1,107 @@
 # Quick Start Guide
 
-## Installation
+This guide provides instructions for users new to Node.js or command-line interfaces. Follow these steps to configure and execute the Notion Scraper.
 
-```bash
-# Install dependencies
-npm install
+## 1. Prerequisites
 
-# Or manually install each package
-npm install puppeteer axios jsdom
-```
+**Node.js** must be installed on the host machine.
 
-## Configuration
+1.  Navigate to the [Node.js official website](https://nodejs.org/).
+2.  Download the **LTS (Long Term Support)** version appropriate for the operating system (Windows, macOS, or Linux).
+3.  Execute the installer and follow the provided instructions.
+4.  To verify the installation, open a terminal (Command Prompt on Windows, Terminal on macOS/Linux) and execute:
+    ```bash
+    node -v
+    ```
+    If a version number is displayed (e.g., `v18.16.0`), the installation is successful.
 
-Edit `src/core/Config.js` to set your target Notion page:
+## 2. Installation
 
-```javascript
-this.NOTION_PAGE_URL = 'https://your-notion-site-url-here';
-this.OUTPUT_DIR = 'downloaded_course_material';
-this.MAX_RECURSION_DEPTH = 5;  // How deep to follow links
-this.MAX_EXPANSION_DEPTH = 3;   // How deep to expand toggles
-```
+1.  **Download the Source Code**: Download the project directory to the local machine.
+2.  **Open Terminal**:
+    *   **Windows**: Right-click the project folder and select "Open in Terminal" (or open Command Prompt and navigate to the folder using `cd`).
+    *   **macOS/Linux**: Open Terminal and navigate to the folder using `cd /path/to/folder`.
+3.  **Install Dependencies**:
+    Execute the following command to install all necessary libraries:
+    ```bash
+    npm install
+    ```
+    *Note: This process may require several minutes. A progress indicator will be displayed.*
 
-## Running the Scraper
+## 3. Configuration
 
-```bash
-# Start scraping
-npm start
+The scraper requires the target Notion page URL to be configured.
 
-# Or directly
-node main-cluster.js
+1.  Open the file `src/core/Config.js` in a text editor (e.g., Notepad, TextEdit, or VS Code).
+2.  Locate the `constructor` section:
 
-# With custom depth
-node main-cluster.js --max-depth 3
+    ```javascript
+    class Config {
+      constructor() {
+        // Main configuration
+        this.NOTION_PAGE_URL = 'https://your-notion-site-url-here';
+        this.OUTPUT_DIR = './downloaded_content';
+        this.MAX_RECURSION_DEPTH = 100;
+        // ...
+    ```
 
-# Show help
-node main-cluster.js --help
-```
+3.  **Set the URL**: Update `this.NOTION_PAGE_URL` with the URL of the target Notion page.
+    *   *Important*: The Notion page must be **publicly accessible**.
+4.  **Set Output Directory**: Update `this.OUTPUT_DIR` to specify the destination folder (default is `./`, representing the current directory).
+5.  **Save the file**.
 
-**System Requirements:**
-- 4GB+ RAM recommended for optimal performance
-- Each worker requires ~1GB RAM
-- Worker count auto-scales based on available memory
+## 4. Execution
 
-### Testing
+1.  In the terminal, execute:
+    ```bash
+    npm start
+    ```
+    *(Alternatively: `node main-cluster.js`)*
 
-```bash
-# Run full integration test suite
-npm test
+2.  **Monitor Progress**:
+    *   The system will initiate a "discovery" phase to map the site structure.
+    *   A hierarchical tree structure of discovered pages will be displayed.
 
-# Run specific tests
-node tests/test-integration.js      # Full workflow test
-node tests/test-worker-crash.js     # Crash recovery test
-node tests/test-cookie-propagation.js  # Cookie handling test
-```
+3.  **Confirm Download**:
+    *   The system will pause and request confirmation: `Do you want to proceed with downloading X pages? (y/n)`
+    *   Enter `y` and press **Enter**.
 
-## What Happens
+4.  **Await Completion**:
+    *   Progress indicators for each worker process will be displayed.
+    *   Wait for the "Scraping Complete" message.
 
-The scraper executes in **5 distinct phases**:
+## 5. Result Verification
 
-### 1. Bootstrap Phase (10-15 seconds)
-- Spawns initial worker for cookie capture
-- Spawns remaining workers based on system capacity
-- Broadcasts authentication cookies to all workers
-
-### 2. Discovery Phase (parallel, fast)
-- Multiple workers discover pages simultaneously
-- Extracts metadata, titles, and links only (no heavy assets)
-- Builds complete PageContext tree
-
-### 3. Conflict Resolution (5-10 seconds)
-- Detects duplicate pages (same URL referenced multiple times)
-- Selects canonical version for each unique page
-- Generates link rewrite map for download phase
-
-### 4. Download Phase (parallel, varies by site size)
-- Multiple workers download unique pages simultaneously
-- Full scraping with assets (images, CSS, files)
-- Link rewriting using the map from phase 3
-- Workers write files directly to disk
-
-### 5. Complete Phase (instant)
-- Statistics reporting
-- Resource cleanup
-- All workers gracefully terminated
-
-## Expected Output
-
-```
-downloaded_course_material/
-├── Main_Page/
-│   ├── index.html          ← Start here!
-│   └── images/
-├── Section_1/
-│   ├── index.html
-│   ├── images/
-│   └── Subsection/
-│       ├── index.html
-│       └── images/
-└── Section_2/
-    └── ...
-```
-
-## Opening the Offline Copy
-
-Simply open the main page in any browser:
-
-```bash
-# Windows
-start downloaded_course_material/Main_Page/index.html
-
-# Mac
-open downloaded_course_material/Main_Page/index.html
-
-# Linux
-xdg-open downloaded_course_material/Main_Page/index.html
-```
-
-Or just double-click `Main_Page/index.html` in your file explorer!
-
-## Verification Checklist
-
-After scraping completes, verify:
-
-- [ ] All pages are present in the folder structure
-- [ ] Images load correctly (no broken images)
-- [ ] Clicking links navigates to local pages (URL bar shows `file://`)
-- [ ] Toggle blocks still work
-- [ ] Styling looks identical to online version
-- [ ] External links still point to original websites
+1.  Navigate to the installation directory (or the custom `OUTPUT_DIR`).
+2.  Locate the folder named after the Notion page (e.g., `JBC090_Language_AI`).
+3.  Open the `index.html` file within that folder.
+4.  **Open `index.html`** in a web browser.
+5.  The entire site is now available for offline browsing.
 
 ## Troubleshooting
 
-### "Module not found: jsdom"
-```bash
-npm install jsdom
-```
+### "npm is not recognized"
+*   **Cause**: Node.js is not installed correctly or the terminal session requires a restart.
+*   **Resolution**: Reinstall Node.js and restart the computer.
 
-### "Page load timeout"
-Increase timeout in `src/core/Config.js`:
-```javascript
-this.TIMEOUT_PAGE_LOAD = 120000; // 2 minutes
-```
+### "TimeoutError" or "Navigation failed"
+*   **Cause**: Network latency or slow response from Notion.
+*   **Resolution**: Open `src/core/Config.js` and increase `this.TIMEOUT_PAGE_LOAD` to `120000` (2 minutes).
 
-### "Too many open files" or "Out of memory"
-Reduce recursion depth in `src/core/Config.js`:
-```javascript
-this.MAX_RECURSION_DEPTH = 3;
-```
+### "Target closed" or "Browser disconnected"
+*   **Cause**: A worker process terminated unexpectedly (typically due to memory constraints).
+*   **Resolution**: The system is designed to recover automatically. If this issue persists, close other applications to release system memory.
 
-Or manually limit worker count by editing `src/cluster/BrowserInitializer.js`.
+### "EPERM" or "Permission denied"
+*   **Cause**: The scraper lacks write permissions for the target directory.
+*   **Resolution**: Execute the terminal as Administrator, or change `OUTPUT_DIR` to a user-writable location (e.g., `C:\Users\YourName\Desktop\NotionDump`).
 
-### Workers not spawning
-Check system resources. Each worker needs ~1GB RAM. If system has <4GB, workers may be limited.
+### Missing Images
+*   **Cause**: Certain images may be hosted on external domains that restrict scraping.
+*   **Resolution**: Consult the logs in the `logs/` directory for specific error messages.
 
-### Images not downloading
-Check the console for `[DOWNLOAD] ERROR` messages. The scraper will retry up to 3 times automatically.
+## Advanced Usage
 
-### Links not working offline
-Check that link rewriting completed:
-```
-[LINK-REWRITE] Total internal links rewritten: XX
-```
-
-## Performance Tips
-
-- **Large sites**: Set `MAX_RECURSION_DEPTH = 3` initially in `src/core/Config.js`
-- **Slow internet**: Increase timeouts in `src/core/Config.js`
-- **Limited RAM**: System auto-scales workers, but you can manually limit in `BrowserInitializer.js`
-- **Monitor resources**: Use Task Manager/Activity Monitor to watch memory usage during scraping
-
-## Example Session
-
-```
-[14:30:00] [MAIN] ========================================
-[14:30:00] [MAIN] Initializing Cluster Mode
-[14:30:00] [MAIN] ========================================
-[14:30:02] [BOOTSTRAP] Spawning initial worker for cookie capture...
-[14:30:05] [WORKER] Worker 1 ready
-[14:30:06] [COOKIES] Captured 3 authentication cookies
-[14:30:07] [BOOTSTRAP] Spawning 3 additional workers...
-[14:30:10] [WORKER] Worker 2 ready
-[14:30:10] [WORKER] Worker 3 ready
-[14:30:11] [WORKER] Worker 4 ready
-[14:30:11] [COOKIES] Broadcast cookies to 4 workers
-[14:30:12] [DISCOVERY] Starting parallel discovery phase...
-[14:30:45] [DISCOVERY] Discovered 47 pages
-[14:30:46] [CONFLICT] Resolving duplicates... found 5 duplicates
-[14:30:46] [CONFLICT] Generated rewrite map for 42 unique pages
-[14:30:47] [DOWNLOAD] Starting parallel download phase...
-[14:32:30] [DOWNLOAD] Completed 42/42 pages
-[14:32:31] [STATS] Total pages scraped: 42
-[14:32:31] [STATS] Total assets downloaded: 215
-[14:32:31] [STATS] Total internal links rewritten: 138
-[14:32:31] [STATS] Total time elapsed: 2m 31s
-[14:32:31] [STATS] 
-[14:32:31] [STATS] The downloaded site is now fully browsable offline!
-[14:32:31] [STATS] Open downloaded_course_material/Main_Page/index.html in your browser.
-```
-
-## Need Help?
-
-Check these files:
-- `Docs/README.md` - Full documentation
-- `Docs/CLUSTER_MODE.md` - Detailed cluster architecture
-- `src/core/Config.js` - All configuration options
-
-Happy scraping! 🚀
+For advanced configuration and architectural details, refer to:
+*   `Docs/README.md`: Comprehensive documentation.
+*   `Docs/ARCHITECTURE.md`: Internal system architecture.

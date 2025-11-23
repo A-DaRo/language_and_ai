@@ -1,53 +1,43 @@
-const path = require('path');
-const FileSystemUtils = require('../utils/FileSystemUtils');
-
 /**
  * @fileoverview Domain model for scraped page metadata
  * @module domain/PageContext
- * @description Represents the context of a page in the hierarchy. This class is designed
- * to be serializable for IPC communication in the Micro-Kernel architecture.
- * 
- * **CRITICAL CHANGE**: In the Micro-Kernel architecture, PageContext must be JSON-serializable
- * for IPC transfer between Master and Worker processes. The `parentContext` reference has been
- * replaced with `parentId` (string) to break circular references.
+ * @description Represents the context of a page in the hierarchy.
+ * Delegates path calculation to PathCalculator for clean separation.
  */
 
+const FileSystemUtils = require('../utils/FileSystemUtils');
+const PathCalculator = require('./path/PathCalculator');
+
 /**
- * Represents the context of a page in the hierarchy
  * @class PageContext
- * @classdesc Encapsulates page metadata including URL, title, hierarchical position,
- * and relationships. Supports both tree-based (parentContext) and flat (parentId) representations.
+ * @classdesc Encapsulates page metadata including URL, title, and hierarchical position.
  */
 class PageContext {
   /**
    * @param {string} url - Page URL
-   * @param {string} rawTitle - Page title (will be sanitized for filesystem use)
-   * @param {number} [depth=0] - Depth in the hierarchy
-   * @param {PageContext|null} [parentContext=null] - Parent context reference (Master-side only)
-   * @param {string|null} [parentId=null] - Parent page ID (IPC-safe alternative)
-   * 
-   * @note Human-readable titles are resolved via GlobalQueueManager.idToTitleMap.
-   * This class only stores sanitized filesystem-safe titles.
+   * @param {string} rawTitle - Page title (filesystem-safe)
+   * @param {number} [depth=0] - Depth in hierarchy
+   * @param {PageContext|null} [parentContext=null] - Parent reference (Master-side)
+   * @param {string|null} [parentId=null] - Parent ID (IPC-safe)
    */
   constructor(url, rawTitle, depth = 0, parentContext = null, parentId = null) {
-    // Generate unique ID from URL (Notion ID)
     this.id = this._extractNotionId(url);
     this.url = url;
     this.title = FileSystemUtils.sanitizeFilename(rawTitle || 'Untitled');
     this.depth = depth;
-    
-    // Support both tree-based and flat representations
-    this.parentContext = parentContext; // Master-side: full object reference
-    this.parentId = parentId || (parentContext ? parentContext.id : null); // IPC-safe: string ID
-    
-    this.section = null; // e.g., "Syllabus", "Material"
-    this.subsection = null; // e.g., "Week 1", "Week 2"
-    this.children = []; // Array of PageContext (Master-side) or empty (Worker-side)
-    this.childIds = []; // Array of child IDs (IPC-safe)
-    this.isNestedUnderParent = false; // Flag to indicate if this is a nested sub-page
-    this.targetFilePath = null; // Calculated by Master for download phase
+    this.parentContext = parentContext;
+    this.parentId = parentId || (parentContext ? parentContext.id : null);
+    this.section = null;
+    this.subsection = null;
+    this.children = [];
+    this.childIds = [];
+    this.isNestedUnderParent = false;
+    this.targetFilePath = null;
+
+    // Initialize path calculator
+    this.pathCalculator = new PathCalculator();
   }
-  
+
   /**
    * Extract Notion page ID from URL
    * @private
@@ -55,114 +45,77 @@ class PageContext {
    * @returns {string} Notion page ID
    */
   _extractNotionId(url) {
-    // Notion URLs format: https://www.notion.so/Title-XXXXX or https://www.notion.so/XXXXX
     const match = url.match(/([a-f0-9]{32})/i);
     return match ? match[1] : url;
   }
 
   /**
-   * Update the title from a human-readable title (e.g., from title registry)
-   * This sanitizes the human-readable title and updates the filesystem-safe title
-   * @param {string} humanReadableTitle - The human-readable title to update from
+   * Update title from human-readable value
+   * @param {string} humanReadableTitle - Title to sanitize and update
+   * @returns {void}
    */
   updateTitleFromRegistry(humanReadableTitle) {
     if (!humanReadableTitle) return;
     this.title = FileSystemUtils.sanitizeFilename(humanReadableTitle);
   }
-  
+
   /**
-   * Set the section this page belongs to (e.g., "Syllabus")
+   * Set the section this page belongs to
+   * @param {string} section - Section name
+   * @returns {void}
    */
   setSection(section) {
     this.section = FileSystemUtils.sanitizeFilename(section);
   }
-  
+
   /**
-   * Set the subsection this page belongs to (e.g., "Week_1")
+   * Set the subsection this page belongs to
+   * @param {string} subsection - Subsection name
+   * @returns {void}
    */
   setSubsection(subsection) {
     this.subsection = FileSystemUtils.sanitizeFilename(subsection);
   }
-  
+
   /**
-   * Get the relative path for this page with deep nesting support
-   * This builds a path that reflects the true hierarchical structure
-   * THIS IS THE SINGLE SOURCE OF TRUTH for where a page should be saved
+   * Get relative path for this page based on hierarchy
+   * @returns {string} Relative path using parent chain
    */
   getRelativePath() {
-    const parts = [];
-    
-    // Build path by traversing up the parent chain
-    let current = this;
-    while (current) {
-      // Add current page's folder name (including Main_Page)
-      // FIX: Skip root page (depth 0) to prevent duplicating the root folder name
-      if (current.title && current.title !== 'untitled' && current.depth > 0) {
-        parts.unshift(current.title);
-      }
-      current = current.parentContext;
-    }
-    
-    return parts.join('/');
+    return this.pathCalculator.calculateRelativePath(this);
   }
-  
+
   /**
-   * Get the full directory path for this page
-   * Used for saving files to disk
+   * Get full directory path for saving files
+   * @param {string} baseDir - Base output directory
+   * @returns {string} Full directory path
    */
   getDirectoryPath(baseDir) {
-    const relativePath = this.getRelativePath();
-    if (relativePath) {
-      return path.join(baseDir, relativePath);
-    }
-    return baseDir;
+    return this.pathCalculator.calculateDirectoryPath(baseDir, this);
   }
-  
+
   /**
-   * Get the full file path for this page's index.html
+   * Get full file path for index.html
+   * @param {string} baseDir - Base output directory
+   * @returns {string} Full file path
    */
   getFilePath(baseDir) {
-    const dirPath = this.getDirectoryPath(baseDir);
-    return path.join(dirPath, 'index.html');
+    return this.pathCalculator.calculateFilePath(baseDir, this);
   }
-  
+
   /**
-   * Get the relative path from one page to another for link rewriting
-   * Returns a relative path string like '../Week_2/index.html'
+   * Get relative path from this page to another
+   * @param {PageContext} targetContext - Target page context
+   * @returns {string} Relative path like '../sibling/child/index.html'
    */
   getRelativePathTo(targetContext) {
-    const sourcePath = this.getRelativePath();
-    const targetPath = targetContext.getRelativePath();
-    
-    // Split paths into segments
-    const sourceSegments = sourcePath ? sourcePath.split('/') : [];
-    const targetSegments = targetPath ? targetPath.split('/') : [];
-    
-    // Find common ancestor
-    let commonDepth = 0;
-    while (commonDepth < sourceSegments.length && 
-           commonDepth < targetSegments.length && 
-           sourceSegments[commonDepth] === targetSegments[commonDepth]) {
-      commonDepth++;
-    }
-    
-    // Build relative path
-    const upLevels = sourceSegments.length - commonDepth;
-    const downSegments = targetSegments.slice(commonDepth);
-    
-    const relativeParts = [];
-    for (let i = 0; i < upLevels; i++) {
-      relativeParts.push('..');
-    }
-    relativeParts.push(...downSegments);
-    relativeParts.push('index.html');
-    
-    return relativeParts.join('/');
+    return this.pathCalculator.calculateRelativePathBetween(this, targetContext);
   }
-  
+
   /**
    * Add a child page context
-   * @param {PageContext} childContext - Child page context
+   * @param {PageContext} childContext - Child to add
+   * @returns {void}
    */
   addChild(childContext) {
     if (!childContext) return;
@@ -174,14 +127,10 @@ class PageContext {
       }
     }
   }
-  
+
   /**
-   * Serialize to JSON for IPC transfer (Worker → Master or Master → Worker)
+   * Serialize to JSON for IPC transfer
    * @returns {Object} JSON-serializable object
-   * @note Human-readable titles are stored in GlobalQueueManager.idToTitleMap, not here.
-   * @example
-   * const json = pageContext.toJSON();
-   * // Send via IPC: process.send({ type: 'RESULT', data: json });
    */
   toJSON() {
     return {
@@ -197,64 +146,56 @@ class PageContext {
       targetFilePath: this.targetFilePath
     };
   }
-  
+
   /**
-   * Deserialize from JSON to create a PageContext instance with methods
+   * Deserialize from JSON
    * @static
-   * @param {Object} json - Serialized PageContext data
-   * @param {Map<string, PageContext>} [contextMap] - Optional map to resolve parent references
-   * @returns {PageContext} Reconstructed PageContext instance
-   * @note Human-readable titles must be resolved via GlobalQueueManager.idToTitleMap
-   * @example
-   * const json = { id: 'abc123', url: '...', title: 'Page', ... };
-   * const pageContext = PageContext.fromJSON(json);
+   * @param {Object} json - Serialized data
+   * @param {Map<string, PageContext>} [contextMap] - Optional parent map
+   * @returns {PageContext} Reconstructed instance
    */
   static fromJSON(json, contextMap = null) {
-    // Create instance with IPC-safe parentId
     const context = new PageContext(
       json.url,
       json.title,
       json.depth || 0,
-      null, // parentContext will be resolved if contextMap provided
+      null,
       json.parentId
     );
-    
-    // Restore properties
+
     context.id = json.id;
     context.section = json.section;
     context.subsection = json.subsection;
     context.childIds = json.childIds || [];
     context.isNestedUnderParent = json.isNestedUnderParent || false;
     context.targetFilePath = json.targetFilePath;
-    
-    // Resolve parent reference if contextMap provided
+
     if (contextMap && json.parentId) {
       context.parentContext = contextMap.get(json.parentId) || null;
     }
-    
+
     return context;
   }
-  
+
   /**
    * Check if this is the root page
-   * @returns {boolean} True if this is the root page
+   * @returns {boolean} True if root
    */
   isRoot() {
     return this.depth === 0 || !this.parentId;
   }
-  
+
   /**
-   * Get depth label for logging (e.g., "[L0]", "[L1]")
-   * @returns {string} Depth label
+   * Get depth label for logging
+   * @returns {string} Depth label like '[L0]'
    */
   getDepthLabel() {
     return `[L${this.depth}]`;
   }
-  
+
   /**
-   * Get a string representation for debugging
-   * @returns {string} String representation
-   * @note Human-readable title available via GlobalQueueManager.getTitleById(this.id)
+   * Get string representation
+   * @returns {string} Debug string
    */
   toString() {
     return `PageContext(id="${this.id}", sanitizedTitle="${this.title}", depth=${this.depth}, section="${this.section}", subsection="${this.subsection}")`;
@@ -262,3 +203,4 @@ class PageContext {
 }
 
 module.exports = PageContext;
+
