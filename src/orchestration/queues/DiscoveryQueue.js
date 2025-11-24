@@ -25,13 +25,24 @@ class DiscoveryQueue {
   /**
    * Adds a page to the discovery queue
    * @param {PageContext} context - The page context
-   * @param {boolean} [isRoot=false] - Whether this is the root page
-   * @returns {boolean} True if enqueued, false if already visited
+   * @param {boolean} isRoot - Whether this is the root page
+   * @returns {boolean} True if enqueued, false if skipped
    */
   enqueue(context, isRoot = false) {
+    if (!context || !context.url) {
+      this.logger.warn('DiscoveryQueue', 'Attempted to enqueue invalid context (missing context or URL)');
+      return false;
+    }
+
     const rawPageId = this._extractPageId(context.url);
 
-    if (!rawPageId || this.visitedUrls.has(rawPageId)) {
+    if (!rawPageId) {
+      this.logger.warn('DiscoveryQueue', `Failed to extract page ID from URL: ${context.url}`);
+      return false;
+    }
+
+    if (this.visitedUrls.has(rawPageId)) {
+      this.logger.debug('DiscoveryQueue', `Skipping already-visited page: ${rawPageId.substring(0, 8)}...`);
       return false;
     }
 
@@ -165,8 +176,8 @@ class DiscoveryQueue {
    * @returns {string|null} Normalized id
    */
   _extractPageId(url) {
-    const match = url && url.match(/29[a-f0-9]{30}/i);
-    return match ? match[0] : null;
+    const match = url && url.match(/([a-f0-9]{32})$/i);
+    return match ? match[1] : null;
   }
 
   /**

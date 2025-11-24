@@ -27,6 +27,10 @@ class FileTypeDetector {
       /notion-static\.com/,
       /\/file\//
     ];
+
+    // Blacklists
+    this.blacklistedDomains = ['surf.nl', 'surfdrive.surf.nl'];
+    this.blacklistedExtensions = ['.csv'];
   }
 
   /**
@@ -36,31 +40,51 @@ class FileTypeDetector {
    * @returns {boolean} True if URL is downloadable file
    */
   isDownloadableFile(url, linkText = '') {
+    if (!url) return false;
+
     try {
-      // Check Notion file patterns
+      const urlLower = url.toLowerCase();
+
+      // 1. Check Blacklists
+      if (this.blacklistedDomains.some(domain => urlLower.includes(domain))) {
+        return false;
+      }
+      
+      // Check for blacklisted extensions (checking end of path or query param start)
+      if (this.blacklistedExtensions.some(ext => urlLower.includes(ext))) {
+         // Simple include check might be too aggressive (e.g. .csv.pdf?), but for .csv it's likely fine.
+         // Better: check if it ends with extension or has extension followed by ? or /
+         const isBlacklistedExt = this.blacklistedExtensions.some(ext => 
+           urlLower.endsWith(ext) || urlLower.includes(`${ext}?`) || urlLower.includes(`${ext}/`)
+         );
+         if (isBlacklistedExt) return false;
+      }
+
+      // 2. Check Notion file patterns (Always allow these)
       for (const pattern of this.notionFilePatterns) {
         if (pattern.test(url)) {
           return true;
         }
       }
 
-      // Check file extension
-      const urlLower = url.toLowerCase();
+      // 3. Check Allowed Extensions
       for (const ext of this.fileExtensions) {
         if (urlLower.includes(ext)) {
           return true;
         }
       }
 
-      // Check link text for download indicators
+      // 4. Check link text for strong file indicators
+      // We are stricter here: only accept if text looks like a filename with extension
       const textLower = linkText.toLowerCase();
-      if (textLower.includes('download') || 
-          textLower.includes('.pdf') || 
-          textLower.includes('.zip') ||
-          textLower.includes('file')) {
+      const strongIndicators = ['.pdf', '.zip', '.docx', '.pptx', '.xlsx', '.rar', '.7z'];
+      
+      if (strongIndicators.some(ind => textLower.includes(ind))) {
         return true;
       }
 
+      // Removed generic 'download' or 'file' checks to avoid false positives like "Download Profile"
+      
       return false;
     } catch (error) {
       return false;

@@ -54,10 +54,11 @@ class WorkerProxy {
    * @async
    * @param {string} messageType - Message type from MESSAGE_TYPES
    * @param {Object} payload - Command payload
+   * @param {Object} [metadata={}] - Optional metadata for UI display (e.g., pageTitle)
    * @returns {Promise<void>}
    * @throws {Error} If worker is not available or send fails
    */
-  async sendCommand(messageType, payload) {
+  async sendCommand(messageType, payload, metadata = {}) {
     if (this.stateManager.isCrashed()) {
       throw new Error(`Worker ${this.workerId} has crashed`);
     }
@@ -73,7 +74,8 @@ class WorkerProxy {
     this.eventBus.emit('TASK:STARTED', {
       workerId: this.workerId,
       taskId: task.taskId,
-      taskType: messageType
+      taskType: messageType,
+      metadata
     });
   }
 

@@ -57,6 +57,9 @@ class DownloadPhase extends PhaseStrategy {
 
       const { context, savePath } = downloadTask;
 
+      const titleRegistry = this.queueManager.getTitleRegistry();
+      const pageTitle = context.getDisplayTitle(titleRegistry);
+
       // Execute download
       const workerId = await this.browserManager.execute(MESSAGE_TYPES.DOWNLOAD, {
         url: context.url,
@@ -65,15 +68,8 @@ class DownloadPhase extends PhaseStrategy {
         depth: context.depth,
         savePath: savePath,
         cookies: this.orchestrator.cookies,
-        linkRewriteMap: Object.fromEntries(linkRewriteMap)
-      });
-
-      const titleRegistry = this.queueManager.getTitleRegistry();
-      const title = context.getDisplayTitle(titleRegistry);
-
-      this.orchestrator.eventBus.emit('WORKER:BUSY', {
-        workerId,
-        task: { description: `Downloading '${title}'...` }
+        linkRewriteMap: Object.fromEntries(linkRewriteMap),
+        metadata: { pageTitle }
       });
     }
 

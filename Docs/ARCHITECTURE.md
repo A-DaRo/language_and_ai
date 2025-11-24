@@ -423,6 +423,197 @@ async _executeDownload(payload) {
 
 ---
 
+## Page Identification and Naming Strategy
+
+### Overview
+
+The system employs a **strict separation between logic and display** when handling page identification. This architectural decision ensures deterministic behavior, prevents race conditions, and simplifies debugging.
+
+**Core Principle**: All internal logic operates on immutable **Page IDs** (32-character hexadecimal hashes), while human-readable **titles** serve only as optional display metadata.
+
+### ID vs Title: Separation of Concerns
+
+| Aspect | Page ID | Page Title |
+|--------|---------|------------|
+| **Source** | Extracted from URL (Notion's 32-char hash) | Extracted from HTML or URL text |
+| **Availability** | Always available (synchronous) | May be delayed (async HTML parsing) |
+| **Mutability** | Immutable (deterministic) | Immutable once resolved |
+| **Used For** | Queue logic, deduplication, graph edges | Display, logging, file paths |
+| **Fallback** | Falls back to normalized URL if no hash | Falls back to ID or 'Untitled' |
+| **Uniqueness** | Guaranteed unique per page | May have conflicts (multiple 'Home' pages) |
+
+### ID Extraction: Single Source of Truth
+
+Both `GlobalQueueManager` and `DiscoveryQueue` use **identical extraction patterns** to ensure consistency:
+
+```javascript
+// GlobalQueueManager._derivePageId(url)
+_derivePageId(url) {
+  try {
+    const { normalizedUrl, normalizedPath } = this._normalizeUrlParts(url);
+    const match = normalizedPath.match(/([a-f0-9]{32})$/i);
+    return match ? match[1] : normalizedUrl;
+  } catch (error) {
+    return url;
+  }
+}
+
+// DiscoveryQueue._extractPageId(url)
+_extractPageId(url) {
+  const match = url && url.match(/([a-f0-9]{32})$/i);
+  return match ? match[1] : null;
+}
+```
+
+**Critical Requirement**: Both methods MUST use the same regex pattern to avoid ID extraction mismatches that could cause silent queue stalls.
+
+**Historical Bug**: Early implementations used `/29[a-f0-9]{30}/i` (requiring IDs to start with '29'), which silently discarded 86% of pages. The current pattern `/([a-f0-9]{32})$/i` correctly matches any valid Notion ID.
+
+### Title Resolution: Async and Optional
+
+Titles are resolved during the Discovery phase via worker HTML parsing:
+
+**Flow**:
+1. Worker navigates to page and extracts `<title>` tag or URL text
+2. Worker returns `{ pageId, resolvedTitle, links }` to Master
+3. Master stores in `TitleRegistry`: `idToTitleMap.set(pageId, resolvedTitle)`
+4. Title is cached for display purposes (dashboard, logs, file paths)
+
+**Guarantees**:
+- ✅ Title extraction never blocks queue logic
+- ✅ Missing titles don't prevent discovery from proceeding
+- ✅ Dashboard can display IDs as fallback if title unavailable
+- ✅ Queue operations are purely ID-based (no title dependencies)
+
+### Queue Logic: ID-Only Operations
+
+**Rule**: The discovery and download queues operate exclusively on Page IDs. Titles are NEVER used for:
+- Enqueue/dequeue decisions
+- Deduplication logic (`visitedUrls` tracks IDs, not titles)
+- Parent-child relationships (`PageContext.id`, not `PageContext.title`)
+- Graph edge classification (`EdgeClassifier` uses context IDs)
+
+**Example** (DiscoveryQueue enqueue validation):
+```javascript
+enqueue(context, isRoot = false) {
+  // Validation logging for debugging
+  if (!context || !context.url) {
+    this.logger.warn('DiscoveryQueue', 'Attempted to enqueue invalid context');
+    return false;
+  }
+
+  const rawPageId = this._extractPageId(context.url);
+  if (!rawPageId) {
+    this.logger.warn('DiscoveryQueue', `Failed to extract page ID from URL: ${context.url}`);
+    return false;
+  }
+
+  if (this.visitedUrls.has(rawPageId)) {
+    this.logger.debug('DiscoveryQueue', `Skipping already-visited page: ${rawPageId.substring(0, 8)}...`);
+    return false;
+  }
+
+  this.visitedUrls.add(rawPageId); // Uses ID, not title
+  this.queue.push({ pageContext: context, isFirstPage: isRoot });
+  return true;
+}
+```
+
+### Display Layer: Title or ID Fallback
+
+Human-readable displays use titles when available, IDs as fallback:
+
+**Dashboard Display** (BrowserManager):
+```javascript
+_getTaskDescription(taskType, metadata = {}) {
+  // Discovery Phase: Strict ID-only display
+  if (taskType === 'IPC_DISCOVER') {
+    const pageId = metadata.pageId || 'unknown';
+    return `Discovering [${pageId.substring(0, 8)}...]`;
+  }
+  
+  // Download Phase: Use Title if available
+  const pageTitle = metadata.pageTitle || 'page';
+  return `${taskType}: ${pageTitle}`;
+}
+```
+
+**Tree Display** (CompletionPhase):
+```javascript
+_printTreeNode(context, titleRegistry) {
+  const displayTitle = titleRegistry[context.id] || context.title || `Page [${context.id.substring(0, 8)}]`;
+  
+  // Cycle Detection: Stop recursion if edge is not a tree edge
+  // (i.e., child.parentContext !== context)
+  if (isCycle(context)) {
+    console.log(`├─ ${displayTitle} ↺ (Cycle)`);
+    return;
+  }
+  
+  console.log(`├─ ${displayTitle}`);
+  // Recurse...
+}
+```
+
+**File Paths** (PageProcessor):
+```javascript
+getOutputPath(context, titleRegistry) {
+  const title = titleRegistry[context.id] || context.title || context.id.substring(0, 16);
+  const safeName = FileSystemUtils.sanitizeFilename(title);
+  return path.join(outputDir, safeName, 'index.html');
+}
+```
+
+### Validation and Error Handling
+
+**Enqueue Failure Detection**:
+To prevent silent queue stalls, `ClusterOrchestrator` validates that newly discovered contexts are successfully enqueued:
+
+```javascript
+async _handleTaskComplete(workerId, taskType, result) {
+  if (taskType === MESSAGE_TYPES.DISCOVER) {
+    const newContexts = this.queueManager.completeDiscovery(/*...*/);
+    
+    let enqueuedCount = 0;
+    for (const context of newContexts) {
+      const enqueued = this.queueManager.enqueueDiscovery(context, false);
+      if (enqueued) {
+        enqueuedCount++;
+      } else {
+        this.logger.warn('ORCHESTRATOR', `Failed to enqueue: ${context.id.substring(0, 8)}... (${context.url})`);
+      }
+    }
+    
+    if (newContexts.length > 0) {
+      this.logger.debug('ORCHESTRATOR', `Enqueued ${enqueuedCount}/${newContexts.length} contexts`);
+    }
+  }
+}
+```
+
+**Benefits**:
+- Detects ID extraction failures immediately
+- Prevents silent data loss (pages discovered but never queued)
+- Provides actionable logs for debugging URL normalization issues
+
+### Benefits of ID-First Strategy
+
+✅ **No Race Conditions**: ID extraction is synchronous, title extraction is async and decoupled  
+✅ **Deterministic Behavior**: Queue logic never waits for title resolution  
+✅ **Simplified Debugging**: IDs are always available, no empty/null title edge cases  
+✅ **Fault Tolerance**: Missing titles don't break system functionality  
+✅ **Performance**: No IPC overhead for title updates during task execution  
+✅ **Clear Architecture**: Logic layer (IDs) vs Display layer (titles) separation  
+
+### Trade-offs
+
+❌ **Less Human-Readable Logs**: Dashboard shows `[29d979ee...]` instead of `"JBC090 Language AI"` during discovery  
+❌ **Debugging Overhead**: Need to cross-reference IDs with title registry to understand page identity  
+
+**Mitigation**: Keep short ID displays (8 characters) for compactness while maintaining uniqueness. Full titles are shown in final output and file system.
+
+---
+
 ## Detailed Package Documentation
 
 ### 1. Core Package (`src/core`) - Infrastructure Foundation
@@ -1354,9 +1545,9 @@ childProcess.on('message', (msg) => {
 ```
 
 **Message Translation**:
-- `IPC_RESULT` (success) → `JOB:COMPLETED` event
-- `IPC_RESULT` (error) → `JOB:FAILED` event
-- Worker crash (`exit` event) → `WORKER:DIED` event
+- `IPC_RESULT` (success) → `TASK:COMPLETE` event + `WORKER:IDLE` event
+- `IPC_RESULT` (error) → `TASK:FAILED` event + `WORKER:IDLE` event
+- Worker crash (`exit` event) → `WORKER:CRASHED` event
 
 **State Tracking**:
 - **Idle**: Ready for new tasks, available in BrowserManager pool

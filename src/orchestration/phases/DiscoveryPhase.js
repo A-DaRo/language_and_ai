@@ -134,21 +134,17 @@ class DiscoveryPhase extends PhaseStrategy {
           continue;
         }
 
+        const titleRegistry = this.queueManager.getTitleRegistry();
+        const pageTitle = task.pageContext.getDisplayTitle(titleRegistry);
+
         const workerId = await this.browserManager.execute(MESSAGE_TYPES.DISCOVER, {
           url: task.pageContext.url,
           pageId: task.pageContext.id,
           parentId: task.pageContext.parentId,
           depth: task.pageContext.depth,
           isFirstPage: false,
-          cookies: this.orchestrator.cookies
-        });
-
-        const titleRegistry = this.queueManager.getTitleRegistry();
-        const title = task.pageContext.getDisplayTitle(titleRegistry);
-
-        this.orchestrator.eventBus.emit('WORKER:BUSY', {
-          workerId,
-          task: { description: `Discovering '${title}'...` }
+          cookies: this.orchestrator.cookies,
+          metadata: { pageTitle, pageId: task.pageContext.id }
         });
       }
     };

@@ -114,6 +114,14 @@ class FileDownloader {
       }
     }
 
+    // Process hidden files (e.g. in divs)
+    try {
+      const hiddenCount = await this._processHiddenFiles(page, filesDir);
+      downloadCount += hiddenCount;
+    } catch (error) {
+      this.logger.error('FILE', 'Error processing hidden files', error);
+    }
+
     // Rewrite file links in HTML
     if (Object.keys(urlMap).length > 0) {
       this.logger.info('FILE', 'Rewriting file links in the HTML...');
@@ -127,6 +135,113 @@ class FileDownloader {
     }
 
     this.logger.success('FILE', `Downloaded ${downloadCount} embedded files.`);
+  }
+
+  /**
+   * Process hidden file links (e.g. in divs) by clicking and intercepting requests
+   * @param {import('puppeteer').Page} page - Puppeteer page instance
+   * @param {string} filesDir - Directory to save files
+   * @returns {Promise<number>} Number of files downloaded
+   */
+  async _processHiddenFiles(page, filesDir) {
+    let downloadCount = 0;
+    
+    // Selector for hidden file elements
+    const hiddenElements = await page.$$('div[data-popup-origin="true"]');
+    
+    if (hiddenElements.length > 0) {
+      this.logger.info('FILE', `Found ${hiddenElements.length} potential hidden file elements. Scanning...`);
+    }
+
+    for (const element of hiddenElements) {
+      try {
+        const text = await page.evaluate(el => el.textContent.trim(), element);
+        
+        // Check if text implies a file (e.g. "slides.pdf")
+        const hasExtension = ['.pdf', '.zip', '.docx', '.pptx', '.xlsx'].some(ext => text.toLowerCase().includes(ext));
+        
+        if (!hasExtension) continue;
+
+        this.logger.info('FILE', `Processing hidden file candidate: ${text}`);
+
+        let downloadUrl = null;
+        
+        // 1. Listener for new targets (tabs/windows)
+        const targetHandler = async (target) => {
+            try {
+              if (target.opener() === page.target()) {
+                  const newPage = await target.page();
+                  if (newPage) {
+                      downloadUrl = newPage.url();
+                      await newPage.close();
+                  }
+              }
+            } catch (e) { /* Ignore target errors */ }
+        };
+        page.browser().on('targetcreated', targetHandler);
+
+        // 2. Listener for requests (same tab)
+        await page.setRequestInterception(true);
+        const requestHandler = (request) => {
+            if (this.typeDetector.isDownloadableFile(request.url())) {
+                downloadUrl = request.url();
+                request.abort(); // Prevent browser download
+            } else {
+                request.continue();
+            }
+        };
+        page.on('request', requestHandler);
+
+        try {
+            await element.click();
+            // Wait for reaction (request or new tab)
+            await new Promise(resolve => setTimeout(resolve, 3000));
+        } catch (e) {
+            this.logger.debug('FILE', `Interaction error: ${e.message}`);
+        } finally {
+            page.browser().off('targetcreated', targetHandler);
+            page.off('request', requestHandler);
+            await page.setRequestInterception(false);
+        }
+
+        if (downloadUrl) {
+             this.logger.info('FILE', `Captured hidden download URL: ${downloadUrl}`);
+             
+             // Use 'hidden' as index to avoid conflict, or generate unique name
+             const filename = this.nameExtractor.extractFilename(downloadUrl, text, Date.now());
+             const localFilePath = path.join(filesDir, filename);
+             
+             if (!this.downloadStrategy.hasDownloaded(downloadUrl)) {
+                const savedPath = await this.downloadStrategy.downloadFileWithRetry(downloadUrl, localFilePath);
+                if (savedPath) {
+                    const savedRelativePath = path.posix.join('files', path.basename(savedPath));
+                    this.downloadStrategy.recordDownload(downloadUrl, savedRelativePath);
+                    downloadCount++;
+                    
+                    // Rewrite DOM: Replace div with anchor
+                    await page.evaluate((el, newHref, newText) => {
+                        const link = document.createElement('a');
+                        link.href = newHref;
+                        link.textContent = newText;
+                        link.style.display = 'block';
+                        link.style.fontWeight = 'bold';
+                        link.setAttribute('data-restored-file', 'true');
+                        
+                        // Try to replace the parent wrapper if it exists and is just a wrapper
+                        if (el.parentNode && el.parentNode.tagName === 'DIV' && el.parentNode.children.length === 1) {
+                           el.parentNode.replaceWith(link);
+                        } else {
+                           el.replaceWith(link);
+                        }
+                    }, element, savedRelativePath, text);
+                }
+             }
+        }
+      } catch (error) {
+        this.logger.error('FILE', `Error processing hidden element`, error);
+      }
+    }
+    return downloadCount;
   }
 
   /**

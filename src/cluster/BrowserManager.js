@@ -39,7 +39,7 @@ class BrowserManager {
       }
     });
     
-    // Worker becomes idle after task completion
+    // Worker is idle (after task completion or failure)
     this.eventBus.on('WORKER:IDLE', ({ workerId }) => {
       this.busyWorkers.delete(workerId);
       if (!this.idleWorkers.includes(workerId)) {
@@ -48,12 +48,19 @@ class BrowserManager {
     });
     
     // Worker started a task
-    this.eventBus.on('TASK:STARTED', ({ workerId, taskId, taskType }) => {
+    this.eventBus.on('TASK:STARTED', ({ workerId, taskId, taskType, metadata }) => {
       const index = this.idleWorkers.indexOf(workerId);
       if (index > -1) {
         this.idleWorkers.splice(index, 1);
       }
       this.busyWorkers.set(workerId, { taskId, taskType });
+      
+      // Emit WORKER:BUSY for UI dashboard with human-readable description
+      const description = this._getTaskDescription(taskType, metadata);
+      this.eventBus.emit('WORKER:BUSY', {
+        workerId,
+        task: { description }
+      });
     });
     
     // Worker crashed
@@ -119,8 +126,28 @@ class BrowserManager {
       throw new Error(`Worker ${workerId} not found in registry`);
     }
     
-    await worker.sendCommand(messageType, payload);
+    await worker.sendCommand(messageType, payload, payload.metadata || {});
     return workerId;
+  }
+  
+  /**
+   * Generate human-readable task description for UI
+   * @private
+   * @param {string} taskType - Task type (IPC_DISCOVER or IPC_DOWNLOAD)
+   * @param {Object} metadata - Task metadata (pageTitle, etc.)
+   * @returns {string} Task description
+   */
+  _getTaskDescription(taskType, metadata = {}) {
+    const pageTitle = metadata.pageTitle || 'page';
+    
+    if (taskType === 'IPC_DISCOVER') {
+      const id = metadata.pageId || 'unknown';
+      return `Discovering [${id.substring(0, 8)}...]`;
+    } else if (taskType === 'IPC_DOWNLOAD') {
+      return `Downloading '${pageTitle}'...`;
+    }
+    
+    return `Processing ${taskType}...`;
   }
   
   /**

@@ -5,7 +5,7 @@ class Config {
   constructor() {
     // Main configuration
     this.NOTION_PAGE_URL = 'https://mctenthij.notion.site/JBC090-Language-AI-29d979eeca9f81469905f51d65beefae';
-    this.OUTPUT_DIR = './';
+    this.OUTPUT_DIR = './JBC090-Language-AI';
     this.LOG_DIR = './';
     this.LOG_FILE_ENABLED = true;
     this.MAX_EXPANSION_DEPTH = 100;

@@ -152,8 +152,18 @@ class ClusterOrchestrator {
         result.resolvedTitle
       );
 
+      let enqueuedCount = 0;
       for (const context of newContexts) {
-        this.queueManager.enqueueDiscovery(context, false);
+        const enqueued = this.queueManager.enqueueDiscovery(context, false);
+        if (enqueued) {
+          enqueuedCount++;
+        } else {
+          this.logger.warn('ORCHESTRATOR', `Failed to enqueue context: ${context.id.substring(0, 8)}... (${context.url})`);
+        }
+      }
+
+      if (newContexts.length > 0) {
+        this.logger.debug('ORCHESTRATOR', `Enqueued ${enqueuedCount}/${newContexts.length} new contexts`);
       }
 
     } else if (taskType === MESSAGE_TYPES.DOWNLOAD) {
