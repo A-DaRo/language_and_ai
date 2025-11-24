@@ -95,13 +95,13 @@ class FileDownloader {
         // Extract and sanitize filename
         const filename = this.nameExtractor.extractFilename(fileUrl, linkInfo.text, index + 1);
         const localFilePath = path.join(filesDir, filename);
-        const relativePath = path.posix.join('files', filename);
 
         // Download if not already cached
         if (!this.downloadStrategy.hasDownloaded(fileUrl)) {
-          const success = await this.downloadStrategy.downloadFileWithRetry(fileUrl, localFilePath);
-          if (success) {
-            this.downloadStrategy.recordDownload(fileUrl, relativePath);
+          const savedPath = await this.downloadStrategy.downloadFileWithRetry(fileUrl, localFilePath);
+          if (savedPath) {
+            const savedRelativePath = path.posix.join('files', path.basename(savedPath));
+            this.downloadStrategy.recordDownload(fileUrl, savedRelativePath);
             downloadCount++;
           }
         }

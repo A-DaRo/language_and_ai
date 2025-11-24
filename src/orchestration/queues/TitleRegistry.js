@@ -17,14 +17,21 @@ class TitleRegistry {
   }
 
   /**
-   * Associates a human-readable title with a page ID
+   * Associates a human-readable title with a page ID, overriding stale values.
    * @param {string} id - The page ID
    * @param {string} title - The resolved title
    */
   register(id, title) {
-    if (!this.idToTitleMap.has(id)) {
-      this.idToTitleMap.set(id, title);
+    if (!id || !title) {
+      return;
     }
+
+    const existing = this.idToTitleMap.get(id);
+    if (existing === title) {
+      return;
+    }
+
+    this.idToTitleMap.set(id, title);
   }
 
   /**

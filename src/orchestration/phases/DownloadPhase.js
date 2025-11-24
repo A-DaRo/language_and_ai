@@ -69,10 +69,7 @@ class DownloadPhase extends PhaseStrategy {
       });
 
       const titleRegistry = this.queueManager.getTitleRegistry();
-      let title = titleRegistry[context.id] || context.title || 'Untitled';
-      if (title.match(/^[a-f0-9]{32}$/i)) {
-        title = `Page ${title.substring(0, 6)}...`;
-      }
+      const title = context.getDisplayTitle(titleRegistry);
 
       this.orchestrator.eventBus.emit('WORKER:BUSY', {
         workerId,

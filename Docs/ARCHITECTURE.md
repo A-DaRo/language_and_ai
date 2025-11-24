@@ -28,12 +28,14 @@ The architecture represents a fundamental shift from direct method invocation to
 2. **Separation of Concerns**: Clear boundaries between decision-making (Master) and execution (Workers)
 3. **Single Responsibility**: Each class has one well-defined purpose
 4. **Dependency Injection**: Components receive dependencies through constructors
-5. **Event-Driven Communication**: Components coordinate via events, not direct method calls
+5. **Event-Driven Communication**: Components coordinate via events, not direct method calls or polling loops; state transitions emit events and consumers await those signals instead of busy-waiting
 6. **Stateless Workers**: Worker processes maintain no global state, enabling fault tolerance
 7. **Strict BFS Traversal**: Breadth-first search ensures proper hierarchy and prevents infinite loops
 8. **Two-Phase Execution**: Discovery (lightweight) followed by Execution (full scraping)
-9. **Centralized Title Registry**: Single source of truth for ID-to-title mapping maintained by GlobalQueueManager, enabling efficient internal operations with raw IDs while providing instant human-readable title lookups for display and logging
-9. **Centralized Title Registry**: Single source of truth for ID-to-title mapping in GlobalQueueManager, enabling efficient internal operations with raw IDs while providing instant human-readable title lookups
+9. **Centralized Title Registry**: Single source of truth for ID-to-title mapping maintained by GlobalQueueManager, enabling efficient internal operations while keeping display titles up to date
+10. **Canonicalization Invariant**: Every entity (page, URL) has exactly one canonical representation; duplicates are detected at creation and collapsed into that canonical instance
+
+  The canonicalization logic now normalizes each URL before deriving an ID. `_derivePageId(url)` strips query parameters and trailing slashes, normalizes host and path casing, and prefers built-in 32-character Notion IDs when they exist; otherwise it falls back to the normalized host/path string. This ensures variations like `?v=1` or trailing slashes do not create duplicate contexts.
 
 ### Runtime Contexts: Master vs Worker
 
@@ -53,6 +55,8 @@ The system operates in **two distinct runtime contexts**, each with specific res
 - Lightweight, event-driven coordination only
 
 **Key Components**: `ClusterOrchestrator`, `GlobalQueueManager`, `BrowserManager`, `ConflictResolver`
+
+The `UserConfirmationPhase` is responsible for rendering the discovered graph before download. It now keeps a per-branch visited set when recursing through child contexts so that cycles in the graph are detected, annotated with `↺ (Cycle)`, and the recursion stops rather than causing a `RangeError`. This keeps the dashboard friendly even when Notion pages link back to their parents.
 
 #### Worker Process (The Muscle)
 **Responsibilities:**
@@ -856,6 +860,30 @@ removeAllListeners(event)
  */
 
 /**
+ * @event DISCOVERY:QUEUE_READY
+ * @summary Queue has transitioned from empty to ready for dispatch
+ * @payload {Object} { queueLength: number }
+ */
+
+/**
+ * @event DISCOVERY:QUEUE_EMPTY
+ * @summary Discovery queue drained while tasks are still executing
+ * @payload {Object} { queueLength: 0, pendingCount: number }
+ */
+
+/**
+ * @event DISCOVERY:TASK_COMPLETED
+ * @summary A discovery task finished (success or failure)
+ * @payload {Object} { pageId: string, success: boolean, pendingCount: number, queueLength: number }
+ */
+
+/**
+ * @event DISCOVERY:ALL_IDLE
+ * @summary Discovery reached quiescent state (no queued or pending tasks)
+ * @payload {Object} { queueLength: 0, pendingCount: 0 }
+ */
+
+/**
  * Execution Phase Events
  */
 
@@ -1048,7 +1076,7 @@ The domain package defines the core data structures that represent the scraped c
 **Serialization**: JSON-compatible (no circular references)
 
 **Class Description**:
-Represents a single Notion page within the hierarchical structure. It is the **Single Source of Truth** for page relationships and metadata. Has been refactored to delegate all path calculations to a specialized `PathCalculator` component, improving separation of concerns and testability.
+Represents a single Notion page within the hierarchical structure. It is the **Single Source of Truth** for page relationships and metadata. The master-side `GlobalQueueManager` enforces canonical instances via `allContexts`, and any TitleRegistry update immediately flows into the `PageContext.title`, ensuring the human-readable title stays in sync with the registry. The class now delegates all path calculations to a specialized `PathCalculator` component, improving separation of concerns and testability.
 
 **Refactoring Overview**:
 
@@ -1230,6 +1258,7 @@ process.on('message', (msg) => {
 4. **Code Reuse**: PathCalculator can be used for other path operations
 5. **Maintainability**: Single responsibility for each component
 6. **Extensibility**: Path logic extensible without modifying domain model
+7. **Canonical Title Sync**: Title updates from TitleRegistry propagate to every canonical PageContext instance, keeping serialized titles consistent for downstream consumers
 
 **Dependencies**: `PathCalculator` (path calculation strategy)  
 **Used By**: All components handling page metadata and file operations  
@@ -1970,10 +1999,12 @@ class ClusterOrchestrator {
    - Sends titleRegistry to workers via `BrowserManager.initializeWorkers()`
 
 2. **DiscoveryPhase.js** (90 lines)
-   - Implements BFS page discovery
-   - Coordinates between worker availability and task dispatch
-   - Emits progress events for dashboard
-   - Returns when all discovery complete
+  - Implements BFS page discovery using `DiscoveryQueue`
+  - Coordinates between worker availability and task dispatch via `SystemEventBus`
+  - Awaits `DISCOVERY:ALL_IDLE` instead of polling and enforces a 30-minute safety timeout
+  - Listens to `DISCOVERY:TASK_COMPLETED` to detect invariant violations (negative pending counts)
+  - Emits progress events for dashboard
+  - Returns when all discovery complete
 
 3. **UserConfirmationPhase.js** (87 lines)
    - Displays discovered page tree structure
@@ -2122,15 +2153,20 @@ function isRetryableError(error) {
 
 ---
 
-#### 5.2 `GlobalQueueManager.js` - BFS Frontier Management (REFACTORED - Queue Component Separation)
+#### 5.2 `GlobalQueueManager.js` - BFS Frontier Management with Page Graph Building (REFACTORED - Queue Component Separation)
 
 **Runtime Context**: Master Process Only  
 **Design Pattern**: Facade + Delegation Pattern  
-**Responsibility**: Coordinate between specialized queue components (DiscoveryQueue, ExecutionQueue, TitleRegistry)
+**Responsibility**: Coordinate between specialized queue components and build PageGraph during discovery
 
 **Behavioral Description**:
 
-GlobalQueueManager has been refactored from a 404-line monolithic class that managed discovery queue, execution queue, and title registry into a lightweight 212-line facade that delegates to three specialized components.
+GlobalQueueManager has been refactored from a 404-line monolithic class into a lightweight facade that delegates to three specialized components and now also builds a PageGraph during discovery phase to capture edge classifications.
+
+**Canonicalization Guarantee**:
+- `allContexts` serves as the single source of truth for every `PageContext`; the map is updated once per unique page ID and reused throughout the discovery lifecycle.
+- `completeDiscovery()` reuses canonical contexts when it processes discovered links, adds edges for every relationship, and only enqueues truly new contexts so the graph never contains duplicate nodes.
+- Resolved titles flow immediately into the TitleRegistry and the affected `PageContext`, keeping the canonical representation consistent with human-readable metadata.
 
 **Architecture Change**:
 
@@ -2157,6 +2193,10 @@ class GlobalQueueManager {
     this.titleRegistry = new TitleRegistry();
     this.discoveryQueue = new DiscoveryQueue(logger);
     this.executionQueue = new ExecutionQueue(config, logger);
+    
+    // NEW: Page graph for capturing hierarchy and edge classifications
+    this.pageGraph = new PageGraph();
+    this.edgeClassifier = new EdgeClassifier();
   }
   
   // Facade methods delegate to components
@@ -2170,6 +2210,38 @@ class GlobalQueueManager {
     return task;
   }
   
+  // NEW: Build page graph and classify edges during discovery completion
+  completeDiscovery(pageId, discoveredLinks, metadata = {}, resolvedTitle = null) {
+    this.discoveryQueue.markComplete(pageId);
+    
+    const parentContext = this.allContexts.get(pageId);
+    
+    // Add parent to graph
+    this.pageGraph.addNode(pageId, parentContext);
+    
+    this.edgeClassifier.setContextMap(this.allContexts);
+    
+    // Process discovered links and classify edges
+    for (const link of discoveredLinks) {
+      const childContext = new PageContext(
+        link.url,
+        link.text || 'Untitled',
+        parentContext.depth + 1,
+        parentContext,
+        parentContext.id
+      );
+      
+      parentContext.addChild(childContext);
+      
+      // NEW: Classify edge and add to graph
+      const classification = this.edgeClassifier.classifyEdge(parentContext, childContext);
+      this.pageGraph.addEdge(pageId, childContext.id, classification);
+      this.pageGraph.addNode(childContext.id, childContext);
+    }
+    
+    return newContexts;
+  }
+  
   buildDownloadQueue(contexts) {
     return this.executionQueue.build(contexts);
   }
@@ -2177,6 +2249,11 @@ class GlobalQueueManager {
   nextDownload(outputDir) {
     const task = this.executionQueue.next(outputDir);
     return task;
+  }
+  
+  // NEW: Get page graph for context-aware operations
+  getPageGraph() {
+    return this.pageGraph;
   }
 }
 ```
@@ -2196,21 +2273,24 @@ class GlobalQueueManager {
      - Supports lazy initialization (send once via IPC_INIT)
 
 2. **DiscoveryQueue.js** (130 lines)
-   - Purpose: BFS discovery frontier management
+   - Purpose: BFS discovery frontier management with built-in state instrumentation
    - Responsibilities:
-     - `enqueue(context, isRoot)`: Add to appropriate BFS level
-     - `next()`: Return next task with incremented pending count
-     - `complete()`: Mark task complete
-     - `isComplete()`: Check if discovery finished
+     - `enqueue(context, isRoot)`: Add to BFS frontier and emit `DISCOVERY:QUEUE_READY`
+     - `next()`: Return next task and track it inside `pendingTaskIds`
+     - `markComplete(pageId)`/`markFailed(pageId)`: Idempotent finalization that emits `DISCOVERY:TASK_COMPLETED` and `DISCOVERY:ALL_IDLE`
+     - `isComplete()`: Check if discovery finished (queue empty + no pending tasks)
    - Features:
      - Level-based BFS (all tasks at depth N before depth N+1)
      - Automatic level transitions
      - Visited URL deduplication
      - Progress emission for dashboard
+     - Event-driven instrumentation: emits `DISCOVERY:QUEUE_READY`, `DISCOVERY:QUEUE_EMPTY`, `DISCOVERY:TASK_COMPLETED`, and `DISCOVERY:ALL_IDLE`
+     - Pending tasks tracked via `pendingTaskIds: Set<string>` for deterministic, non-negative counts
    - Key invariants:
      - All currentLevel tasks have same depth
      - No URL appears multiple times
-     - visitedUrls prevents cycles
+     - `visitedUrls` prevents cycles
+     - `pendingTaskIds.size` never drops below zero and only contains outstanding task IDs
 
 3. **ExecutionQueue.js** (170 lines)
    - Purpose: Download dependency-aware scheduling
@@ -2995,15 +3075,15 @@ await page.waitForTimeout(delay)
 
 ---
 
-#### 6.4 `LinkExtractor.js` - Hierarchical Link Discovery
+#### 6.4 `LinkExtractor.js` - Hierarchical Link Discovery with Block ID Preservation
 
 **Runtime Context**: Worker Process Only  
 **Design Pattern**: Extractor + Filter + Enricher  
-**Responsibility**: Extract internal links with hierarchical context metadata
+**Responsibility**: Extract internal links with hierarchical context metadata and block ID preservation
 
 **Behavioral Description**:
 
-LinkExtractor finds all Notion page links and enriches them with contextual information (sections, subsections) to aid hierarchy construction.
+LinkExtractor finds all Notion page links and enriches them with contextual information (sections, subsections) and block IDs to aid hierarchy construction and support section-level navigation in offline mode.
 
 **Extraction Strategy**:
 
@@ -3021,6 +3101,17 @@ async extractLinks(page, currentUrl, baseUrl) {
       
       // Resolve to absolute URL
       const absoluteUrl = new URL(href, baseUrl).href
+      
+      // Extract block ID if present in URL hash (NEW)
+      const hashIndex = absoluteUrl.indexOf('#')
+      let blockIdRaw = null
+      if (hashIndex > -1) {
+        blockIdRaw = absoluteUrl.substring(hashIndex + 1)
+        // Validate it's a raw block ID (32 hex chars)
+        if (!/^[a-f0-9]{32}$/i.test(blockIdRaw)) {
+          blockIdRaw = null
+        }
+      }
       
       // Filter: Only internal Notion links
       if (!absoluteUrl.includes('notion.so') && 
@@ -3044,7 +3135,8 @@ async extractLinks(page, currentUrl, baseUrl) {
         url: absoluteUrl,
         title: anchor.textContent.trim() || 'Untitled',
         section: this.findSection(anchor),
-        subsection: this.findSubsection(anchor)
+        subsection: this.findSubsection(anchor),
+        blockId: blockIdRaw  // NEW: preserve raw block ID from URL
       }
       
       links.push(linkInfo)
@@ -3054,6 +3146,10 @@ async extractLinks(page, currentUrl, baseUrl) {
   }, currentUrl, baseUrl)
 }
 ```
+
+**Block ID Format**:
+- **Raw Format (URL)**: `29d979eeca9f81f7b82fe4b983834212` (32 hex characters)
+- **Formatted Format (HTML)**: `29d979ee-ca9f-81f7-b82f-e4b983834212` (standard UUID format with dashes)
 
 **Hierarchical Context Extraction**:
 
@@ -3111,23 +3207,23 @@ pageContext.setSubsection('API Reference')
 
 ---
 
-#### 6.5 `LinkRewriter.js` - Offline Link Transformation (REFACTORED)
+#### 6.5 `LinkRewriter.js` - Offline Link Transformation with Block Anchor Support
 
 **Runtime Context**: Worker Process Only  
 **Design Pattern**: Transformer + Post-Processor  
-**Responsibility**: Convert online URLs to offline-compatible relative paths
+**Responsibility**: Convert online URLs to offline-compatible relative paths with proper block anchors
 
 **Behavioral Description**:
 
-LinkRewriter is invoked AFTER HTML is saved to disk. It loads the HTML, rewrites links, and saves back. It now supports **ID-based resolution** to handle cases where URL strings don't match exactly (e.g., different titles or short links).
+LinkRewriter is invoked AFTER HTML is saved to disk. It loads the HTML, rewrites links with proper anchor support, and saves back. It now supports **ID-based resolution** and **block anchor mapping** to handle cases where URL strings don't match exactly and to support section-level navigation.
 
-**Refactored Behavior** (Hot Rewriting):
+**Refactored Behavior** (Hot Rewriting with Block Anchors):
 
-**Before**: Separate post-processing phase  
-**After**: Integrated into worker's download task
+**Before**: Separate post-processing phase, no block ID support  
+**After**: Integrated into worker's download task, with block anchor rewriting
 
 ```javascript
-async rewriteLinksInFile(htmlPath, pageContext, linkMap) {
+async rewriteLinksInFile(htmlPath, pageContext, urlToContextMap, pageGraph, blockMapCache) {
   // 1. Load saved HTML
   const html = await fs.readFile(htmlPath, 'utf-8')
   const dom = new JSDOM(html)
@@ -3136,9 +3232,8 @@ async rewriteLinksInFile(htmlPath, pageContext, linkMap) {
   let rewriteCount = 0
   
   // 2. Build ID-to-Context Map for fallback resolution
-  // This allows resolving links by their 32-char Notion ID even if the URL title differs
   const idToContextMap = new Map()
-  for (const [url, ctx] of this.contextMap.entries()) {
+  for (const [url, ctx] of urlToContextMap.entries()) {
     if (ctx.id) {
       idToContextMap.set(ctx.id.replace(/-/g, ''), ctx)
     }
@@ -3149,30 +3244,32 @@ async rewriteLinksInFile(htmlPath, pageContext, linkMap) {
   
   for (const anchor of anchors) {
     const href = anchor.getAttribute('href')
-    const absoluteUrl = this.resolveUrl(href, pageContext.url)
+    const { urlPart, blockIdRaw } = this._parseHref(href)  // NEW: parse block ID
     
-    let targetRelativePath = null
+    let targetContext = urlToContextMap.get(urlPart)
     
-    // Strategy A: Exact URL Match
-    if (linkMap.has(absoluteUrl)) {
-      targetRelativePath = linkMap.get(absoluteUrl)
-    } 
-    // Strategy B: Notion ID Match (Fallback)
-    else {
-      const idMatch = absoluteUrl.match(/([a-f0-9]{32}|[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})/)
+    // Fallback: Try to find by ID if URL lookup failed
+    if (!targetContext) {
+      const idMatch = urlPart.match(/29[a-f0-9]{30}/i)
       if (idMatch) {
-        const id = idMatch[1].replace(/-/g, '')
-        const targetContext = idToContextMap.get(id)
-        if (targetContext) {
-          targetRelativePath = targetContext.getRelativePath()
-        }
+        const id = idMatch[0]
+        targetContext = idToContextMap.get(id)
       }
     }
     
-    // Apply Rewrite
-    if (targetRelativePath) {
-      const relativePath = pageContext.getRelativePathTo(targetRelativePath)
-      anchor.setAttribute('href', relativePath)
+    if (targetContext) {
+      // Calculate relative path
+      const relativePath = pageContext.getRelativePathTo(targetContext)
+      
+      // NEW: Rewrite block anchor if present
+      let newHref = relativePath
+      if (blockIdRaw && blockMapCache && blockMapCache.has(targetContext.id)) {
+        const blockMap = blockMapCache.get(targetContext.id)
+        const formattedId = this.blockIDMapper.getFormattedId(blockIdRaw, blockMap)
+        newHref += '#' + formattedId
+      }
+      
+      anchor.setAttribute('href', newHref)
       rewriteCount++
     }
   }
@@ -3189,21 +3286,412 @@ async rewriteLinksInFile(htmlPath, pageContext, linkMap) {
   
   return rewriteCount
 }
-```
 
-**Link Map Usage**:
-
-The `linkMap` (from ConflictResolver) ensures consistent rewriting:
-```javascript
-linkMap = {
-  'https://notion.so/page-abc': 'Projects/WebApp/index.html',
-  'https://notion.so/page-xyz': 'Docs/API/index.html'
+/**
+ * Parse href to separate URL and raw block ID
+ * @private
+ */
+_parseHref(href) {
+  const parts = href.split('#')
+  const urlPart = parts[0].split('?')[0]
+  const blockIdRaw = parts.length > 1 ? parts[1] : null
+  return { urlPart, blockIdRaw }
 }
 
-// From any page, links point to canonical instances
+/**
+ * Build anchor hash for block ID (NEW)
+ * Converts raw block ID to formatted UUID using block map if available
+ * @private
+ */
+_buildAnchorHash(blockIdRaw, targetContext, blockMapCache) {
+  if (!blockIdRaw) return ''
+  
+  if (blockMapCache && targetContext.id) {
+    const blockMap = blockMapCache.get(targetContext.id)
+    if (blockMap) {
+      const formattedId = this.blockIDMapper.getFormattedId(blockIdRaw, blockMap)
+      return '#' + formattedId
+    }
+  }
+  
+  // Fallback: format the raw ID directly
+  const formattedId = this.blockIDMapper.getFormattedId(blockIdRaw, null)
+  return '#' + formattedId
+}
+```
+
+**Block Anchor Processing**:
+
+The new `blockMapCache` parameter enables proper anchor rewriting:
+
+```javascript
+// blockMapCache format:
+{
+  '29abc': Map {
+    '29d979eeca9f81f7b82fe4b983834212' => '29d979ee-ca9f-81f7-b82f-e4b983834212',
+    '12345678123456781234567812345678' => '12345678-1234-5678-1234-567812345678'
+  },
+  '29def': Map { ... }
+}
 ```
 
 **Source**: [`src/processing/LinkRewriter.js`](../src/processing/LinkRewriter.js)
+
+---
+
+#### 6.5a `EdgeClassifier.js` - Edge Classification for Page Hierarchy (NEW)
+
+**Runtime Context**: Master Process Only  
+**Design Pattern**: Classifier + Analyzer  
+**Responsibility**: Classify edges in the discovered page graph based on depth relationships
+
+**Behavioral Description**:
+
+EdgeClassifier analyzes the relationship between discovered pages during the discovery phase and classifies each link as either FORWARD (progressing deeper in hierarchy) or BACK (returning to same/shallower level). This enables context-aware link handling and future optimization.
+
+**Classification Strategy**:
+
+```javascript
+/**
+ * Classify an edge between two discovered pages
+ * BFS guarantees all pages visited, so edge type is deterministic based on depth
+ */
+classifyEdge(sourceContext, targetContext) {
+  const depthDelta = Math.abs(sourceContext.depth - targetContext.depth)
+  
+  if (targetContext.depth > sourceContext.depth) {
+    // Target is deeper - going forward in hierarchy
+    return {
+      type: 'FORWARD',
+      depthDelta,
+      isAncestor: false
+    }
+  }
+  
+  // Target is at same level or shallower - check if ancestor
+  const isAncestor = this._isAncestor(sourceContext, targetContext)
+  return {
+    type: 'BACK',
+    depthDelta,
+    isAncestor
+  }
+}
+
+/**
+ * Walk parent chain to check ancestor relationship
+ */
+_isAncestor(sourceContext, targetContext) {
+  let current = sourceContext
+  
+  while (current.parentContext || current.parentId) {
+    current = current.parentContext || this.contextMap.get(current.parentId)
+    if (!current) break
+    
+    if (current.id === targetContext.id) {
+      return true
+    }
+  }
+  
+  return false
+}
+```
+
+**Edge Types**:
+- **FORWARD**: Child → Parent (depth increases). Example: "Home" → "Introduction"
+- **BACK**: Parent → Child or Sibling (depth same/decreases). Example: "Introduction" → "Home", "Module A" → "Module B"
+
+**Integration with Discovery**:
+
+EdgeClassifier is used during discovery phase in `GlobalQueueManager.completeDiscovery()`:
+
+```javascript
+const edgeClassifier = new EdgeClassifier(this.allContexts)
+
+for (const link of discoveredLinks) {
+  const childContext = new PageContext(...)
+  parentContext.addChild(childContext)
+  
+  // Classify edge
+  const classification = edgeClassifier.classifyEdge(parentContext, childContext)
+  this.pageGraph.addEdge(parentContext.id, childContext.id, classification)
+}
+```
+
+**Source**: [`src/orchestration/analysis/EdgeClassifier.js`](../src/orchestration/analysis/EdgeClassifier.js)
+
+---
+
+#### 6.5b `PageGraph.js` - Hierarchy Graph with Edge Metadata (NEW)
+
+**Runtime Context**: Master Process Only  
+**Design Pattern**: Graph + Repository  
+**Responsibility**: Maintain the discovered page hierarchy with edge classification metadata
+
+**Behavioral Description**:
+
+PageGraph builds during the discovery phase and captures the complete site structure along with edge directionality information. It serves as the canonical representation of discovered page relationships.
+
+**Data Structure**:
+
+```javascript
+class PageGraph {
+  constructor() {
+    // Map: pageId → PageContext
+    this.nodes = new Map()
+    
+    // Map: pageId → Set<targetPageId>
+    this.edges = new Map()
+    
+    // Map: "sourceId-targetId" → EdgeClassification
+    this.edgeMetadata = new Map()
+  }
+}
+```
+
+**Key Methods**:
+
+```javascript
+// Add a discovered page
+addNode(pageId, context)
+
+// Add an edge with classification
+addEdge(sourceId, targetId, classification)
+
+// Query edges
+hasEdge(sourceId, targetId)
+getEdgeClassification(sourceId, targetId)
+getOutgoingEdges(sourceId)        // All links from a page
+getIncomingEdges(targetId)        // All backlinks to a page
+
+// Statistics
+getStatistics()  // Returns { nodeCount, edgeCount, forwardEdges, backEdges }
+
+// Serialization for IPC
+toJSON()
+static fromJSON(json)
+```
+
+**Usage in Discovery**:
+
+```javascript
+const graph = new PageGraph()
+
+// During completeDiscovery()
+graph.addNode(parentContext.id, parentContext)
+
+for (const childContext of newContexts) {
+  const classification = classifier.classifyEdge(parent, child)
+  graph.addEdge(parentContext.id, childContext.id, classification)
+  graph.addNode(childContext.id, childContext)
+}
+
+// Query later
+const backlinks = graph.getIncomingEdges('29def')  // All pages linking to this one
+const classification = graph.getEdgeClassification('29abc', '29def')
+```
+
+**Source**: [`src/orchestration/PageGraph.js`](../src/orchestration/PageGraph.js)
+
+---
+
+#### 6.5c `BlockIDExtractor.js` - Block ID Extraction from HTML (NEW)
+
+**Runtime Context**: Worker Process Only  
+**Design Pattern**: Extractor + Mapper  
+**Responsibility**: Extract block IDs from downloaded page HTML and map raw to formatted IDs
+
+**Behavioral Description**:
+
+BlockIDExtractor parses downloaded HTML to find all `data-block-id` attributes (Notion block identifiers) and builds a mapping from raw hex format (as found in URLs) to formatted UUID format (as found in HTML).
+
+**Extraction Strategy**:
+
+```javascript
+/**
+ * Extract block ID mapping from saved HTML
+ * Maps raw block IDs (URL format) to formatted block IDs (HTML format)
+ */
+extractBlockIDs(document) {
+  const blockMap = new Map()
+  
+  // Find all elements with data-block-id
+  const blocks = document.querySelectorAll('[data-block-id]')
+  
+  for (const block of blocks) {
+    const formattedId = block.getAttribute('data-block-id')
+    
+    if (formattedId) {
+      // Convert formatted UUID to raw hex for mapping
+      const rawId = this._formatToRaw(formattedId)
+      blockMap.set(rawId, formattedId)
+    }
+  }
+  
+  return blockMap
+}
+
+/**
+ * Convert formatted UUID to raw hex
+ * 29d979ee-ca9f-81f7-b82f-e4b983834212 → 29d979eeca9f81f7b82fe4b983834212
+ */
+_formatToRaw(formattedId) {
+  return formattedId.replace(/-/g, '').toLowerCase()
+}
+
+/**
+ * Convert raw hex to formatted UUID
+ * 29d979eeca9f81f7b82fe4b983834212 → 29d979ee-ca9f-81f7-b82f-e4b983834212
+ */
+_rawToFormatted(rawId) {
+  const hex = rawId.toLowerCase()
+  return [
+    hex.substring(0, 8),
+    hex.substring(8, 12),
+    hex.substring(12, 16),
+    hex.substring(16, 20),
+    hex.substring(20, 32)
+  ].join('-')
+}
+```
+
+**ID Format Conversion**:
+
+| Context | Format | Example | Length |
+|---------|--------|---------|--------|
+| URL (Raw) | 32 hex chars, no dashes | `29d979eeca9f81f7b82fe4b983834212` | 32 |
+| HTML (Formatted) | Standard UUID with dashes | `29d979ee-ca9f-81f7-b82f-e4b983834212` | 36 |
+
+**Integration with Download Handler**:
+
+```javascript
+// In DownloadHandler.handle() after scraping
+const blockExtractor = new BlockIDExtractor()
+const blockMap = blockExtractor.extractBlockIDs(document)
+
+const blockMapper = new BlockIDMapper()
+const saveDir = path.dirname(payload.savePath)
+await blockMapper.saveBlockMap(payload.pageId, saveDir, blockMap)
+```
+
+**Source**: [`src/extraction/BlockIDExtractor.js`](../src/extraction/BlockIDExtractor.js)
+
+---
+
+#### 6.5d `BlockIDMapper.js` - Block ID Mapping Persistence (NEW)
+
+**Runtime Context**: Both Master and Worker (loaded during rewriting)  
+**Design Pattern**: Mapper + Persister  
+**Responsibility**: Save and load block ID mappings for offline link rewriting
+
+**Behavioral Description**:
+
+BlockIDMapper manages the persistence of block ID mappings to `.block-ids.json` files alongside saved HTML. It provides methods to save mappings after downloading, load them before rewriting links, and convert between raw and formatted IDs.
+
+**Persistence Strategy**:
+
+```javascript
+/**
+ * Save block ID mapping to disk
+ * Creates .block-ids.json alongside the HTML file
+ */
+async saveBlockMap(pageId, saveDir, blockMap) {
+  const mapFile = path.join(saveDir, '.block-ids.json')
+  
+  // Convert Map to plain object for JSON serialization
+  const mapObj = blockMap instanceof Map
+    ? Object.fromEntries(blockMap)
+    : blockMap
+  
+  await fs.writeFile(
+    mapFile,
+    JSON.stringify(mapObj, null, 2),
+    { encoding: 'utf-8' }
+  )
+}
+
+/**
+ * Load block ID mapping from disk
+ * Returns empty Map if file doesn't exist
+ */
+async loadBlockMap(saveDir) {
+  try {
+    const mapFile = path.join(saveDir, '.block-ids.json')
+    const content = await fs.readFile(mapFile, 'utf-8')
+    const mapObj = JSON.parse(content)
+    return new Map(Object.entries(mapObj))
+  } catch (error) {
+    // File not found or invalid JSON - return empty map
+    return new Map()
+  }
+}
+
+/**
+ * Get formatted ID for a raw block ID
+ * Uses block map if available, falls back to formatting
+ */
+getFormattedId(rawId, blockMap) {
+  if (!rawId) return ''
+  
+  // Try to find in map first
+  if (blockMap && blockMap.has(rawId)) {
+    return blockMap.get(rawId)
+  }
+  
+  // Fall back to formatting
+  return this._fallbackFormat(rawId)
+}
+
+/**
+ * Pre-load all block maps before link rewriting
+ * Caches block maps for all discovered pages
+ */
+async loadAllBlockMaps(contextMap) {
+  const cache = new Map()
+  
+  for (const [pageId, context] of contextMap) {
+    const saveDir = path.dirname(context.htmlFilePath || '')
+    const blockMap = await this.loadBlockMap(saveDir)
+    cache.set(pageId, blockMap)
+  }
+  
+  return cache
+}
+```
+
+**File Structure**:
+
+```
+output/
+  Root/
+    index.html
+    .block-ids.json          ← Saved by DownloadHandler
+  Child/
+    index.html
+    .block-ids.json          ← Loaded by LinkRewriter
+```
+
+**Example .block-ids.json**:
+
+```json
+{
+  "29d979eeca9f81f7b82fe4b983834212": "29d979ee-ca9f-81f7-b82f-e4b983834212",
+  "12345678123456781234567812345678": "12345678-1234-5678-1234-567812345678"
+}
+```
+
+**Integration with Link Rewriting**:
+
+```javascript
+// Before rewriting all links
+const blockMapCache = await blockMapper.loadAllBlockMaps(contextMap)
+
+// During link rewriting
+const blockMap = blockMapCache.get(targetContext.id)
+const formattedId = blockMapper.getFormattedId(rawId, blockMap)
+newHref = relativePath + '#' + formattedId
+```
+
+**Source**: [`src/processing/BlockIDMapper.js`](../src/processing/BlockIDMapper.js)
 
 ---
 
@@ -4930,7 +5418,18 @@ bus.on('JOB:COMPLETED', ({ pageTitle }) => {
 
 ## 11. Conclusion
 
-The **Reactive Event-Driven Micro-Kernel Architecture** with **Multi-Transport Logging and Real-Time Dashboard** represents a complete transformation of the scraper from a monolithic sequential script into a robust, observable, and user-friendly distributed system. Recent refactoring has further strengthened reliability through pipeline-based execution, absolute path enforcement, and comprehensive UI integration.
+The **Reactive Event-Driven Micro-Kernel Architecture** with **Multi-Transport Logging and Real-Time Dashboard** represents a complete transformation of the scraper from a monolithic sequential script into a robust, observable, and user-friendly distributed system. Recent refactoring has further strengthened reliability through pipeline-based execution, absolute path enforcement, comprehensive UI integration, and intelligent link processing improvements.
+
+**Latest Enhancements (v2.3 - Link Processing Improvements)**:
+
+1. **Edge Classification**: New `EdgeClassifier` component classifies page relationships as FORWARD (deeper) or BACK (same/shallower) during discovery
+2. **Page Graph Architecture**: `PageGraph` maintains discovered hierarchy with edge metadata for context-aware operations and future optimizations
+3. **Block ID Extraction**: `BlockIDExtractor` maps raw block IDs from URLs to formatted UUIDs for proper section-level link anchoring
+4. **Block ID Mapping**: `BlockIDMapper` persists block ID mappings in `.block-ids.json` for offline link rewriting accuracy
+5. **Enhanced LinkExtractor**: Preserves block IDs from URL fragments during discovery for later anchor rewriting
+6. **Enhanced LinkRewriter**: Rewrites links with proper formatted block anchors using pre-loaded block maps
+7. **Enhanced DownloadHandler**: Extracts and saves block ID maps after page scraping for later use
+8. **Enhanced GlobalQueueManager**: Builds PageGraph with edge classifications during discovery phase
 
 **Key Achievements**:
 - Process Isolation: Master/Worker separation prevents cascading failures
@@ -4981,11 +5480,12 @@ This architecture provides a solid foundation for future enhancements including 
 
 ---
 
-**Document Version**: 2.2 (Multi-Transport Logging + Terminal Dashboard)  
-**Last Updated**: November 2024  
+**Document Version**: 2.3 (Link Processing Improvements - Edge Classification, Page Graph, Block ID Handling)  
+**Last Updated**: November 2025  
 **Related Documents**:
 - [`REFACTORING_PLAN.md`](REFACTORING_PLAN.md) - Original transformation roadmap
 - [`Advanced_Improvements.md`](Advanced_Improvements.md) - Detailed implementation notes
 - [`ROADMAP.md`](ROADMAP.md) - Future enhancement plan
 - [`CLUSTER_MODE.md`](CLUSTER_MODE.md) - Cluster deployment guide
 - [`plan-ImprovedLoggingAndUi.prompt.md`](../.github/prompts/plan-ImprovedLoggingAndUi.prompt.md) - Logging & UI implementation plan
+- [`plan-LinkImprovements.prompt.md`](../.github/prompts/plan-LinkImprovements.prompt.md) - Link processing improvements specification

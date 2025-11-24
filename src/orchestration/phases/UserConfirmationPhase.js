@@ -80,7 +80,7 @@ class UserConfirmationPhase extends PhaseStrategy {
 
     rootContext.children.forEach((child, index) => {
       const isLast = index === rootContext.children.length - 1;
-      this._printTreeNode(child, '   ', isLast, titleRegistry);
+      this._printTreeNode(child, '   ', isLast, titleRegistry, new Set([rootContext.id]));
     });
 
     this.logger.separator();
@@ -93,9 +93,15 @@ class UserConfirmationPhase extends PhaseStrategy {
    * @param {boolean} isLast - Is this the last child?
    * @param {Object} titleRegistry - ID-to-title map
    */
-  _printTreeNode(context, prefix, isLast, titleRegistry) {
+  _printTreeNode(context, prefix, isLast, titleRegistry, pathVisited = new Set()) {
     const connector = isLast ? '└─ ' : '├─ ';
     const title = titleRegistry[context.id] || context.title || 'Untitled';
+
+    if (pathVisited.has(context.id)) {
+      console.log(`${prefix}${connector}${title} ↺ (Cycle)`);
+      return;
+    }
+
     const exploredChildren = context.children.filter(child => titleRegistry[child.id]);
     const internalRefs = context.children.length - exploredChildren.length;
     const label = internalRefs > 0 ? `${title} [${internalRefs} internal ref${internalRefs > 1 ? 's' : ''}]` : title;
@@ -103,9 +109,11 @@ class UserConfirmationPhase extends PhaseStrategy {
     console.log(`${prefix}${connector}${label}`);
 
     const childPrefix = prefix + (isLast ? '   ' : '│  ');
+    const nextVisited = new Set(pathVisited);
+    nextVisited.add(context.id);
     exploredChildren.forEach((child, index) => {
       const childIsLast = index === exploredChildren.length - 1;
-      this._printTreeNode(child, childPrefix, childIsLast, titleRegistry);
+      this._printTreeNode(child, childPrefix, childIsLast, titleRegistry, nextVisited);
     });
   }
 }

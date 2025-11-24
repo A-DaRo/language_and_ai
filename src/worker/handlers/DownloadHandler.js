@@ -18,8 +18,11 @@ const ContentExpander = require('../../processing/ContentExpander');
 const AssetDownloader = require('../../download/AssetDownloader');
 const CssDownloader = require('../../download/CssDownloader');
 const FileDownloader = require('../../download/FileDownloader');
+const BlockIDExtractor = require('../../extraction/BlockIDExtractor');
+const BlockIDMapper = require('../../processing/BlockIDMapper');
 
 const path = require('path');
+const { JSDOM } = require('jsdom');
 
 /**
  * @class DownloadHandler
@@ -45,6 +48,10 @@ class DownloadHandler {
     this.cssDownloader = new CssDownloader(this.config, this.logger);
     this.fileDownloader = new FileDownloader(this.config, this.logger);
     this.fileSystem = new WorkerFileSystem(this.logger);
+
+    // Block ID extraction and mapping
+    this.blockIDExtractor = new BlockIDExtractor();
+    this.blockIDMapper = new BlockIDMapper();
   }
 
   /**
@@ -105,6 +112,9 @@ class DownloadHandler {
     try {
       await pipeline.execute(pipelineContext);
 
+      // NEW: Extract block IDs from saved HTML
+      await this._extractAndSaveBlockIds(payload);
+
       this.logger.success('DOWNLOAD', `Completed: ${displayTitle}`);
 
       return {
@@ -113,12 +123,40 @@ class DownloadHandler {
         url: payload.url,
         savedPath: payload.savePath,
         assetsDownloaded: pipelineContext.stats.assetsDownloaded,
-        linksRewritten: pipelineContext.stats.linksRewritten
+        linksRewritten: pipelineContext.stats.linksRewritten,
+        blockMapSaved: true
       };
 
     } catch (error) {
       this.logger.error('DOWNLOAD', `Failed: ${displayTitle}`, error);
       throw error;
+    }
+  }
+
+  /**
+   * Extract block IDs from saved HTML and save mapping
+   * @private
+   * @param {Object} payload - Download payload
+   */
+  async _extractAndSaveBlockIds(payload) {
+    try {
+      const fs = require('fs/promises');
+      const htmlContent = await fs.readFile(payload.savePath, 'utf-8');
+      const dom = new JSDOM(htmlContent);
+      const document = dom.window.document;
+
+      // Extract block IDs from HTML
+      const blockMap = this.blockIDExtractor.extractBlockIDs(document);
+
+      // Save mapping to disk
+      if (blockMap.size > 0) {
+        const saveDir = path.dirname(payload.savePath);
+        await this.blockIDMapper.saveBlockMap(payload.pageId, saveDir, blockMap);
+        this.logger.debug('BLOCK-ID', `Saved ${blockMap.size} block IDs for ${payload.pageId}`);
+      }
+    } catch (error) {
+      // Log but don't fail - block ID extraction is optional
+      this.logger.debug('BLOCK-ID', `Failed to extract block IDs: ${error.message}`);
     }
   }
 

@@ -34,24 +34,32 @@ class FileNameExtractor {
   extractFilename(url, linkText = '', index = 0) {
     try {
       const urlObj = new URL(url);
-      let filename = path.basename(urlObj.pathname);
+      const pathname = urlObj.pathname || '';
+      const pathnameFilename = path.basename(pathname);
+      const pathnameExt = path.extname(pathname);
+      let filename = '';
 
-      // If filename is empty or UUID-like, try link text
-      if (!filename || filename.length < 3 || /^[a-f0-9-]{32,}$/.test(filename)) {
-        if (linkText && linkText.length > 0 && linkText.length < 100) {
-          filename = linkText;
+      if (pathnameExt && pathnameFilename) {
+        filename = pathnameFilename;
+      } else if (linkText && linkText.trim().length > 0 && linkText.length < 100) {
+        filename = linkText;
 
-          // Add extension if missing
-          if (!path.extname(filename)) {
-            const ext = this._guessExtension(url);
-            if (ext) {
-              filename += ext;
-            }
+        if (!path.extname(filename)) {
+          const ext = this._guessExtension(url);
+          if (ext) {
+            filename += ext;
           }
         }
+      } else if (pathnameFilename && pathnameFilename.length >= 3) {
+        filename = pathnameFilename;
       }
 
-      const sanitized = FileSystemUtils.sanitizeFilename(filename || 'downloaded_file');
+      if (!filename) {
+        const ext = this._guessExtension(url) || '';
+        filename = `downloaded_file${ext}`;
+      }
+
+      const sanitized = FileSystemUtils.sanitizeFilename(filename);
       return index > 0 ? `${index}-${sanitized}` : sanitized;
     } catch (error) {
       return index > 0 ? `${index}-downloaded_file` : 'downloaded_file';

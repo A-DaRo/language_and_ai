@@ -38,6 +38,51 @@ const MESSAGE_TYPES = {
 };
 
 /**
+ * Discovery queue lifecycle events emitted on SystemEventBus
+ */
+
+/**
+ * @event DISCOVERY:QUEUE_READY
+ * @description Discovery queue has transitioned from empty to ready with pending work; listeners should wake dispatchers.
+ * @payload {Object} payload - Event payload
+ * @payload {number} payload.queueLength - Number of tasks waiting in the queue
+ * @when Queue length changes from 0 to >0
+ * @listeners DiscoveryPhase, DashboardController
+ */
+
+/**
+ * @event DISCOVERY:QUEUE_EMPTY
+ * @description Discovery queue emptied while tasks are still pending execution (workers busy).
+ * @payload {Object} payload - Event payload
+ * @payload {number} payload.queueLength - Always 0 when emitted
+ * @payload {number} payload.pendingCount - Number of tasks currently executing
+ * @when Queue transitions from >0 to 0 while pending tasks remain
+ * @listeners DiscoveryPhase, DashboardController
+ */
+
+/**
+ * @event DISCOVERY:TASK_COMPLETED
+ * @description Fired when a discovery task completes (success or failure).
+ * @payload {Object} payload - Event payload
+ * @payload {string} payload.pageId - Completed page ID
+ * @payload {boolean} payload.success - Whether discovery succeeded
+ * @payload {number} payload.pendingCount - Pending tasks remaining after this completion
+ * @payload {number} payload.queueLength - Current queue length
+ * @when Worker returns discovery result and queue state updates
+ * @listeners DiscoveryPhase, DashboardController, SystemEventBus logger
+ */
+
+/**
+ * @event DISCOVERY:ALL_IDLE
+ * @description Discovery phase reached a quiescent state: queue empty and no pending tasks.
+ * @payload {Object} payload - Event payload
+ * @payload {number} payload.queueLength - Always 0
+ * @payload {number} payload.pendingCount - Always 0
+ * @when The last pending task completes with an empty queue
+ * @listeners DiscoveryPhase, ClusterOrchestrator, DashboardController
+ */
+
+/**
  * @typedef {Object} InitPayload
  * @description Command payload for Worker initialization. Contains configuration
  * and optionally the title registry for display purposes.

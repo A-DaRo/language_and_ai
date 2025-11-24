@@ -23,7 +23,8 @@ class PageContext {
   constructor(url, rawTitle, depth = 0, parentContext = null, parentId = null) {
     this.id = this._extractNotionId(url);
     this.url = url;
-    this.title = FileSystemUtils.sanitizeFilename(rawTitle || 'Untitled');
+    this.rawTitle = rawTitle || 'Untitled';
+    this.title = FileSystemUtils.sanitizeFilename(this.rawTitle);
     this.depth = depth;
     this.parentContext = parentContext;
     this.parentId = parentId || (parentContext ? parentContext.id : null);
@@ -56,7 +57,30 @@ class PageContext {
    */
   updateTitleFromRegistry(humanReadableTitle) {
     if (!humanReadableTitle) return;
+    this.rawTitle = humanReadableTitle;
     this.title = FileSystemUtils.sanitizeFilename(humanReadableTitle);
+  }
+
+  /**
+   * Get the best display title, preferring registry data and truncating long strings.
+   * @param {Object} [titleRegistry={}] - ID-to-title map for resolved titles
+   * @returns {string} Display-friendly title
+   */
+  getDisplayTitle(titleRegistry = {}) {
+    const registryTitle = titleRegistry[this.id];
+    const fallback = registryTitle || this.rawTitle || this.title || 'Untitled';
+    const normalized = fallback.trim() || 'Untitled';
+
+    if (/^[a-f0-9]{32}$/i.test(normalized)) {
+      return `Page ${normalized.substring(0, 6)}...`;
+    }
+
+    const maxLength = 50;
+    if (normalized.length > maxLength) {
+      return `${normalized.slice(0, maxLength - 3)}...`;
+    }
+
+    return normalized;
   }
 
   /**
@@ -137,6 +161,7 @@ class PageContext {
       id: this.id,
       url: this.url,
       title: this.title,
+      rawTitle: this.rawTitle,
       depth: this.depth,
       parentId: this.parentId,
       section: this.section,
@@ -157,7 +182,7 @@ class PageContext {
   static fromJSON(json, contextMap = null) {
     const context = new PageContext(
       json.url,
-      json.title,
+      json.rawTitle || json.title,
       json.depth || 0,
       null,
       json.parentId
@@ -169,6 +194,8 @@ class PageContext {
     context.childIds = json.childIds || [];
     context.isNestedUnderParent = json.isNestedUnderParent || false;
     context.targetFilePath = json.targetFilePath;
+    context.rawTitle = json.rawTitle || context.rawTitle;
+    context.title = json.title || FileSystemUtils.sanitizeFilename(context.rawTitle);
 
     if (contextMap && json.parentId) {
       context.parentContext = contextMap.get(json.parentId) || null;

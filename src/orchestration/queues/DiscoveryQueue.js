@@ -18,7 +18,7 @@ class DiscoveryQueue {
 
     this.queue = [];
     this.visitedUrls = new Set(); // Public for GlobalQueueManager access
-    this.pendingTasks = 0;
+    this.pendingTaskIds = new Set();
     this.maxDepth = 0;
   }
 
@@ -29,8 +29,7 @@ class DiscoveryQueue {
    * @returns {boolean} True if enqueued, false if already visited
    */
   enqueue(context, isRoot = false) {
-    const rawIdMatch = context.url.match(/29[a-f0-9]{30}/i);
-    const rawPageId = rawIdMatch ? rawIdMatch[0] : null;
+    const rawPageId = this._extractPageId(context.url);
 
     if (!rawPageId || this.visitedUrls.has(rawPageId)) {
       return false;
@@ -43,6 +42,12 @@ class DiscoveryQueue {
     }
 
     this.queue.push({ pageContext: context, isFirstPage: isRoot });
+
+    if (this.queue.length === 1) {
+      this.eventBus.emit('DISCOVERY:QUEUE_READY', {
+        queueLength: this.queue.length
+      });
+    }
 
     this.eventBus.emit('QUEUE:DISCOVERY_ENQUEUED', {
       url: context.url,
@@ -62,24 +67,45 @@ class DiscoveryQueue {
     }
 
     const task = this.queue.shift();
-    this.pendingTasks++;
+    this.pendingTaskIds.add(task.pageContext.id);
+
+    if (this.queue.length === 0 && this.pendingTaskIds.size > 0) {
+      this.eventBus.emit('DISCOVERY:QUEUE_EMPTY', {
+        queueLength: 0,
+        pendingCount: this.pendingTaskIds.size
+      });
+    }
+
     return task;
   }
 
   /**
-   * Marks a discovery task as complete
-   * @param {string} pageId - The page ID
+   * @method markComplete
+   * @description Marks a discovery task as complete and publishes the updated queue state.
+   *              Safe to call multiple times for the same page ID (idempotent).
+   * @param {string} pageId - The page ID to finalize
+   * @emits DISCOVERY:TASK_COMPLETED - Emitted every time a tracked task finishes
+   * @emits DISCOVERY:ALL_IDLE - Emitted when this completion brings the system to quiescent state
+   * @returns {boolean} True if the task was tracked and finalized
+   * @example
+   * queue.markComplete('page-abc123');
    */
   markComplete(pageId) {
-    this.pendingTasks--;
+    return this._finalizeTask(pageId, true);
   }
 
   /**
-   * Marks a discovery task as failed
-   * @param {string} pageId - The page ID
+   * @method markFailed
+   * @description Marks a discovery task as failed and emits the failure event for monitoring.
+   * @param {string} pageId - The page ID that failed
+   * @emits DISCOVERY:TASK_COMPLETED - Emitted with success=false
+   * @emits DISCOVERY:ALL_IDLE - Emitted when pending and queue counts reach zero
+   * @returns {boolean} True if the task was tracked and finalized
+   * @example
+   * queue.markFailed('page-bad123');
    */
   markFailed(pageId) {
-    this.pendingTasks--;
+    return this._finalizeTask(pageId, false);
   }
 
   /**
@@ -87,7 +113,7 @@ class DiscoveryQueue {
    * @returns {boolean} True if queues are empty and no pending tasks
    */
   isComplete() {
-    return this.queue.length === 0 && this.pendingTasks === 0;
+    return this.queue.length === 0 && this.pendingTaskIds.size === 0;
   }
 
   /**
@@ -111,7 +137,7 @@ class DiscoveryQueue {
    * @returns {number} Number of pending tasks
    */
   getPendingCount() {
-    return this.pendingTasks;
+    return this.pendingTaskIds.size;
   }
 
   /**
@@ -128,8 +154,63 @@ class DiscoveryQueue {
   reset() {
     this.queue = [];
     this.visitedUrls.clear();
-    this.pendingTasks = 0;
+    this.pendingTaskIds.clear();
     this.maxDepth = 0;
+  }
+
+  /**
+   * Normalize Notion page id from URL
+   * @private
+   * @param {string} url - Notion URL
+   * @returns {string|null} Normalized id
+   */
+  _extractPageId(url) {
+    const match = url && url.match(/29[a-f0-9]{30}/i);
+    return match ? match[0] : null;
+  }
+
+  /**
+   * Finalize a pending task (success or failure)
+   * @private
+   * @param {string} pageId - Completed page ID
+   * @param {boolean} success - Whether task succeeded
+   * @returns {boolean} True if task was tracked, false otherwise
+   */
+  /**
+   * @method _finalizeTask
+   * @description Handles shared completion logic for success/failure paths.
+   * @private
+   * @param {string} pageId - The page ID that finished
+   * @param {boolean} success - Whether the task succeeded
+   * @returns {boolean} True if the task was tracked and finalized
+   */
+  _finalizeTask(pageId, success) {
+    if (!pageId) {
+      return false;
+    }
+
+    if (!this.pendingTaskIds.has(pageId)) {
+      this.logger.warn('DiscoveryQueue', `Attempted to finalize unknown task: ${pageId}`);
+      return false;
+    }
+
+    this.pendingTaskIds.delete(pageId);
+
+    this.eventBus.emit('DISCOVERY:TASK_COMPLETED', {
+      pageId,
+      success,
+      pendingCount: this.pendingTaskIds.size,
+      queueLength: this.queue.length
+    });
+
+    if (this.isComplete()) {
+      this.eventBus.emit('DISCOVERY:ALL_IDLE', {
+        queueLength: 0,
+        pendingCount: 0
+      });
+    }
+
+    return true;
   }
 }
 

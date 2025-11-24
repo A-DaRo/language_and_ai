@@ -147,12 +147,24 @@ class LinkExtractor {
           linkTitle = rawPageId;
         }
         
+        // Extract block ID if present in URL hash
+        const hashIndex = absoluteUrl.indexOf('#');
+        let blockIdRaw = null;
+        if (hashIndex > -1) {
+          blockIdRaw = absoluteUrl.substring(hashIndex + 1);
+          // Validate it's a raw block ID (32 hex chars)
+          if (!/^[a-f0-9]{32}$/i.test(blockIdRaw)) {
+            blockIdRaw = null;
+          }
+        }
+
         // Return the cleaned absolute URL (preserves slug)
         results.push({
           url: cleanUrl,
           title: linkTitle,
           section: findSection(link),
           subsection: null,
+          blockId: blockIdRaw,
           isInternal: true
         });
       });

@@ -9,6 +9,8 @@
 const DiscoveryQueue = require('./queues/DiscoveryQueue');
 const ExecutionQueue = require('./queues/ExecutionQueue');
 const TitleRegistry = require('./queues/TitleRegistry');
+const PageGraph = require('./PageGraph');
+const EdgeClassifier = require('./analysis/EdgeClassifier');
 const PageContext = require('../domain/PageContext');
 const Logger = require('../core/Logger');
 
@@ -24,6 +26,10 @@ class GlobalQueueManager {
     this.discoveryQueue = new DiscoveryQueue();
     this.executionQueue = new ExecutionQueue();
     this.titleRegistry = new TitleRegistry();
+
+    // Page graph for tracking hierarchy and edge classifications
+    this.pageGraph = new PageGraph();
+    this.edgeClassifier = new EdgeClassifier();
 
     // Context registry
     this.allContexts = new Map();
@@ -57,13 +63,7 @@ class GlobalQueueManager {
    * @returns {Object|null} Next task or null if queue is empty
    */
   nextDiscovery() {
-    const task = this.discoveryQueue.next();
-
-    if (task) {
-      this.discoveryQueue.markComplete(task.pageContext.id);
-    }
-
-    return task;
+    return this.discoveryQueue.next();
   }
 
   /**
@@ -84,38 +84,90 @@ class GlobalQueueManager {
       return [];
     }
 
-    if (resolvedTitle && !this.titleRegistry.has(pageId)) {
+    // Add parent node to page graph
+    this.pageGraph.addNode(pageId, parentContext);
+
+    if (resolvedTitle) {
       this.titleRegistry.register(pageId, resolvedTitle);
       parentContext.updateTitleFromRegistry(resolvedTitle);
     }
 
     const newContexts = [];
+    this.edgeClassifier.setContextMap(this.allContexts);
 
     for (const link of discoveredLinks) {
       if (this.discoveryQueue.visitedUrls.has(link.url)) {
         continue;
       }
 
-      const childContext = new PageContext(
-        link.url,
-        link.text || 'Untitled',
-        parentContext.depth + 1,
-        parentContext,
-        parentContext.id
-      );
+      const childId = this._derivePageId(link.url);
+      let childContext = this.allContexts.get(childId);
+      const isNewContext = !childContext;
 
-      if (link.section) {
-        childContext.setSection(link.section);
-      }
-      if (link.subsection) {
-        childContext.setSubsection(link.subsection);
+      if (isNewContext) {
+        childContext = new PageContext(
+          link.url,
+          link.text || 'Untitled',
+          parentContext.depth + 1,
+          parentContext,
+          parentContext.id
+        );
+
+        if (link.section) {
+          childContext.setSection(link.section);
+        }
+        if (link.subsection) {
+          childContext.setSubsection(link.subsection);
+        }
+
+        this.allContexts.set(childId, childContext);
+        newContexts.push(childContext);
       }
 
+      // Ensure parent-child relation exists even for previously seen contexts
       parentContext.addChild(childContext);
-      newContexts.push(childContext);
+
+      const classification = this.edgeClassifier.classifyEdge(parentContext, childContext);
+      this.pageGraph.addEdge(pageId, childContext.id, classification);
+      this.pageGraph.addNode(childContext.id, childContext);
+
+      this.logger.debug(
+        'EDGE-CLASSIFICATION',
+        `${parentContext.title} -> ${childContext.title}: ${classification.type}`
+      );
     }
 
     return newContexts;
+  }
+
+  /**
+   * Derive a canonical page ID from a Notion URL
+   * @private
+   * @param {string} url - Notion URL to normalize
+   * @returns {string} Extracted page ID or original URL
+   */
+  _derivePageId(url) {
+    try {
+      const { normalizedUrl, normalizedPath } = this._normalizeUrlParts(url);
+      const match = normalizedPath.match(/([a-f0-9]{32})$/i);
+      return match ? match[1] : normalizedUrl;
+    } catch (error) {
+      this.logger.debug('GlobalQueueManager', `Failed to normalize URL for ID: ${url} (${error.message})`);
+      return url;
+    }
+  }
+
+  _normalizeUrlParts(url) {
+    const urlObj = new URL(url);
+    let cleanPath = (urlObj.pathname || '').replace(/\/$/, '');
+    if (!cleanPath) {
+      cleanPath = '/';
+    }
+    const normalizedUrl = `${urlObj.host}${cleanPath}`.toLowerCase();
+    return {
+      normalizedUrl,
+      normalizedPath: cleanPath.toLowerCase()
+    };
   }
 
   /**
@@ -202,6 +254,14 @@ class GlobalQueueManager {
   }
 
   /**
+   * Get page graph built during discovery
+   * @returns {PageGraph} The page graph with all discovered pages and edges
+   */
+  getPageGraph() {
+    return this.pageGraph;
+  }
+
+  /**
    * Get maximum depth discovered
    * @returns {number} Maximum depth (0 if no pages discovered)
    */
@@ -236,6 +296,8 @@ class GlobalQueueManager {
     this.discoveryQueue.reset();
     this.executionQueue.reset();
     this.titleRegistry = new TitleRegistry();
+    this.pageGraph = new PageGraph();
+    this.edgeClassifier = new EdgeClassifier();
     this.allContexts.clear();
     this.stats = { discovered: 0, downloaded: 0, failed: 0 };
   }
