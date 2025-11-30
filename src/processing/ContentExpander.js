@@ -1,17 +1,28 @@
 /**
- * @classdesc Expands toggles, databases, and other collapsible content on Notion pages.
+ * @classdesc Prepares Notion pages for scraping by triggering lazy-loading and closing overlays.
  * 
- * Implements an aggressive expansion strategy using iterative click-and-wait cycles
- * to reveal all hidden content. This is critical for ensuring complete page capture,
- * as Notion heavily uses collapsible UI elements that hide content by default.
+ * **Architecture Change (v2.0)**: Toggle expansion is now handled separately by:
+ * - {@link ToggleStateCapture} - Captures dual-state (collapsed/expanded) content
+ * - {@link ToggleCaptureStep} - Pipeline step that orchestrates capture + injection
+ * - {@link OfflineToggleController} - Runtime JavaScript for offline interactivity
  * 
- * The expansion process includes:
- * - Scrolling to bottom to trigger lazy-loading
- * - Multi-iteration toggle expansion to handle nested content
- * - Smart element detection to avoid clicking destructive actions
+ * This class now focuses solely on:
+ * - Scrolling to bottom to trigger lazy-loaded content
+ * - Closing overlays/modals that might obscure content
  * 
+ * The previous aggressive expansion approach was disabled because:
+ * - It destroyed toggle interactivity (all toggles permanently expanded)
+ * - Risk of clicking destructive actions (delete, share, export)
+ * - Breaking page layout with simultaneous expansions
+ * 
+ * @see ToggleStateCapture
+ * @see ToggleCaptureStep
+ * @see OfflineToggleController
  * @see PageProcessor#scrapePage
  */
+
+const { HtmlFacadeFactory } = require('../html');
+
 class ContentExpander {
   /**
    * @param {Config} config - Configuration object containing scroll and timeout settings.
@@ -23,22 +34,22 @@ class ContentExpander {
   }
   
   /**
-   * @summary Expand all content on the page.
+   * @summary Expand all content on the page (scroll only).
    * 
-   * @description Executes the complete content expansion workflow:
+   * @description Executes the page preparation workflow:
    * 1. Scrolls to page bottom to trigger lazy-loaded content
-   * 2. Iteratively expands all toggles and collapsible elements
+   * 
+   * **Note**: Toggle expansion is now handled by {@link ToggleCaptureStep}
+   * in the scraping pipeline. This method only triggers lazy-loading.
    * 
    * @param {Page} page - Puppeteer page instance.
    * @returns {Promise<void>}
    * 
    * @see _scrollToBottom
-   * @see _expandToggles
+   * @see ToggleCaptureStep
    */
   async expandAll(page) {
     await this._scrollToBottom(page);
-    // Aggressive expansion disabled
-    // await this._expandToggles(page);
   }
   
   /**
@@ -107,137 +118,30 @@ class ContentExpander {
       // Try pressing Escape first (common way to close modals)
       await page.keyboard.press('Escape');
       
+      // Create HtmlFacade for element querying
+      const facade = HtmlFacadeFactory.forPage(page);
+      
       // Check for specific close buttons if Escape didn't work or as backup
-      await page.evaluate(() => {
-        const closeSelectors = [
-          '[role="dialog"] button[aria-label="Close"]',
-          '.notion-overlay-container [role="button"]',
-          '.notion-help-button', // Sometimes help button opens things
-          '[aria-modal="true"] button'
-        ];
-        
-        closeSelectors.forEach(selector => {
-          const el = document.querySelector(selector);
-          if (el) {
-            el.click();
-          }
-        });
-      });
+      const closeSelectors = [
+        '[role="dialog"] button[aria-label="Close"]',
+        '.notion-overlay-container [role="button"]',
+        '.notion-help-button',
+        '[aria-modal="true"] button'
+      ];
+      
+      for (const selector of closeSelectors) {
+        const element = await facade.queryOne(selector);
+        if (element) {
+          // Use click() method on the wrapper element
+          await element.click();
+        }
+      }
       
       // Wait a bit for animations
       await new Promise(resolve => setTimeout(resolve, 500));
     } catch (error) {
       this.logger.debug('CLEANUP', `Error closing overlays: ${error.message}`);
     }
-  }
-
-  /**
-   * @summary Aggressively expand ALL toggles, buttons, tabs, and interactive elements.
-   * 
-   * @description Uses a "click and wait" loop to ensure all hidden content is revealed.
-   * Iterates up to maxIterations (default 2) to handle nested collapsible elements.
-   * 
-   * Selection strategy:
-   * - Targets elements with aria-expanded="false"
-   * - Looks for Notion-specific toggle classes
-   * - Finds generic buttons and expandable elements
-   * - Excludes destructive actions (delete, remove, share)
-   * 
-   * After each iteration, waits for network idle or fixed timeout to allow
-   * content to load.
-   * 
-   * @param {Page} page - Puppeteer page instance.
-   * @returns {Promise<void>}
-   * @private
-   */
-  async _expandToggles(page) {
-    this.logger.info('TOGGLE', 'Starting AGGRESSIVE content expansion...');
-    
-    let totalExpanded = 0;
-    let iteration = 0;
-    const maxIterations = 2; // Prevent infinite loops
-    
-    while (iteration < maxIterations) {
-      iteration++;
-      this.logger.info('TOGGLE', `Expansion iteration ${iteration}/${maxIterations}...`);
-      
-      // Get all potentially expandable elements
-      const result = await page.evaluate((scopeSel) => {
-        const scopeElement = document.querySelector(scopeSel) || document.body;
-        
-        // Find ALL potentially expandable elements
-        const selectors = [
-          '[role="button"][aria-expanded="false"]',  // Collapsed toggles
-          '.notion-toggle-block',                     // Toggle blocks
-          '[data-block-id*="toggle"]',               // Any toggle blocks
-          'div[role="button"]',                       // Generic buttons
-          'button:not([disabled])',                   // All enabled buttons
-          '[class*="expand"]',                        // Elements with "expand" in class
-          '[class*="collapse"]',                      // Elements with "collapse" in class
-          '[onclick]',                                // Elements with click handlers
-        ];
-        
-        const allElements = [];
-        selectors.forEach(sel => {
-          const elements = scopeElement.querySelectorAll(sel);
-          elements.forEach(el => {
-            // Skip if already in list or if hidden
-            if (!allElements.includes(el) && el.offsetParent !== null) {
-              allElements.push(el);
-            }
-          });
-        });
-        
-        // Click all elements
-        let clicked = 0;
-        allElements.forEach(element => {
-          try {
-            // Check if element might be expandable
-            const text = element.textContent.toLowerCase();
-            const ariaExpanded = element.getAttribute('aria-expanded');
-            
-            // Skip elements that are clearly not expandable
-            if (text.includes('delete') || text.includes('remove') || text.includes('share')) {
-              return;
-            }
-            
-            // Click if it looks expandable
-            if (ariaExpanded === 'false' || 
-                text.includes('show') || 
-                text.includes('expand') ||
-                element.classList.contains('notion-toggle-block')) {
-              element.click();
-              clicked++;
-            }
-          } catch (e) {
-            // Silently skip elements that can't be clicked
-          }
-        });
-        
-        return { clicked, totalFound: allElements.length };
-      }, this.config.MAIN_CONTENT_SELECTOR);
-
-      this.logger.info('TOGGLE', `Found ${result.totalFound} interactive elements, clicked ${result.clicked}`);
-      
-      if (result.clicked === 0) {
-        this.logger.success('TOGGLE', 'No more expandable elements found. Content fully expanded.');
-        break;
-      }
-
-      totalExpanded += result.clicked;
-      
-      // Wait for content to load and any network requests to complete
-      await Promise.race([
-        page.waitForNetworkIdle({ timeout: 3000 }).catch(() => {}),
-        new Promise(resolve => setTimeout(resolve, 2000))
-      ]);
-    }
-
-    if (iteration >= maxIterations) {
-      this.logger.warn('TOGGLE', `Reached maximum iterations (${maxIterations}). Some content may still be hidden.`);
-    }
-    
-    this.logger.success('TOGGLE', `Aggressive expansion complete. Total elements expanded: ${totalExpanded}`);
   }
 }
 

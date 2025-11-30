@@ -3,6 +3,19 @@
  * @module domain/PageContext
  * @description Represents the context of a page in the hierarchy.
  * Delegates path calculation to PathCalculator for clean separation.
+ * 
+ * @design PATH RESOLUTION
+ * PageContext provides convenience methods for path operations:
+ * - getRelativePath(): Hierarchy-based path (for filesystem)
+ * - getDirectoryPath(): Full directory path for saving files
+ * - getFilePath(): Full path to index.html
+ * - getRelativePathTo(): Navigation path to another page (delegated to PathCalculator)
+ * 
+ * For more advanced path resolution (same-page anchors, block IDs),
+ * use PathStrategyFactory directly in calling code.
+ * 
+ * @see PathCalculator - Filesystem path calculation
+ * @see PathStrategyFactory - Advanced path resolution with strategies
  */
 
 const FileSystemUtils = require('../utils/FileSystemUtils');

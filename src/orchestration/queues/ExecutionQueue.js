@@ -1,17 +1,29 @@
 /**
- * @fileoverview Download queue manager with dependency tracking
+ * @fileoverview Download queue manager with leaf-first ordering
  * @module orchestration/queues/ExecutionQueue
- * @description Manages download queue with dependency constraints.
+ * @description Manages download queue with dependency constraints using leaf-first ordering.
+ * 
+ * **Ordering Strategy:**
+ * **Leaf-First (Depth Sort)**: Orders by depth descending, processing deepest pages first.
+ * This naturally processes leaf nodes before their parents, allowing hidden file
+ * deduplication across the tree.
  */
 
 const path = require('path');
+const fs = require('fs');
 const SystemEventBus = require('../../core/SystemEventBus');
 const Logger = require('../../core/Logger');
 
 /**
  * @class ExecutionQueue
- * @classdesc Manages download queue respecting parent-child dependencies.
- * Ensures parents are downloaded only after their children (bottom-up).
+ * @classdesc Manages download queue with leaf-first ordering to prevent worker deadlock.
+ * 
+ * **Deadlock Prevention Strategy:**
+ * By processing leaf pages first (those with no children), hidden files are discovered
+ * and registered globally before their parent pages are processed. This enables:
+ * 1. Natural deduplication of hidden files across the page tree
+ * 2. Shorter worker blocking times (leaf pages typically have fewer hidden elements)
+ * 3. Better worker pool utilization through progressive task completion
  */
 class ExecutionQueue {
   constructor() {
@@ -24,34 +36,52 @@ class ExecutionQueue {
   }
 
   /**
-   * Constructs the queue from the canonical page list
-   * @param {Array<PageContext>} contexts - The list of pages to download
-   * @param {Map} dependencyGraph - Parent-child relationships (unused but accepted)
+   * Build queue with leaf-first (depth descending) ordering.
+   * 
+   * @description Sorts contexts by depth descending so that deepest pages (leaves)
+   * are processed first. For pages at the same depth, those with fewer children
+   * are prioritized to complete faster.
+   * 
+   * **Algorithm:** O(n log n) sort by depth
+   * 
+   * @param {Array<PageContext>} contexts - Discovered pages to download
+   * @param {PageGraph} [pageGraph=null] - Optional page graph for edge metadata (unused)
    */
-  build(contexts, dependencyGraph = null) {
+  build(contexts, pageGraph = null) {
     this.queue = [];
     this.pendingDownloads.clear();
     this.completedDownloads.clear();
-
-    for (const context of contexts) {
+    
+    // Sort by depth descending (deepest/leaves first)
+    const sortedContexts = [...contexts].sort((a, b) => {
+      // Primary: depth descending (leaves first)
+      if (b.depth !== a.depth) {
+        return b.depth - a.depth;
+      }
+      // Secondary: pages with fewer children first (faster completion)
+      return (a.children?.length || 0) - (b.children?.length || 0);
+    });
+    
+    for (const context of sortedContexts) {
       this.queue.push(context);
       this.pendingDownloads.set(context.id, {
         context: context,
-        childrenCount: context.children.length,
+        childrenCount: context.children?.length || 0,
         completedChildren: 0
       });
     }
-
+    
     this.eventBus.emit('QUEUE:DOWNLOAD_READY', {
-      count: this.queue.length
+      count: this.queue.length,
+      strategy: 'leaf-first'
     });
-
-    this.logger.debug('ExecutionQueue', `Loaded ${this.queue.length} page(s) for download`);
+    
+    this.logger.info('ExecutionQueue', `Built queue with leaf-first ordering: ${this.queue.length} page(s)`);
   }
 
   /**
    * Retrieves the next ready download task
-   * @description Returns pages whose children have all been processed
+   * @description Returns pages from the queue in the pre-computed order
    * @param {string} outputDir - Root output directory (absolute)
    * @returns {Object|null} The task payload with { context, savePath }
    */

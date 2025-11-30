@@ -3,7 +3,11 @@
  * @module extraction/BlockIDExtractor
  * @description Extracts block IDs from downloaded page HTML.
  * Maps raw block IDs (URL format) to formatted IDs (HTML format).
+ * 
+ * Uses HtmlFacade for DOM operations to support both browser and server contexts.
  */
+
+const { JsdomHtmlFacade } = require('../html');
 
 /**
  * @class BlockIDExtractor
@@ -15,7 +19,57 @@
  */
 class BlockIDExtractor {
   /**
-   * Extract block ID mapping from saved HTML
+   * Extract block ID mapping from saved HTML file
+   * @param {string} htmlFilePath - Path to the HTML file
+   * @returns {Promise<Map<string, string>>} raw block ID → formatted block ID
+   */
+  async extractBlockIDsFromFile(htmlFilePath) {
+    const facade = JsdomHtmlFacade.fromFile(htmlFilePath);
+    return this._extractBlockIDs(facade);
+  }
+
+  /**
+   * Extract block ID mapping from HTML string
+   * @param {string} htmlContent - HTML content string
+   * @returns {Promise<Map<string, string>>} raw block ID → formatted block ID
+   */
+  async extractBlockIDsFromHtml(htmlContent) {
+    const facade = JsdomHtmlFacade.fromHtml(htmlContent);
+    return this._extractBlockIDs(facade);
+  }
+
+  /**
+   * Extract block ID mapping from HtmlFacade
+   * @param {HtmlFacade} facade - HtmlFacade instance
+   * @returns {Promise<Map<string, string>>} raw block ID → formatted block ID
+   * @private
+   */
+  async _extractBlockIDs(facade) {
+    const blockMap = new Map();
+
+    try {
+      const blocks = await facade.query('[data-block-id]');
+      
+      for (const block of blocks) {
+        const formattedId = await facade.getAttribute(block, 'data-block-id');
+        
+        if (formattedId) {
+          // Convert formatted UUID to raw hex for mapping
+          const rawId = this._formatToRaw(formattedId);
+          blockMap.set(rawId, formattedId);
+        }
+      }
+    } catch (error) {
+      // If query fails, return empty map
+      return new Map();
+    }
+
+    return blockMap;
+  }
+
+  /**
+   * Extract block ID mapping from saved HTML (legacy synchronous method)
+   * @deprecated Use extractBlockIDsFromFile or extractBlockIDsFromHtml instead
    * @param {Document|JSDOM.window.document} document - Parsed HTML DOM
    * @returns {Map<string, string>} raw block ID → formatted block ID
    */

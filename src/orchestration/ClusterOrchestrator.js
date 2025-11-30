@@ -93,7 +93,17 @@ class ClusterOrchestrator {
       await discoveryPhase.execute(maxDepth);
 
       if (dryRun) {
-        this.logger.info('ORCHESTRATOR', 'Dry run mode: skipping download phases');
+        this.logger.info('ORCHESTRATOR', 'Dry run mode: building download queue');
+        
+        // Phase 4 (skipped): Conflict Resolution would canonicalize contexts,
+        // but for dry-run we use discovered contexts directly for queue analysis
+        const allContexts = this.queueManager.getAllContexts();
+        
+        // Build download queue with leaf-first ordering
+        this.queueManager.buildDownloadQueue(allContexts);
+        
+        this.logger.success('ORCHESTRATOR', 'Dry run complete: execution queue built');
+        
         const completionPhase = new CompletionPhase(this);
         return await completionPhase.execute(true);
       }

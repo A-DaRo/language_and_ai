@@ -1,17 +1,61 @@
 /**
  * @fileoverview Renderer for the Multi-Bar Terminal Dashboard
  * @module ui/TerminalDashboard
+ * 
+ * @design DASHBOARD CONSISTENCY
+ * This component ensures consistent, clean terminal output:
+ * 1. All dynamic text fields are truncated to prevent layout breakage
+ * 2. Output goes through process.stdout (never console.log)
+ * 3. ANSI escape codes used for formatting
+ * 4. Worker status lines are fixed-width for stable layout
  */
 
 const cliProgress = require('cli-progress');
+
+/**
+ * Truncate a string to a maximum length with ellipsis.
+ * 
+ * @param {string} str - String to truncate
+ * @param {number} maxLength - Maximum length including ellipsis
+ * @returns {string} Truncated string with '...' if needed
+ * 
+ * @example
+ * truncate('Hello World', 8); // 'Hello...'
+ * truncate('Short', 10); // 'Short'
+ */
+function truncate(str, maxLength) {
+  if (!str || typeof str !== 'string') return '';
+  if (str.length <= maxLength) return str;
+  if (maxLength <= 3) return str.substring(0, maxLength);
+  return str.substring(0, maxLength - 3) + '...';
+}
 
 /**
  * @class TerminalDashboard
  * @description Encapsulates the rendering logic for the terminal UI. It is a "dumb"
  * component that receives data and updates its visual state. It does not contain
  * any application logic.
+ * 
+ * @design Features for consistent display:
+ * - Text truncation on all dynamic fields (URLs, titles, status)
+ * - Fixed-width columns for stable layout
+ * - No console.log usage (uses process.stdout)
+ * - Graceful handling of long Unicode strings
  */
 class TerminalDashboard {
+  /**
+   * Maximum display lengths for various fields.
+   * @private
+   * @type {Object}
+   */
+  static DISPLAY_LIMITS = {
+    TITLE: 50,
+    URL: 60,
+    STATUS: 40,
+    WORKER_LABEL: 70,
+    FOOTER: 80
+  };
+
   /**
    * @constructor
    * @param {number} workerCount - The number of worker slots to create.
@@ -77,7 +121,8 @@ class TerminalDashboard {
    * @param {string} title - The main title to display.
    */
   updateHeader(title) {
-    this.header.update(1, { label: title });
+    const safeTitle = truncate(title, TerminalDashboard.DISPLAY_LIMITS.TITLE);
+    this.header.update(1, { label: safeTitle });
   }
 
   /**
@@ -114,22 +159,26 @@ class TerminalDashboard {
 
   /**
    * @method updateWorkerStatus
+   * @summary Update a worker's status display with automatic truncation.
    * @param {number} slotIndex - The visual slot for the worker.
    * @param {string} statusText - The text to display.
    */
   updateWorkerStatus(slotIndex, statusText) {
     const bar = this.workerBars.get(slotIndex);
     if (bar) {
-      bar.update(1, { label: statusText });
+      const safeStatus = truncate(statusText, TerminalDashboard.DISPLAY_LIMITS.WORKER_LABEL);
+      bar.update(1, { label: safeStatus });
     }
   }
 
   /**
    * @method updateFooter
+   * @summary Update the footer/ticker with automatic truncation.
    * @param {string} text - The text for the log ticker.
    */
   updateFooter(text) {
-    this.footer.update(1, { label: text });
+    const safeText = truncate(text, TerminalDashboard.DISPLAY_LIMITS.FOOTER);
+    this.footer.update(1, { label: safeText });
   }
 
   /**
@@ -140,5 +189,11 @@ class TerminalDashboard {
     this.multibar.stop();
   }
 }
+
+/**
+ * Truncate utility exported for use by other components.
+ * @type {function}
+ */
+TerminalDashboard.truncate = truncate;
 
 module.exports = TerminalDashboard;

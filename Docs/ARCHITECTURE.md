@@ -118,15 +118,16 @@ The application is divided into the following packages, organized by runtime con
 
 *   **`src/core`**: Fundamental infrastructure (Configuration, Logging, Event Bus, Protocol Definitions)
     *   **`src/core/logger`**: Logging strategy implementations (Console, File, Dashboard, IPC)
-*   **`src/cluster`**: Worker process lifecycle management (Initialization, Proxy, Pool Management)
+*   **`src/cluster`**: Worker process lifecycle management (Initialization, Proxy, Pool Management with Elasticity)
     *   **`src/cluster/proxy`**: WorkerProxy component decomposition (StateManager, MessageHandler, LifecycleManager)
-*   **`src/orchestration`**: High-level workflow coordination and state machines
+*   **`src/orchestration`**: High-level workflow coordination, state machines, and deadlock prevention
     *   **`src/orchestration/phases`**: Phase Strategy pattern implementations (6 concrete phases: Bootstrap, Discovery, UserConfirmation, ConflictResolution, Download, Completion)
-    *   **`src/orchestration/queues`**: Queue component separation (TitleRegistry, DiscoveryQueue, ExecutionQueue)
+    *   **`src/orchestration/queues`**: Queue component separation (TitleRegistry, DiscoveryQueue, ExecutionQueue with leaf-first ordering)
     *   **`src/orchestration/analysis`**: Graph analysis and conflict resolution
+    *   **`src/orchestration/GlobalHiddenFileRegistry.js`**: Cross-page hidden file deduplication registry
 *   **`src/ui`**: Terminal dashboard components for real-time monitoring
 *   **`src/domain`**: Serializable domain entities (PageContext)
-    *   **`src/domain/path`**: Path calculation strategy (PathCalculator)
+    *   **`src/domain/path`**: Path resolution strategies (PathStrategy, IntraPathStrategy, InterPathStrategy, ExternalPathStrategy, PathStrategyFactory, PathCalculator)
 *   **`src/utils`**: Shared utility functions (FileSystem, Integrity, UserPrompt)
 
 #### Worker Process Packages
@@ -136,11 +137,15 @@ The application is divided into the following packages, organized by runtime con
     *   **`src/worker/io`**: File system abstraction and I/O safety
     *   **`src/worker/pipeline`**: Scraping pipeline orchestration and step implementations
 *   **`src/scraping`**: Puppeteer interaction for page navigation and saving
-*   **`src/processing`**: Content manipulation (expansion, cookies, link rewriting)
+*   **`src/processing`**: Content manipulation (toggle capture, cookies, link rewriting)
+    *   **`src/processing/ToggleStateCapture.js`**: Dual-state toggle content capture for offline interactivity
+    *   **`src/processing/OfflineToggleController.js`**: JavaScript generator for offline toggle functionality
 *   **`src/extraction`**: Data extraction from DOM (Links)
 *   **`src/download`**: Resource downloading (Assets, CSS, Files)
     *   **`src/download/css`**: Specialized CSS processing components (PuppeteerCssStrategy, JsdomCssStrategy)
     *   **`src/download/file`**: File downloader component decomposition (FileTypeDetector, FileDownloadStrategy, FileNameExtractor)
+*   **`src/html`**: Unified HTML DOM manipulation facade (Context-agnostic interface)
+    *   **`src/html/elements`**: Element wrappers (PuppeteerHtmlElement, JsdomHtmlElement)
 
 #### Shared Packages
 
@@ -200,12 +205,21 @@ The application is divided into the following packages, organized by runtime con
 │  ┌─────────────▼────────┐  ┌─────────▼──────────┐            │ │
 │  │   PageProcessor      │  │  LinkRewriter      │            │ │
 │  │   [Scraping Logic]   │  │  [Offline Links]   │            │ │
-│  └──────────┬───────────┘  └────────────────────┘            │ │
-│             │                                                 │ │
-│  ┌──────────▼──────────┐  ┌────────────────────┐            │ │
-│  │  AssetDownloader    │  │  CssDownloader     │            │ │
-│  │  [Images/Files]     │  │  [Stylesheets]     │            │ │
-│  └─────────────────────┘  └────────────────────┘            │ │
+│  └──────────┬───────────┘  └─────────┬──────────┘            │ │
+│             │                        │                        │ │
+│  ┌──────────▼──────────┐  ┌──────────▼─────────┐            │ │
+│  │  AssetDownloader    │  │  HtmlFacadeFactory │            │ │
+│  │  [Images/Files]     │  │  [DOM Abstraction] │            │ │
+│  └─────────────────────┘  └──────────┬─────────┘            │ │
+│                                      │                        │ │
+│  ┌────────────────────┐   ┌──────────┴───────────┐          │ │
+│  │  CssDownloader     │   │                      │          │ │
+│  │  [Stylesheets]     │   ▼                      ▼          │ │
+│  └────────────────────┘  ┌────────────┐  ┌───────────────┐  │ │
+│                          │Puppeteer   │  │JSDOM          │  │ │
+│                          │HtmlFacade  │  │HtmlFacade     │  │ │
+│                          │[Browser]   │  │[Server]       │  │ │
+│                          └────────────┘  └───────────────┘  │ │
 │                                                                 │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -420,6 +434,167 @@ async _executeDownload(payload) {
 - Workers remain stateless (cache is ephemeral, not persisted)
 - Separation of concerns preserved (workers cache read-only data)
 - No synchronization issues (registry is append-only during scraping)
+
+---
+
+## Toggle Capture Architecture
+
+### Overview
+
+The system employs a **dual-state capture strategy** for Notion toggle elements, enabling both complete content capture AND offline interactivity. This solves the fundamental tradeoff between aggressive expansion (which destroys interactivity) and passive preservation (which loses hidden content).
+
+### The Problem
+
+Notion pages frequently use toggle elements to hide content by default. Previous approaches had critical limitations:
+
+| Approach | Content Captured | Interactivity | Offline Behavior |
+|----------|-----------------|---------------|------------------|
+| Expand All (Aggressive) | ✅ Complete | ❌ Destroyed | Static expanded view |
+| Expand None (Passive) | ❌ Partial | ✅ Preserved | Non-functional toggles |
+| **Dual-State Capture** | ✅ Complete | ✅ Preserved | Interactive toggles |
+
+### Architecture Components
+
+The toggle capture system consists of three coordinated components:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                   SCRAPING PIPELINE                              │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  1. NavigationStep    ─────►  Navigate to page                   │
+│  2. CookieConsentStep ─────►  Handle cookie dialogs              │
+│  3. ExpansionStep     ─────►  Scroll for lazy-loading            │
+│  4. ToggleCaptureStep ─────►  Capture + Inject (NEW)             │
+│  5. AssetDownloadStep ─────►  Download images/CSS/files          │
+│  6. LinkRewriterStep  ─────►  Rewrite URLs for offline           │
+│  7. HtmlWriteStep     ─────►  Save final HTML                    │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                   TOGGLE CAPTURE STEP (Step 4)                   │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌─────────────────────┐    ┌──────────────────────────────┐    │
+│  │  ToggleStateCapture │───►│  For each toggle element:    │    │
+│  │  (src/processing/)  │    │  1. Record collapsed HTML    │    │
+│  └─────────────────────┘    │  2. Click to expand          │    │
+│            │                │  3. Record expanded HTML     │    │
+│            │                │  4. Click to restore         │    │
+│            ▼                │  5. Generate state map       │    │
+│  ┌─────────────────────┐    └──────────────────────────────┘    │
+│  │OfflineToggleController│                                       │
+│  │  (src/processing/)  │───►  Generate + Inject JavaScript      │
+│  └─────────────────────┘                                         │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Component Responsibilities
+
+#### 1. ToggleStateCapture (`src/processing/ToggleStateCapture.js`)
+
+Captures both collapsed and expanded states of each toggle element:
+
+```javascript
+/**
+ * @typedef {Object} ToggleState
+ * @property {string} toggleId - Unique identifier (data-block-id)
+ * @property {string} collapsedHtml - HTML when aria-expanded="false"
+ * @property {string} expandedHtml - HTML when aria-expanded="true"
+ * @property {string} triggerSelector - CSS selector for click target
+ */
+```
+
+**Key Features**:
+- Uses HtmlFacade abstraction for DOM operations
+- Skips potentially destructive elements (delete, share, export)
+- Restores original toggle state after capture
+- Configurable animation wait time and max toggles
+
+#### 2. OfflineToggleController (`src/processing/OfflineToggleController.js`)
+
+Generates self-contained JavaScript for offline interactivity:
+
+- Initializes toggles with captured state data
+- Handles click events to toggle between states
+- Animates icon rotation (rotateZ transformation)
+- Updates ARIA attributes for accessibility
+- Works entirely offline without external dependencies
+
+#### 3. ToggleCaptureStep (`src/worker/pipeline/steps/ToggleCaptureStep.js`)
+
+Pipeline step that orchestrates capture and injection:
+
+- Instantiates ToggleStateCapture for the current page
+- Stores captured states in pipeline context
+- Injects OfflineToggleController script into page
+- Reports statistics (togglesCaptured, togglesFailed)
+
+### Capture Algorithm
+
+```
+For each toggle element [role="button"][aria-expanded]:
+    1. Skip if text contains destructive patterns (delete, share, export)
+    2. Get unique ID from data-block-id or generate one
+    3. Check current state (aria-expanded attribute)
+    4. Capture current state HTML (content container)
+    5. Click toggle → Wait for animation (300ms)
+    6. Capture opposite state HTML
+    7. Click toggle → Restore original state
+    8. Store: { toggleId, collapsedHtml, expandedHtml, triggerSelector }
+```
+
+### Integration with HtmlFacade
+
+The toggle capture system uses the HtmlFacade abstraction for all DOM operations:
+
+```javascript
+// Create facade for Puppeteer page
+const facade = HtmlFacadeFactory.forPage(page);
+
+// Query toggle elements
+const toggles = await facade.query('[role="button"][aria-expanded]');
+
+// Get/set attributes
+const isExpanded = await facade.getAttribute(toggle, 'aria-expanded');
+```
+
+This abstraction ensures:
+- Consistent DOM operations across browser and server contexts
+- Testability via mock facades
+- Separation of DOM logic from capture orchestration
+
+### Runtime Behavior
+
+When the offline HTML is loaded in a browser:
+
+1. `DOMContentLoaded` triggers controller initialization
+2. Controller iterates through TOGGLE_STATES object
+3. For each toggle:
+   - Finds trigger element by selector
+   - Attaches click handler
+   - Sets initial content (collapsed)
+4. On click:
+   - Toggles aria-expanded attribute
+   - Swaps content HTML (collapsed ↔ expanded)
+   - Animates icon rotation
+5. Keyboard support: Enter/Space triggers toggle
+
+### Performance Considerations
+
+- **Capture Time**: ~300ms per toggle (animation wait)
+- **Max Toggles**: Configurable limit (default 100) prevents runaway
+- **Script Size**: ~4KB unminified, ~2KB minified
+- **Memory**: Toggle states stored in single serialized object
+
+### Error Handling
+
+- Failed toggle captures logged but don't halt pipeline
+- Missing toggles at runtime logged to console
+- Graceful degradation: toggles remain static if controller fails
 
 ---
 
@@ -1260,21 +1435,22 @@ export function deserializeError(serialized)
 
 The domain package defines the core data structures that represent the scraped content. These objects must be JSON-serializable to cross IPC boundaries.
 
-#### 2.1 `PageContext.js` (REFACTORED - Path Calculation Delegation)
+#### 2.1 `PageContext.js` (REFACTORED - Path Strategy Pattern)
 
 **Runtime Context**: Both Master and Worker  
-**Design Pattern**: Data Transfer Object + Delegation to PathCalculator  
+**Design Pattern**: Data Transfer Object + Delegation to PathStrategyFactory  
 **Serialization**: JSON-compatible (no circular references)
 
 **Class Description**:
-Represents a single Notion page within the hierarchical structure. It is the **Single Source of Truth** for page relationships and metadata. The master-side `GlobalQueueManager` enforces canonical instances via `allContexts`, and any TitleRegistry update immediately flows into the `PageContext.title`, ensuring the human-readable title stays in sync with the registry. The class now delegates all path calculations to a specialized `PathCalculator` component, improving separation of concerns and testability.
+Represents a single Notion page within the hierarchical structure. It is the **Single Source of Truth** for page relationships and metadata. The master-side `GlobalQueueManager` enforces canonical instances via `allContexts`, and any TitleRegistry update immediately flows into the `PageContext.title`, ensuring the human-readable title stays in sync with the registry. The class delegates path calculations to a specialized `PathCalculator` component for filesystem operations, while advanced link resolution (same-page anchors, cross-page navigation) uses the **PathStrategyFactory** with the **Strategy Pattern**.
 
 **Refactoring Overview**:
 
-PageContext was reduced from 260 lines to 184 lines (29% reduction) by delegating path calculation logic to `PathCalculator.js`:
+PageContext was reduced from 260 lines to 184 lines (29% reduction) by delegating path calculation logic to `PathCalculator.js`. Further refinement introduced the **Path Strategy Pattern** for link resolution:
 
 - **Before**: PageContext mixed domain properties with 7 path calculation methods
-- **After**: PageContext focuses on domain (page ID, title, hierarchy); PathCalculator handles all path operations
+- **After**: PageContext focuses on domain (page ID, title, hierarchy); PathCalculator handles filesystem paths
+- **Current**: LinkRewriter uses PathStrategyFactory for intelligent link resolution (IntraPathStrategy for same-page anchors, InterPathStrategy for cross-page navigation)
 
 **Constructor Signature**:
 ```javascript
@@ -1382,25 +1558,157 @@ getFilePath(baseDir)
  * @param {PageContext} targetContext - Target page context
  * @returns {string} Relative path (e.g., "../../Other/Page/index.html")
  * @note Delegates to: pathCalculator.calculateRelativePathBetween(this, targetContext)
+ * @note For advanced link resolution with block IDs, use PathStrategyFactory directly
  * @used-for Link rewriting to convert absolute URLs to relative filesystem paths
  */
 getRelativePathTo(targetContext)
 ```
 
-**PathCalculator Component** (`src/domain/path/PathCalculator.js` - 105 lines):
+**Path Strategy Pattern** (`src/domain/path/` - Strategy Pattern Implementation):
 
-The `PathCalculator` encapsulates all path calculation logic:
+The path module implements the **Strategy Pattern** for intelligent link resolution. This separates concerns between filesystem path calculation (PathCalculator) and link resolution with anchors (PathStrategyFactory).
+
+**Class Hierarchy**:
+```
+┌──────────────────────────────────────────────────────────────┐
+│                    «interface»                               │
+│                    PathStrategy                              │
+├──────────────────────────────────────────────────────────────┤
+│ + resolve(source, target, options): string                   │
+│ + supports(source, target): boolean                          │
+│ + getType(): PathType                                        │
+│ + getName(): string                                          │
+└──────────────────────────────────────────────────────────────┘
+                              △
+                              │
+          ┌───────────────────┼───────────────────┐
+          │                   │                   │
+┌─────────┴─────────┐ ┌───────┴───────┐ ┌────────┴────────┐
+│  IntraPathStrategy│ │InterPathStrategy│ │ExternalPathStrategy│
+│  [Same-page]      │ │ [Cross-page]  │ │ [External URLs] │
+└───────────────────┘ └───────────────┘ └─────────────────┘
+```
+
+**Strategy Implementations**:
+
+1. **IntraPathStrategy** (`IntraPathStrategy.js`):
+   - Handles same-page anchor links (source.id === target.id)
+   - Returns formatted anchor hash (e.g., `#29d979ee-ca9f-4abc-...`)
+   - Uses BlockIDMapper for consistent ID formatting
+
+2. **InterPathStrategy** (`InterPathStrategy.js`):
+   - Handles cross-page navigation (source.id !== target.id)
+   - Computes relative filesystem paths using parent chain traversal
+   - Appends optional anchor hash for block ID targets
+
+3. **ExternalPathStrategy** (`ExternalPathStrategy.js`):
+   - Handles external URLs (null targetContext)
+   - Passes through original URL unchanged
+
+**PathStrategyFactory** (`PathStrategyFactory.js`):
+```javascript
+class PathStrategyFactory {
+  constructor(config, logger) {
+    this.strategies = [];
+    // Register strategies in priority order (first match wins)
+    this.registerStrategy(new IntraPathStrategy(blockIdMapper));
+    this.registerStrategy(new InterPathStrategy(blockIdMapper));
+    this.registerStrategy(new ExternalPathStrategy());
+  }
+  
+  // Main entry point for path resolution
+  resolvePath(sourceContext, targetContext, options = {}) {
+    const strategy = this.findStrategy(sourceContext, targetContext);
+    return strategy?.resolve(sourceContext, targetContext, options);
+  }
+  
+  // Determine path type without full resolution
+  getPathType(sourceContext, targetContext) {
+    const strategy = this.findStrategy(sourceContext, targetContext);
+    return strategy ? strategy.getType() : 'unknown';
+  }
+}
+```
+
+**Integration with LinkRewriter**:
+```javascript
+// LinkRewriter now uses PathStrategyFactory for unified resolution
+class LinkRewriter {
+  constructor(config, logger, cssDownloader, pathStrategyFactory = null) {
+    this.pathStrategyFactory = pathStrategyFactory || new PathStrategyFactory(config, logger);
+  }
+  
+  async rewriteLinksInFile(pageContext, urlToContextMap, pageGraph, blockMapCache) {
+    for (const link of links) {
+      // Single unified call replaces complex if/else logic
+      const newHref = this.pathStrategyFactory.resolvePath(
+        pageContext,
+        targetContext,
+        { blockId: blockIdRaw, blockMapCache }
+      );
+      link.setAttribute('href', newHref || 'index.html');
+    }
+  }
+}
+```
+
+**Benefits of Path Strategy Pattern**:
+1. **Single Responsibility**: Each strategy handles one type of path resolution
+2. **Open/Closed**: New strategies can be added without modifying existing code
+3. **Testability**: Each strategy independently testable
+4. **Simplified LinkRewriter**: Complex if/else logic replaced with factory call
+5. **Block ID Support**: Anchor formatting integrated into path resolution
+
+**PathCalculator Component** (`src/domain/path/PathCalculator.js` - LEGACY):
+
+> **Note**: PathCalculator is retained for backward compatibility and filesystem operations.
+> For link resolution, prefer PathStrategyFactory.
+
+The `PathCalculator` encapsulates filesystem path calculation logic:
 
 1. **calculateRelativePath(pageContext)**: Build hierarchical path from parent chain
 2. **calculateDirectoryPath(baseDir, pageContext)**: Full directory path for saving page
 3. **calculateFilePath(baseDir, pageContext)**: Full path to index.html file
-4. **calculateRelativePathBetween(source, target)**: Path for link rewriting
+4. **calculateRelativePathBetween(source, target)**: Path for link rewriting (**DEPRECATED: Use PathStrategyFactory**)
 
 Features:
 - Handles multi-level hierarchy with proper parent chain traversal
 - Windows/Unix compatible path handling
 - Proper path normalization and sanitization
 - Safe directory creation paths
+- **Correct root page relative paths** (see fix below)
+
+**Root Page Path Fix** (calculateRelativePathBetween):
+
+```javascript
+/**
+ * FIXED: Properly handles links TO root page (depth=0)
+ * 
+ * Problem: Pages at depth=1 linking to root got './index.html' (incorrect)
+ * Solution: Always go up (../) for the source page's own depth, then navigate to target
+ * 
+ * Examples:
+ * - Source: depth=1, Target: depth=0 → '../index.html' (go up from Module, land at root)
+ * - Source: depth=2, Target: depth=0 → '../../index.html' (go up from Topic, through Module)
+ * - Source: depth=2, Target: depth=1 → '../OtherModule/index.html' (up one, into sibling)
+ * - Source: depth=1, Target: depth=2 (same parent) → './SubTopic/index.html' (down into child)
+ */
+calculateRelativePathBetween(sourceContext, targetContext) {
+  // Go UP from source's location (sourceDepth times)
+  // Each depth level = one directory
+  const ups = '../'.repeat(sourceContext.depth);
+  
+  // Build path DOWN to target
+  const targetPath = this.calculateRelativePath(targetContext);
+  
+  // Root page (depth=0) has empty targetPath
+  if (targetContext.depth === 0) {
+    return ups + 'index.html';
+  }
+  
+  return ups + targetPath + '/index.html';
+}
+```
 
 **Integration Example**:
 
@@ -1415,10 +1723,10 @@ module1.getRelativePath();           // → "Module 1"
 module1.getDirectoryPath('/output'); // → "/output/Module 1"
 module1.getFilePath('/output');      // → "/output/Module 1/index.html"
 
-// Link rewriting example
-const otherModule = new PageContext(...);
+// Link rewriting example - including root page links
+module1.getRelativePathTo(root);       // → "../index.html" (FIXED: was "./index.html")
 module1.getRelativePathTo(otherModule);
-// → "../../Other Module/index.html" (calculated by PathCalculator)
+// → "../Other Module/index.html" (calculated by PathCalculator)
 ```
 
 **Serialization Across IPC**:
@@ -1444,16 +1752,180 @@ process.on('message', (msg) => {
 **Benefits of PageContext Decomposition**:
 
 1. **Cleaner Separation**: Domain model separated from path logic
-2. **Improved Testability**: PathCalculator independently testable without PageContext
+2. **Improved Testability**: PathCalculator and PathStrategies independently testable
 3. **Reduced Complexity**: 260 lines → 184 lines (29% reduction)
-4. **Code Reuse**: PathCalculator can be used for other path operations
+4. **Code Reuse**: Path strategies can be used across components
 5. **Maintainability**: Single responsibility for each component
-6. **Extensibility**: Path logic extensible without modifying domain model
-7. **Canonical Title Sync**: Title updates from TitleRegistry propagate to every canonical PageContext instance, keeping serialized titles consistent for downstream consumers
+6. **Extensibility**: New path strategies can be added without modifying existing code
+7. **Canonical Title Sync**: Title updates from TitleRegistry propagate to every canonical PageContext instance
+8. **Unified Link Resolution**: PathStrategyFactory provides single entry point for all link types
 
-**Dependencies**: `PathCalculator` (path calculation strategy)  
+**Dependencies**: `PathCalculator` (filesystem paths), `PathStrategyFactory` (link resolution)  
 **Used By**: All components handling page metadata and file operations  
-**Source**: [`src/domain/PageContext.js`](../src/domain/PageContext.js) and [`src/domain/path/PathCalculator.js`](../src/domain/path/PathCalculator.js)
+**Source**: 
+- [`src/domain/PageContext.js`](../src/domain/PageContext.js)
+- [`src/domain/path/PathCalculator.js`](../src/domain/path/PathCalculator.js)
+- [`src/domain/path/PathStrategy.js`](../src/domain/path/PathStrategy.js)
+- [`src/domain/path/IntraPathStrategy.js`](../src/domain/path/IntraPathStrategy.js)
+- [`src/domain/path/InterPathStrategy.js`](../src/domain/path/InterPathStrategy.js)
+- [`src/domain/path/ExternalPathStrategy.js`](../src/domain/path/ExternalPathStrategy.js)
+- [`src/domain/path/PathStrategyFactory.js`](../src/domain/path/PathStrategyFactory.js)
+
+**HtmlFacade Pattern** (`src/html/` - Facade Pattern Implementation):
+
+The html module implements the **Facade Pattern** for unified HTML DOM manipulation across different execution contexts (browser via Puppeteer, server via JSDOM). This abstraction allows components like LinkRewriter, AssetDownloader, and ContentExpander to work uniformly regardless of whether they're operating on live browser pages or saved HTML files.
+
+**Design Goals**:
+1. **Unified Interface**: Single API for DOM manipulation across contexts
+2. **Context Agnostic**: Same operations work in browser and server
+3. **Chainable**: Methods return promises for fluent async patterns
+4. **Testable**: Easy to mock for unit testing
+5. **Extensible**: New implementations can support additional contexts
+
+**Class Hierarchy**:
+```
+┌──────────────────────────────────────────────────────────────┐
+│                    «abstract»                                │
+│                    HtmlFacade                                │
+├──────────────────────────────────────────────────────────────┤
+│ + Context: { BROWSER, SERVER }                               │
+│ + getContext(): string                                       │
+│ + query(selector): Promise<Element[]>                        │
+│ + queryOne(selector): Promise<Element|null>                  │
+│ + getAttribute(element, name): Promise<string>               │
+│ + setAttribute(element, name, value): Promise<void>          │
+│ + getInnerHtml(element): Promise<string>                     │
+│ + setInnerHtml(element, html): Promise<void>                 │
+│ + createElement(tagName): Promise<Element>                   │
+│ + appendChild(parent, child): Promise<void>                  │
+│ + insertBefore(newElement, reference): Promise<void>         │
+│ + serialize(): Promise<string>                               │
+│ + injectScript(content, options): Promise<void>              │
+│ + injectStyle(css, options): Promise<void>                   │
+└──────────────────────────────────────────────────────────────┘
+                              △
+                              │
+          ┌───────────────────┴───────────────────┐
+          │                                       │
+┌─────────┴──────────────┐       ┌───────────────┴────────────┐
+│  PuppeteerHtmlFacade   │       │    JsdomHtmlFacade         │
+│  [Browser Context]     │       │    [Server Context]        │
+├────────────────────────┤       ├────────────────────────────┤
+│ - page: Puppeteer.Page │       │ - dom: JSDOM               │
+│ + waitForSelector()    │       │ + fromHtml(html): Facade   │
+│ + evaluate(fn, args)   │       │ + fromFile(path): Facade   │
+│ + getPage(): Page      │       │ + saveToFile(path)         │
+└────────────────────────┘       └────────────────────────────┘
+          │                                       │
+          │ wraps                                 │ wraps
+          ▼                                       ▼
+┌────────────────────────┐       ┌────────────────────────────┐
+│ PuppeteerHtmlElement   │       │    JsdomHtmlElement        │
+├────────────────────────┤       ├────────────────────────────┤
+│ - handle: ElementHandle│       │ - element: Element         │
+│ + click()              │       │ + click() // dispatches    │
+│ + focus()              │       │ + focus() // event         │
+│ + type(text)           │       │ + type(text) // sets value │
+│ + hover()              │       │ + hover() // mouseenter    │
+└────────────────────────┘       └────────────────────────────┘
+```
+
+**HtmlFacadeFactory** (`HtmlFacadeFactory.js`):
+```javascript
+class HtmlFacadeFactory {
+  // Create facade for Puppeteer page (browser context)
+  static forPage(page) {
+    return new PuppeteerHtmlFacade(page);
+  }
+  
+  // Create facade from HTML string (server context)
+  static fromHtml(html) {
+    return JsdomHtmlFacade.fromHtml(html);
+  }
+  
+  // Create facade from file (server context)
+  static async fromFile(filePath) {
+    return await JsdomHtmlFacade.fromFile(filePath);
+  }
+  
+  // Auto-detect context and create appropriate facade
+  static async create(source) {
+    if (HtmlFacadeFactory.isPuppeteerPage(source)) {
+      return HtmlFacadeFactory.forPage(source);
+    }
+    if (typeof source === 'string') {
+      return source.startsWith('<') 
+        ? HtmlFacadeFactory.fromHtml(source)
+        : await HtmlFacadeFactory.fromFile(source);
+    }
+    throw new Error('Unable to determine source type');
+  }
+}
+```
+
+**Usage Example - LinkRewriter Integration**:
+```javascript
+// Before: Direct JSDOM manipulation
+const dom = new JSDOM(html);
+const document = dom.window.document;
+const links = document.querySelectorAll('a[href]');
+for (const link of links) {
+    const href = link.getAttribute('href');
+    link.setAttribute('href', newHref);
+}
+const modifiedHtml = dom.serialize();
+await fs.writeFile(htmlFilePath, modifiedHtml);
+
+// After: Using HtmlFacade (context-agnostic)
+const facade = await HtmlFacadeFactory.fromFile(htmlFilePath);
+const links = await facade.query('a[href]');
+for (const link of links) {
+    const href = await facade.getAttribute(link, 'href');
+    await facade.setAttribute(link, 'href', newHref);
+}
+await facade.saveToFile(htmlFilePath);
+```
+
+**Usage Example - Script Injection**:
+```javascript
+async function injectToggleController(facade, toggleStates) {
+    const statesJson = JSON.stringify(Object.fromEntries(toggleStates));
+    const controllerScript = TOGGLE_TEMPLATE.replace('__STATES__', statesJson);
+    
+    await facade.injectScript(controllerScript, {
+        placement: 'body-end',
+        id: 'offline-toggle-controller'
+    });
+    
+    await facade.injectStyle(`
+        .toggle-content-container {
+            transition: max-height 200ms ease-out;
+            overflow: hidden;
+        }
+    `, { id: 'offline-toggle-styles' });
+}
+```
+
+**Benefits of HtmlFacade Pattern**:
+1. **Context Abstraction**: Same code works with live pages (Puppeteer) or saved files (JSDOM)
+2. **Simplified Testing**: Mock facade instead of mocking Puppeteer/JSDOM
+3. **Future-Proof**: Can add new implementations (e.g., Playwright) without changing consumers
+4. **Consistent API**: Async interface across all contexts
+5. **Script/Style Injection**: Unified approach for offline interactivity
+
+**Beneficiary Components**:
+- `LinkRewriter`: Rewrite hrefs in saved HTML files
+- `AssetDownloader`: Update src attributes after asset download
+- `ContentExpander`: Inject toggle controllers for offline interactivity
+- `CssDownloader`: Rewrite CSS url() references
+
+**Source**:
+- [`src/html/HtmlFacade.js`](../src/html/HtmlFacade.js)
+- [`src/html/PuppeteerHtmlFacade.js`](../src/html/PuppeteerHtmlFacade.js)
+- [`src/html/JsdomHtmlFacade.js`](../src/html/JsdomHtmlFacade.js)
+- [`src/html/HtmlFacadeFactory.js`](../src/html/HtmlFacadeFactory.js)
+- [`src/html/elements/PuppeteerHtmlElement.js`](../src/html/elements/PuppeteerHtmlElement.js)
+- [`src/html/elements/JsdomHtmlElement.js`](../src/html/elements/JsdomHtmlElement.js)
 
 ---
 
@@ -1646,6 +2118,42 @@ When `WORKER:DIED` event received:
 4. Re-queue failed task (with retry limit)
 
 **Deadlock Prevention**:
+
+The system implements a multi-layered deadlock prevention strategy to handle worker pool exhaustion, particularly during hidden file processing:
+
+**Worker Pool Elasticity**
+- Dynamic worker scaling when pool exhaustion is detected
+- Emergency worker spawning when utilization exceeds threshold (default 90%)
+- Extended timeouts under high load (60s → 180s)
+- Configurable via `BrowserManager.configureElasticity()`
+
+```javascript
+// Elasticity configuration
+{
+  baseTimeout: 60000,        // Base allocation timeout (ms)
+  extendedTimeout: 180000,   // Extended timeout under load (ms)
+  maxWorkers: 8,             // Maximum workers including emergency
+  emergencyThreshold: 0.9,   // Utilization threshold for emergency spawn
+  enableEmergencySpawn: true,
+  emergencySpawnCooldown: 30000
+}
+```
+
+**Leaf-First Download Ordering**
+- Download queue processes deepest pages (leaves) first
+- Leaf pages typically have fewer hidden file elements
+- Hidden files discovered on leaves are deduplicated before parent processing
+- Two ordering strategies available:
+  - `leaf-first`: O(n log n) depth-descending sort
+  - `topological`: O(V+E) Kahn's algorithm ensuring children before parents
+
+**Global Hidden File Registry**
+- Cross-page deduplication of hidden file URLs
+- Workers query Master before processing hidden files
+- Prevents redundant 3-second waits per duplicate
+- Statistics tracked: `totalDiscovered`, `totalSkippedDuplicates`, `totalDownloaded`
+
+**Legacy Deadlock Prevention** (Task Timeouts):
 - Track task start times
 - If task exceeds maximum duration (configurable, default 5 minutes):
   - Log timeout warning
@@ -2483,22 +2991,50 @@ class GlobalQueueManager {
      - `visitedUrls` prevents cycles
      - `pendingTaskIds.size` never drops below zero and only contains outstanding task IDs
 
-3. **ExecutionQueue.js** (170 lines)
-   - Purpose: Download dependency-aware scheduling
+3. **ExecutionQueue.js** (~400 lines, enhanced)
+   - Purpose: Download dependency-aware scheduling with deadlock prevention
    - Responsibilities:
-     - `build(contexts)`: Initialize queue from canonical contexts
+     - `build(contexts, pageGraph)`: Initialize queue with leaf-first ordering
+     - `buildTopological(contexts, pageGraph)`: Initialize with topological ordering
+     - `computeBothOrderings(contexts, pageGraph)`: Compute and log both orderings for comparison
+     - `writeOrderingLog(logDir, runId)`: Write ordering comparison to file
      - `next(outputDir)`: Return task with calculated absolute path
      - `markComplete(pageId)`: Update dependency counts
      - `isComplete()`: Check if all downloads finished
    - Features:
+     - **Leaf-first ordering (Solution D)**: Processes deepest pages first to enable hidden file deduplication
+     - **Topological ordering alternative**: Kahn's algorithm ensures children before parents
+     - **Ordering comparison logging**: Both strategies computed and logged for dry-run analysis
      - Parent-child dependency tracking
-     - Leaf-node-first scheduling (downloads can't start until children done)
      - Absolute path calculation in Master (prevents Ghost Execution)
      - Automatic parent queueing when children complete
+   - Ordering Strategies:
+     - `leaf-first`: O(n log n) sort by depth descending, then by children count ascending
+     - `topological`: O(V+E) Kahn's algorithm with reverse adjacency (child → parent)
    - Key invariants:
      - All pending tasks have satisfied dependencies
      - pendingChildrenCount accurately reflects children
      - absolute paths prevent working directory issues
+     - Leaf pages processed before their ancestors
+
+4. **GlobalHiddenFileRegistry.js** (NEW - ~350 lines)
+   - Purpose: Cross-page deduplication of hidden file downloads (Solution E)
+   - Responsibilities:
+     - `shouldProcess(url)`: Check if URL needs processing
+     - `markPending(url, pageId)`: Mark URL as being processed
+     - `recordDownload(url, savedPath, pageId)`: Record successful download
+     - `recordFailure(url, pageId, error)`: Record failed download
+     - `getSavedPath(url)`: Get local path for already-downloaded URL
+     - `getUrlToPathMap()`: Get URL → path mapping for link rewriting
+   - Features:
+     - URL normalization for consistent deduplication
+     - Pending tracking prevents duplicate processing by concurrent workers
+     - Statistics tracking: discovered, downloaded, failed, skipped
+     - Event-driven IPC integration for worker queries
+   - Key invariants:
+     - Each URL processed at most once across all pages
+     - Pending URLs cannot be claimed by multiple workers
+     - Downloaded paths available for link rewriting
 
 **Benefits of Queue Component Refactoring**:
 
@@ -2508,6 +3044,7 @@ class GlobalQueueManager {
 4. **State Clarity**: Separate data structures reduce cognitive load
 5. **Reusability**: Components can be used in different orchestration patterns
 6. **Maintainability**: Smaller files focused on specific tasks
+7. **Deadlock Prevention**: Leaf-first ordering + hidden file registry prevent worker starvation
 
 **Integration with ClusterOrchestrator**:
 
@@ -2520,8 +3057,15 @@ while (!queueManager.isDiscoveryComplete()) {
   queueManager.completeDiscovery(result);
 }
 
-// Build execution queue after pruning
+// Build execution queue after pruning (with leaf-first ordering)
+queueManager.configureDownload({ 
+  strategy: 'leaf-first',  // or 'topological'
+  logBothOrderings: true   // Log both strategies for comparison
+});
 queueManager.buildDownloadQueue(canonicalContexts);
+
+// Optionally write ordering comparison log (for dry-run analysis)
+queueManager.writeQueueOrderingLog(runId);
 
 // Execution phase
 while (!queueManager.isDownloadComplete()) {
@@ -2530,6 +3074,11 @@ while (!queueManager.isDownloadComplete()) {
   // Worker sends results back
   queueManager.markDownloadComplete(result.pageId);
 }
+
+// Get extended statistics including hidden file registry
+const stats = queueManager.getExtendedStatistics();
+console.log(`Hidden files: ${stats.hiddenFiles.totalDownloaded} downloaded, ` +
+            `${stats.hiddenFiles.totalSkippedDuplicates} skipped as duplicates`);
 ```
 
 **Source**: [`src/orchestration/GlobalQueueManager.js`](../src/orchestration/GlobalQueueManager.js) and [`src/orchestration/queues/`](../src/orchestration/queues/)
@@ -2537,10 +3086,26 @@ while (!queueManager.isDownloadComplete()) {
 ```
 
 **Scheduling Guarantees**:
-1. **Leaf-First**: Pages with no children download first
+1. **Leaf-First**: Pages with no children (deepest in tree) download first
 2. **Bottom-Up**: Parent only downloads after ALL children complete
-3. **No Deadlock**: Acyclic graph (enforced by ConflictResolver) prevents circular dependencies
+3. **No Deadlock**: Combination of:
+   - Acyclic graph (enforced by ConflictResolver) prevents circular dependencies
+   - Leaf-first ordering enables hidden file deduplication
+   - Global hidden file registry prevents duplicate processing
+   - Worker pool elasticity spawns emergency workers under load
 4. **Progress**: At least one page is always ready (unless complete)
+5. **Deduplication**: Hidden files discovered on leaves are skipped when encountered on parents
+
+**Queue Ordering Strategies**:
+
+The ExecutionQueue supports two ordering strategies that can be compared during dry-run:
+
+| Strategy | Algorithm | Time Complexity | Use Case |
+|----------|-----------|-----------------|----------|
+| `leaf-first` | Depth-descending sort | O(n log n) | Default, simple graphs |
+| `topological` | Kahn's algorithm | O(V + E) | Complex graphs, strict ordering |
+
+Both strategies produce orderings where children are processed before parents, but may differ in the order of siblings at the same depth level.
 
 **Statistics and Monitoring**:
 
@@ -2554,6 +3119,15 @@ getStatistics() {
     pendingParents: Array.from(this.pendingChildrenCount.values())
                          .filter(count => count > 0).length
   }
+}
+
+// Extended statistics with hidden file registry
+getExtendedStatistics() {
+  return {
+    ...this.getStatistics(),
+    hiddenFiles: this.hiddenFileRegistry.getStatistics(),
+    downloadStrategy: this.executionQueue.getActiveStrategy()
+  };
 }
 ```
 
@@ -2814,7 +3388,7 @@ The UI package provides a real-time terminal dashboard for monitoring the scrapi
 #### 5.3.1 `TerminalDashboard.js` - UI Renderer (View)
 
 **Class Description**:
-A "dumb" rendering component that manages the `cli-progress` multi-bar display. It receives structured data and updates the visual representation without containing any business logic.
+A "dumb" rendering component that manages the `cli-progress` multi-bar display. It receives structured data and updates the visual representation without containing any business logic. Now includes **text truncation** to prevent layout breakage from long strings.
 
 **Constructor Signature**:
 ```javascript
@@ -2825,7 +3399,39 @@ A "dumb" rendering component that manages the `cli-progress` multi-bar display. 
 constructor(workerCount)
 ```
 
-**Public Methods**:
+**Display Limits (NEW - Layout Consistency)**:
+
+```javascript
+/**
+ * Character limits for dynamic text fields to prevent layout breakage
+ * @constant {Object} DISPLAY_LIMITS
+ */
+const DISPLAY_LIMITS = {
+  TITLE: 50,        // Header title (page names)
+  URL: 60,          // URL display
+  STATUS: 40,       // Status messages
+  WORKER_LABEL: 70, // Worker status line
+  FOOTER: 80        // Footer log messages
+};
+```
+
+**Truncation Utility**:
+
+```javascript
+/**
+ * Truncate string to maximum length with ellipsis
+ * @static
+ * @param {string} str - String to truncate
+ * @param {number} maxLength - Maximum allowed length
+ * @returns {string} Truncated string with '...' suffix if exceeded
+ */
+static truncate(str, maxLength) {
+  if (!str || str.length <= maxLength) return str;
+  return str.substring(0, maxLength - 3) + '...';
+}
+```
+
+**Public Methods** (with truncation applied):
 
 ```javascript
 /**
@@ -2838,10 +3444,13 @@ setMode(mode, initialData = {})
 
 /**
  * @method updateHeader
- * @summary Updates the dashboard title bar
+ * @summary Updates the dashboard title bar (truncated to TITLE limit)
  * @param {string} title - Title text to display
  */
-updateHeader(title)
+updateHeader(title) {
+  const truncatedTitle = TerminalDashboard.truncate(title, DISPLAY_LIMITS.TITLE);
+  // ... render truncated title
+}
 
 /**
  * @method updateDiscoveryStats
@@ -2868,18 +3477,24 @@ updateDownloadStats({ pending, active, completed, total, failed })
 
 /**
  * @method updateWorkerStatus
- * @summary Updates individual worker status line
+ * @summary Updates individual worker status line (truncated to WORKER_LABEL limit)
  * @param {number} slotIndex - Worker visual slot (0-based)
  * @param {string} statusText - Status message to display
  */
-updateWorkerStatus(slotIndex, statusText)
+updateWorkerStatus(slotIndex, statusText) {
+  const truncatedStatus = TerminalDashboard.truncate(statusText, DISPLAY_LIMITS.WORKER_LABEL);
+  // ... render truncated status
+}
 
 /**
  * @method updateFooter
- * @summary Updates the footer log ticker with recent log message
+ * @summary Updates the footer log ticker (truncated to FOOTER limit)
  * @param {string} text - Log message text
  */
-updateFooter(text)
+updateFooter(text) {
+  const truncatedText = TerminalDashboard.truncate(text, DISPLAY_LIMITS.FOOTER);
+  // ... render truncated footer
+}
 
 /**
  * @method stop
@@ -2887,6 +3502,13 @@ updateFooter(text)
  */
 stop()
 ```
+
+**Layout Consistency Benefits**:
+
+1. **Prevents Line Wrapping**: Long URLs/titles no longer break multi-line layout
+2. **Consistent Column Widths**: Worker status lines maintain alignment
+3. **Readable Footer**: Log messages don't overflow terminal width
+4. **Predictable Rendering**: Dashboard dimensions remain stable
 
 **Dependencies**: `cli-progress`  
 **Used By**: `DashboardController`
@@ -3479,24 +4101,41 @@ async rewriteLinksInFile(htmlPath, pageContext, urlToContextMap, pageGraph, bloc
 }
 
 /**
- * Parse href to separate URL and raw block ID
+ * Parse href to separate URL and raw block ID (IMPROVED)
+ * Now properly extracts 32-character hex IDs from various URL formats
  * @private
  */
 _parseHref(href) {
   const parts = href.split('#')
   const urlPart = parts[0].split('?')[0]
-  const blockIdRaw = parts.length > 1 ? parts[1] : null
+  
+  // Extract block ID from hash fragment
+  // Handles both raw hashes and formatted UUIDs
+  let blockIdRaw = null
+  if (parts.length > 1) {
+    const hash = parts[1]
+    // Try to extract 32-char hex ID (with or without hyphens)
+    const match = hash.replace(/-/g, '').match(/([a-f0-9]{32})/i)
+    blockIdRaw = match ? match[1] : hash
+  }
+  
   return { urlPart, blockIdRaw }
 }
 
 /**
- * Build anchor hash for block ID (NEW)
+ * Build anchor hash for block ID (IMPROVED - Always Preserves Block IDs)
  * Converts raw block ID to formatted UUID using block map if available
+ * CRITICAL: Always outputs a formatted ID even without block map (fallback formatting)
  * @private
+ * 
+ * Design Decision: Block IDs should NEVER be lost during link rewriting.
+ * Even if the block map is unavailable, we format the raw ID into UUID format
+ * so that navigation to specific blocks still works in the offline version.
  */
 _buildAnchorHash(blockIdRaw, targetContext, blockMapCache) {
   if (!blockIdRaw) return ''
   
+  // Try to use block map for verified formatting
   if (blockMapCache && targetContext.id) {
     const blockMap = blockMapCache.get(targetContext.id)
     if (blockMap) {
@@ -3505,11 +4144,21 @@ _buildAnchorHash(blockIdRaw, targetContext, blockMapCache) {
     }
   }
   
-  // Fallback: format the raw ID directly
+  // CRITICAL FALLBACK: Format raw ID directly to preserve navigation
+  // This ensures block anchors work even without a complete block map
   const formattedId = this.blockIDMapper.getFormattedId(blockIdRaw, null)
   return '#' + formattedId
 }
 ```
+
+**Block ID Preservation Design**:
+
+The LinkRewriter now guarantees that block IDs are NEVER lost during link rewriting:
+
+1. **ID Extraction**: `_parseHref()` extracts 32-char hex IDs from various formats
+2. **Verification**: If block map exists, uses verified formatted ID
+3. **Fallback**: If no block map, formats raw ID into UUID structure (8-4-4-4-12)
+4. **Result**: All block anchors preserved for offline navigation
 
 **Block Anchor Processing**:
 
@@ -4322,20 +4971,25 @@ FileDownloader has been refactored from a 280-line monolithic class into a light
 
 **Component Implementations**:
 
-1. **FileTypeDetector.js** (66 lines)
-   - Purpose: Identify if a URL points to a downloadable file
+1. **FileTypeDetector.js** (79 lines) - **REFACTORED: Whitelist Policy**
+   - Purpose: Identify if a URL points to a downloadable file using a strict whitelist approach
    - Responsibilities:
-     - `isDownloadableFile(url, linkText)`: Check if URL is downloadable
-   - Detection Strategies:
-     - Notion file URL patterns (S3, signed URLs)
-     - File extension matching (.pdf, .doc, .zip, etc.)
-     - Link text analysis (contains "download")
-   - Supported File Types:
-     - Documents: PDF, DOC, DOCX, XLS, XLSX, PPT, PPTX
-     - Archives: ZIP, RAR, 7Z, TAR, GZ
-     - Code: PY, JS, TS, JAVA, CPP, C, H, IPYNB
-     - Data: JSON, XML, TXT, MD
-     - Media: MP4, AVI, MOV, MP3, WAV, JPG, PNG, GIF, SVG
+     - `isDownloadableFile(url)`: Check if URL is downloadable (strict whitelist)
+     - `getExtension(url)`: Extract file extension from URL
+   - **Detection Strategy (Whitelist-Only)**:
+     - **Primary Check**: URL path must end with a whitelisted extension
+     - **Notion CDN Check**: Recognizes Notion file patterns (secure.notion-static.com, prod-files-secure)
+     - **No fallbacks**: If extension not whitelisted, returns false
+   - **Whitelisted Extensions** (Strict List):
+     - Documents: `.pdf`, `.doc`, `.docx`, `.xls`, `.xlsx`, `.ppt`, `.pptx`, `.odt`, `.ods`, `.odp`
+     - Archives: `.zip`, `.rar`, `.7z`, `.tar`, `.gz`, `.bz2`
+     - Code: `.py`, `.js`, `.ts`, `.java`, `.cpp`, `.c`, `.h`, `.ipynb`, `.rb`, `.go`, `.rs`
+     - Data: `.json`, `.xml`, `.yaml`, `.yml`, `.csv`, `.sql`, `.md`, `.txt`
+     - Media: `.mp4`, `.avi`, `.mov`, `.mkv`, `.mp3`, `.wav`, `.ogg`, `.flac`
+   - **Design Rationale**: 
+     - Switched from blacklist to whitelist to prevent downloading navigation/UI elements
+     - Only explicit file types are downloaded, eliminating false positives
+     - Images handled separately by AssetDownloader
 
 2. **FileDownloadStrategy.js** (102 lines)
    - Purpose: Handle file downloads with retry logic and caching
@@ -4356,22 +5010,27 @@ FileDownloader has been refactored from a 280-line monolithic class into a light
      - Timeout errors → retry with backoff
      - Max retries exceeded → log error, continue
 
-3. **FileNameExtractor.js** (68 lines)
-   - Purpose: Extract and sanitize filenames from URLs
+3. **FileNameExtractor.js** (111 lines) - **REFACTORED: Extension Enforcement**
+   - Purpose: Extract and sanitize filenames from URLs with mandatory extension policy
    - Responsibilities:
-     - `extractFilename(url, linkText, index)`: Generate safe filename
-   - Logic:
-     - Extract filename from URL pathname
-     - Fall back to link text if URL has UUID
-     - Add extension if missing (guess from URL)
-     - Sanitize using FileSystemUtils
-     - Prepend index for uniqueness
+     - `extractFilename(url, linkText, index, targetFolder)`: Generate safe filename with guaranteed extension
+     - `_guessExtension(url)`: Determine extension from URL structure
+     - `_getFallbackExtension(targetFolder)`: Context-aware fallback extension
+   - **Extension Enforcement Policy**:
+     - Files MUST have a valid extension
+     - Folder-aware fallbacks: `.jpg` for images folder, `.bin` for others
+     - Known extensions are preserved from URL
+     - UUID-only filenames get extension from Content-Type or fallback
+   - **Known Extensions**: pdf, doc, docx, xls, xlsx, ppt, pptx, zip, rar, 7z, tar, gz, py, js, ts, java, json, xml, txt, md, csv, mp4, mp3, wav, mov
+   - **Image Extensions**: jpg, jpeg, png, gif, svg, webp, bmp, ico
+   - **MIME-to-Extension Map**: Converts Content-Type headers to extensions
    - Features:
      - Handles UUID-like filenames (common in Notion)
      - Preserves meaningful extensions
-     - Safe for filesystem use
+     - Safe for filesystem use (sanitized via FileSystemUtils)
+     - Prepends index for uniqueness
 
-**FileDownloader Integration**:
+**FileDownloader Integration** (with Hidden File Click Strategy):
 
 ```javascript
 class FileDownloader {
@@ -4381,18 +5040,63 @@ class FileDownloader {
     this.nameExtractor = new FileNameExtractor();
   }
   
+  /**
+   * Click element or find clickable parent (NEW)
+   * Handles elements with display:contents that aren't directly clickable
+   */
+  async _clickElementOrParent(page, element) {
+    // First try to click the element directly
+    const canClick = await page.evaluate(el => {
+      const style = getComputedStyle(el);
+      // Elements with display:contents have no box model - not clickable
+      return style.display !== 'contents' && style.display !== 'none';
+    }, element);
+    
+    if (canClick) {
+      await element.click();
+      return true;
+    }
+    
+    // Find clickable parent with proper cursor style
+    const clickableParent = await page.evaluate(el => {
+      let current = el.parentElement;
+      while (current && current !== document.body) {
+        const style = getComputedStyle(current);
+        if (style.display !== 'contents' && style.cursor === 'pointer') {
+          return current;
+        }
+        current = current.parentElement;
+      }
+      return null;
+    }, element);
+    
+    if (clickableParent) {
+      // Use programmatic click as fallback
+      await page.evaluate(parent => {
+        parent.dispatchEvent(new MouseEvent('click', {
+          view: window, bubbles: true, cancelable: true
+        }));
+      }, clickableParent);
+      return true;
+    }
+    
+    return false;
+  }
+  
   async downloadAndRewriteFiles(page, outputDir) {
     // Extract all file links from page
     const fileLinks = await page.evaluate(() => { ... });
     
     for (const [index, linkInfo] of fileLinks.entries()) {
-      // Detect if downloadable
-      if (!this.typeDetector.isDownloadableFile(linkInfo.url, linkInfo.text)) {
+      // Detect if downloadable (strict whitelist)
+      if (!this.typeDetector.isDownloadableFile(linkInfo.url)) {
         continue;
       }
       
-      // Extract filename
-      const filename = this.nameExtractor.extractFilename(linkInfo.url, linkInfo.text, index + 1);
+      // Extract filename with extension enforcement
+      const filename = this.nameExtractor.extractFilename(
+        linkInfo.url, linkInfo.text, index + 1, 'files'
+      );
       const localPath = path.join(filesDir, filename);
       
       // Download if not cached

@@ -4,9 +4,18 @@
  * @description Downloads and localizes embedded files (PDFs, documents, archives, etc.)
  * 
  * Delegates to specialized components:
- * - FileTypeDetector: Identifies downloadable files
+ * - FileTypeDetector: Identifies downloadable files (whitelist policy)
  * - FileDownloadStrategy: Handles download with retry logic
- * - FileNameExtractor: Extracts and sanitizes filenames
+ * - FileNameExtractor: Extracts and sanitizes filenames with extension enforcement
+ * - HtmlFacade: Abstraction layer for DOM operations (browser/server contexts)
+ * 
+ * @design HIDDEN FILE HANDLING
+ * Notion often wraps downloadable files in interactive elements with `display: contents`
+ * or within nested spans. The improved `_processHiddenFiles` method:
+ * 1. Finds elements with `data-popup-origin="true"` attribute
+ * 2. Traverses up the DOM to find a clickable parent (with cursor:pointer/zoom-in)
+ * 3. Uses programmatic click or fallback to element.click() if needed
+ * 4. Intercepts download URLs from new tabs or request interception
  */
 
 const path = require('path');
@@ -14,6 +23,7 @@ const fs = require('fs/promises');
 const FileTypeDetector = require('./file/FileTypeDetector');
 const FileDownloadStrategy = require('./file/FileDownloadStrategy');
 const FileNameExtractor = require('./file/FileNameExtractor');
+const { HtmlFacadeFactory } = require('../html');
 
 /**
  * @class FileDownloader
@@ -58,22 +68,21 @@ class FileDownloader {
     const filesDir = path.join(outputDir, 'files');
     await fs.mkdir(filesDir, { recursive: true });
 
-    // Extract all file links
-    const fileLinks = await page.evaluate(() => {
-      const results = [];
-      const links = document.querySelectorAll('a[href]');
+    // Create HtmlFacade for DOM operations
+    const facade = HtmlFacadeFactory.forPage(page);
 
-      links.forEach(link => {
-        const href = link.getAttribute('href');
-        const text = link.textContent.trim();
-
-        if (href && href.startsWith('http')) {
-          results.push({ url: href, text: text });
-        }
-      });
-
-      return results;
-    });
+    // Extract all file links using HtmlFacade
+    const linkElements = await facade.query('a[href]');
+    const fileLinks = [];
+    
+    for (const link of linkElements) {
+      const href = await facade.getAttribute(link, 'href');
+      const text = await facade.getTextContent(link);
+      
+      if (href && href.startsWith('http')) {
+        fileLinks.push({ url: href, text: text.trim() });
+      }
+    }
 
     this.logger.info('FILE', `Found ${fileLinks.length} links to examine...`);
 
@@ -92,8 +101,8 @@ class FileDownloader {
 
         this.logger.info('FILE', `Downloading file: ${linkInfo.text || path.basename(fileUrl)}`);
 
-        // Extract and sanitize filename
-        const filename = this.nameExtractor.extractFilename(fileUrl, linkInfo.text, index + 1);
+        // Extract and sanitize filename with extension enforcement
+        const filename = this.nameExtractor.extractFilename(fileUrl, linkInfo.text, index + 1, 'files');
         const localFilePath = path.join(filesDir, filename);
 
         // Download if not already cached
@@ -122,23 +131,36 @@ class FileDownloader {
       this.logger.error('FILE', 'Error processing hidden files', error);
     }
 
-    // Rewrite file links in HTML
+    // Rewrite file links in HTML using HtmlFacade
     if (Object.keys(urlMap).length > 0) {
       this.logger.info('FILE', 'Rewriting file links in the HTML...');
-      await page.evaluate(map => {
-        document.querySelectorAll('a[href]').forEach(link => {
-          if (map[link.href]) {
-            link.href = map[link.href];
-          }
-        });
-      }, urlMap);
+      const allLinks = await facade.query('a[href]');
+      
+      for (const link of allLinks) {
+        const href = await facade.getAttribute(link, 'href');
+        if (urlMap[href]) {
+          await facade.setAttribute(link, 'href', urlMap[href]);
+        }
+      }
     }
 
     this.logger.success('FILE', `Downloaded ${downloadCount} embedded files.`);
   }
 
   /**
-   * Process hidden file links (e.g. in divs) by clicking and intercepting requests
+   * Process hidden file links (e.g. in divs) by clicking and intercepting requests.
+   * 
+   * @description Improved selector strategy that handles:
+   * - Elements with `display: contents` that aren't directly clickable
+   * - Elements obscured by overlays or nested in non-clickable wrappers
+   * - Puppeteer's "Node is not clickable" errors
+   * 
+   * Algorithm:
+   * 1. Find all `div[data-popup-origin="true"]` elements
+   * 2. For each element, traverse up DOM to find clickable parent
+   * 3. Click the clickable parent to trigger file download
+   * 4. Intercept the download URL via request interception or new tab
+   * 
    * @param {import('puppeteer').Page} page - Puppeteer page instance
    * @param {string} filesDir - Directory to save files
    * @returns {Promise<number>} Number of files downloaded
@@ -146,8 +168,11 @@ class FileDownloader {
   async _processHiddenFiles(page, filesDir) {
     let downloadCount = 0;
     
-    // Selector for hidden file elements
-    const hiddenElements = await page.$$('div[data-popup-origin="true"]');
+    // Create HtmlFacade for DOM operations
+    const facade = HtmlFacadeFactory.forPage(page);
+    
+    // Selector for hidden file elements using HtmlFacade
+    const hiddenElements = await facade.query('div[data-popup-origin="true"]');
     
     if (hiddenElements.length > 0) {
       this.logger.info('FILE', `Found ${hiddenElements.length} potential hidden file elements. Scanning...`);
@@ -155,7 +180,7 @@ class FileDownloader {
 
     for (const element of hiddenElements) {
       try {
-        const text = await page.evaluate(el => el.textContent.trim(), element);
+        const text = (await facade.getTextContent(element)).trim();
         
         // Check if text implies a file (e.g. "slides.pdf")
         const hasExtension = ['.pdf', '.zip', '.docx', '.pptx', '.xlsx'].some(ext => text.toLowerCase().includes(ext));
@@ -169,11 +194,15 @@ class FileDownloader {
         // 1. Listener for new targets (tabs/windows)
         const targetHandler = async (target) => {
             try {
-              if (target.opener() === page.target()) {
-                  const newPage = await target.page();
-                  if (newPage) {
-                      downloadUrl = newPage.url();
-                      await newPage.close();
+              const opener = target.opener();
+              if (opener) {
+                  const openerPage = await opener.page();
+                  if (openerPage === page) {
+                      const newPage = await target.page();
+                      if (newPage) {
+                          downloadUrl = newPage.url();
+                          await newPage.close();
+                      }
                   }
               }
             } catch (e) { /* Ignore target errors */ }
@@ -193,7 +222,16 @@ class FileDownloader {
         page.on('request', requestHandler);
 
         try {
-            await element.click();
+            // Improved click strategy: find clickable parent element
+            // Unwrap PuppeteerHtmlElement to get raw ElementHandle for click operations
+            const rawElement = element.handle;
+            const clickSuccess = await this._clickElementOrParent(page, rawElement);
+            
+            if (!clickSuccess) {
+                this.logger.debug('FILE', `Could not click element for: ${text}`);
+                continue;
+            }
+            
             // Wait for reaction (request or new tab)
             await new Promise(resolve => setTimeout(resolve, 3000));
         } catch (e) {
@@ -207,8 +245,8 @@ class FileDownloader {
         if (downloadUrl) {
              this.logger.info('FILE', `Captured hidden download URL: ${downloadUrl}`);
              
-             // Use 'hidden' as index to avoid conflict, or generate unique name
-             const filename = this.nameExtractor.extractFilename(downloadUrl, text, Date.now());
+             // Use timestamp as index to avoid conflicts
+             const filename = this.nameExtractor.extractFilename(downloadUrl, text, Date.now() % 10000, 'files');
              const localFilePath = path.join(filesDir, filename);
              
              if (!this.downloadStrategy.hasDownloaded(downloadUrl)) {
@@ -219,6 +257,7 @@ class FileDownloader {
                     downloadCount++;
                     
                     // Rewrite DOM: Replace div with anchor
+                    // Use rawElement (unwrapped handle) for page.evaluate
                     await page.evaluate((el, newHref, newText) => {
                         const link = document.createElement('a');
                         link.href = newHref;
@@ -233,7 +272,7 @@ class FileDownloader {
                         } else {
                            el.replaceWith(link);
                         }
-                    }, element, savedRelativePath, text);
+                    }, element.handle, savedRelativePath, text);
                 }
              }
         }
@@ -242,6 +281,93 @@ class FileDownloader {
       }
     }
     return downloadCount;
+  }
+
+  /**
+   * Click an element or traverse up to find a clickable parent.
+   * 
+   * @description Handles Puppeteer's "Node is not clickable" error by:
+   * 1. First attempting to find a clickable parent with cursor styles
+   * 2. Scrolling the element into view
+   * 3. Using programmatic click as fallback
+   * 
+   * @private
+   * @param {import('puppeteer').Page} page - Puppeteer page instance
+   * @param {import('puppeteer').ElementHandle} element - Element to click
+   * @returns {Promise<boolean>} True if click was successful
+   */
+  async _clickElementOrParent(page, element) {
+    try {
+      // Strategy 1: Find clickable parent element
+      const clickableTarget = await page.evaluateHandle((el) => {
+        // Look for parent with clickable cursor styles
+        const clickableCursors = ['pointer', 'zoom-in', 'zoom-out', 'grab'];
+        let current = el;
+        
+        // Traverse up to 5 levels looking for clickable parent
+        for (let i = 0; i < 5 && current; i++) {
+          const style = window.getComputedStyle(current);
+          const cursor = style.cursor;
+          const display = style.display;
+          
+          // Skip display:contents elements (they're not clickable)
+          if (display === 'contents') {
+            current = current.parentElement;
+            continue;
+          }
+          
+          // Check if this element has a clickable cursor
+          if (clickableCursors.includes(cursor)) {
+            return current;
+          }
+          
+          // Check for interactive elements
+          if (current.tagName === 'BUTTON' || 
+              current.tagName === 'A' || 
+              current.getAttribute('role') === 'button' ||
+              current.onclick) {
+            return current;
+          }
+          
+          current = current.parentElement;
+        }
+        
+        // Fallback: return immediate parent or element itself
+        return el.parentElement || el;
+      }, element);
+
+      // Strategy 2: Scroll into view and click
+      await page.evaluate((target) => {
+        target.scrollIntoView({ block: 'center', behavior: 'instant' });
+      }, clickableTarget);
+      
+      // Small delay for scroll to complete
+      await new Promise(resolve => setTimeout(resolve, 100));
+
+      // Strategy 3: Try standard click first
+      try {
+        await clickableTarget.click({ delay: 50 });
+        return true;
+      } catch (clickError) {
+        // Strategy 4: Fallback to programmatic click
+        this.logger.debug('FILE', `Standard click failed, trying programmatic click: ${clickError.message}`);
+        
+        await page.evaluate((target) => {
+          // Dispatch click event programmatically
+          const event = new MouseEvent('click', {
+            bubbles: true,
+            cancelable: true,
+            view: window
+          });
+          target.dispatchEvent(event);
+        }, clickableTarget);
+        
+        return true;
+      }
+    } catch (error) {
+      this.logger.debug('FILE', `All click strategies failed: ${error.message}`);
+      return false;
+    }
   }
 
   /**

@@ -1,4 +1,5 @@
 const PipelineStep = require('../PipelineStep');
+const { HtmlFacadeFactory } = require('../../../html');
 
 /**
  * @fileoverview Link Rewriting Step
@@ -11,6 +12,11 @@ const PipelineStep = require('../PipelineStep');
  * @classdesc Rewrites internal page links to point to local HTML files.
  * Uses the linkRewriteMap from the payload to transform Notion URLs
  * into relative local paths.
+ * 
+ * @design HTML FACADE PATTERN
+ * Uses HtmlFacade for context-agnostic DOM manipulation, allowing the
+ * same rewriting logic to work with both live Puppeteer pages and
+ * saved HTML files.
  */
 class LinkRewriterStep extends PipelineStep {
   constructor() {
@@ -21,10 +27,11 @@ class LinkRewriterStep extends PipelineStep {
    * @method process
    * @summary Rewrites <a href> attributes for internal navigation.
    * @description
-   * 1. Evaluates DOM to find all <a> tags
-   * 2. For each href that matches a key in payload.linkRewriteMap
-   * 3. Replaces the href with the corresponding local relative path
-   * 4. Updates context.stats with rewrite count
+   * 1. Creates HtmlFacade for the Puppeteer page
+   * 2. Queries all <a> tags using facade
+   * 3. For each href that matches a key in payload.linkRewriteMap
+   * 4. Replaces the href with the corresponding local relative path
+   * 5. Updates context.stats with rewrite count
    * 
    * This enables offline browsing by converting Notion URLs like:
    *   "https://notion.site/Page-Name-29abc123..."
@@ -47,28 +54,25 @@ class LinkRewriterStep extends PipelineStep {
     
     logger.info('LINK-REWRITE', `Rewriting links using map with ${mapSize} entries...`);
     
-    // Rewrite links in the browser context
-    const rewriteCount = await page.evaluate((map) => {
-      let count = 0;
-      const links = document.querySelectorAll('a[href]');
+    // Use HtmlFacade for DOM manipulation
+    const facade = HtmlFacadeFactory.forPage(page);
+    const links = await facade.query('a[href]');
+    
+    let rewriteCount = 0;
+    
+    for (const link of links) {
+      const href = await facade.getAttribute(link, 'href');
+      if (!href) continue;
       
-      links.forEach(link => {
-        const href = link.getAttribute('href');
-        if (!href) return;
-        
-        // Try to match against link map keys
-        // Keys might be full URLs or page IDs
-        for (const [key, value] of Object.entries(map)) {
-          if (href.includes(key)) {
-            link.setAttribute('href', value);
-            count++;
-            break;
-          }
+      // Try to match against link map keys
+      for (const [key, value] of Object.entries(linkMap)) {
+        if (href.includes(key)) {
+          await facade.setAttribute(link, 'href', value);
+          rewriteCount++;
+          break;
         }
-      });
-      
-      return count;
-    }, linkMap);
+      }
+    }
     
     stats.linksRewritten = rewriteCount;
     logger.success('LINK-REWRITE', `Rewrote ${rewriteCount} internal link(s)`);

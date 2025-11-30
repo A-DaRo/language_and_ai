@@ -4,6 +4,10 @@
  * @description Lightweight facade delegating to specialized queue and registry components.
  * 
  * **CRITICAL CONTEXT**: Runs in MASTER process. Coordinates queue lifecycle.
+ * 
+ * **Deadlock Prevention Features:**
+ * - Leaf-first download ordering (Solution D)
+ * - Global hidden file registry (Solution E)
  */
 
 const DiscoveryQueue = require('./queues/DiscoveryQueue');
@@ -11,12 +15,13 @@ const ExecutionQueue = require('./queues/ExecutionQueue');
 const TitleRegistry = require('./queues/TitleRegistry');
 const PageGraph = require('./PageGraph');
 const EdgeClassifier = require('./analysis/EdgeClassifier');
+const GlobalHiddenFileRegistry = require('./GlobalHiddenFileRegistry');
 const PageContext = require('../domain/PageContext');
 const Logger = require('../core/Logger');
 
 /**
  * @class GlobalQueueManager
- * @classdesc Facade for discovery, execution, and title management
+ * @classdesc Facade for discovery, execution, and title management with deadlock prevention.
  */
 class GlobalQueueManager {
   constructor() {
@@ -30,6 +35,9 @@ class GlobalQueueManager {
     // Page graph for tracking hierarchy and edge classifications
     this.pageGraph = new PageGraph();
     this.edgeClassifier = new EdgeClassifier();
+    
+    // Global hidden file registry for cross-page deduplication (Solution E)
+    this.hiddenFileRegistry = new GlobalHiddenFileRegistry();
 
     // Context registry
     this.allContexts = new Map();
@@ -40,6 +48,26 @@ class GlobalQueueManager {
       downloaded: 0,
       failed: 0
     };
+    
+    /**
+     * Configuration for download queue logging
+     * @type {{logDir: string}}
+     */
+    this.downloadConfig = {
+      logDir: './logs'
+    };
+  }
+
+  /**
+   * Configure download queue behavior.
+   * 
+   * @param {Object} config - Configuration options
+   * @param {string} [config.logDir='./logs'] - Directory for queue logs
+   */
+  configureDownload(config) {
+    this.downloadConfig = { ...this.downloadConfig, ...config };
+    this.logger.info('GlobalQueueManager', 
+      `Download configured: logDir=${this.downloadConfig.logDir}`);
   }
 
   /**
@@ -182,13 +210,34 @@ class GlobalQueueManager {
   }
 
   /**
-   * Build download queue from discovered contexts
+   * Build download queue from discovered contexts with configurable ordering strategy.
+   * 
+   * **Deadlock Prevention (Solution D):**
+   * Uses leaf-first ordering which processes deepest pages first.
+   * This ensures hidden files are discovered on leaf pages before their parents,
+   * enabling natural deduplication across the tree.
+   * 
    * @param {Array<PageContext>} contexts - All discovered contexts
    * @returns {number} Number of pages queued for download
    */
   buildDownloadQueue(contexts) {
-    this.executionQueue.build(contexts);
+    // Build queue with leaf-first ordering
+    this.executionQueue.build(contexts, this.pageGraph);
+    
+    this.logger.info('GlobalQueueManager', 
+      `Download queue built with leaf-first ordering: ${this.executionQueue.getTotalCount()} pages`);
+    
     return this.executionQueue.getTotalCount();
+  }
+
+  /**
+   * Get the hidden file registry for cross-page deduplication.
+   * Workers should query this before processing hidden files.
+   * 
+   * @returns {GlobalHiddenFileRegistry} The hidden file registry
+   */
+  getHiddenFileRegistry() {
+    return this.hiddenFileRegistry;
   }
 
   /**
@@ -298,11 +347,21 @@ class GlobalQueueManager {
     this.titleRegistry = new TitleRegistry();
     this.pageGraph = new PageGraph();
     this.edgeClassifier = new EdgeClassifier();
+    this.hiddenFileRegistry.reset();
     this.allContexts.clear();
     this.stats = { discovered: 0, downloaded: 0, failed: 0 };
   }
-}
 
-module.exports = GlobalQueueManager;
+  /**
+   * Get combined statistics including hidden file registry.
+   * @returns {Object} Extended statistics
+   */
+  getExtendedStatistics() {
+    return {
+      ...this.getStatistics(),
+      hiddenFiles: this.hiddenFileRegistry.getStatistics()
+    };
+  }
+}
 
 module.exports = GlobalQueueManager;

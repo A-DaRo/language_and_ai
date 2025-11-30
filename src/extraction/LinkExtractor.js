@@ -11,9 +11,14 @@
  * - Extracts hierarchical context from parent elements
  * - Excludes self-references and invalid URLs
  * 
+ * Uses HtmlFacade for DOM operations to maintain abstraction layer.
+ * 
  * @see RecursiveScraper#discover
  * @see PageProcessor#scrapePage
  */
+
+const { HtmlFacadeFactory } = require('../html');
+
 class LinkExtractor {
   /**
    * @param {Config} config - Configuration object for base URL resolution.

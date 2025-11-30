@@ -1,7 +1,8 @@
 const fs = require('fs/promises');
 const path = require('path');
-const { JSDOM } = require('jsdom');
 const BlockIDMapper = require('./BlockIDMapper');
+const { PathStrategyFactory } = require('../domain/path');
+const { HtmlFacadeFactory } = require('../html');
 
 /**
  * @classdesc Handles offline link rewriting and CSS localization for scraped pages.
@@ -11,13 +12,22 @@ const BlockIDMapper = require('./BlockIDMapper');
  * - Calculates relative paths between pages based on directory structure
  * - Downloads and localizes external CSS stylesheets
  * - Preserves external links unchanged
- * - Uses JSDOM for safe DOM manipulation without browser overhead
+ * - **Preserves block IDs (anchors) during rewriting**
+ * - Uses HtmlFacade for context-agnostic DOM manipulation
  * 
- * This is a critical step that transforms the scraped content from online-dependent
- * to fully self-contained offline browsing.
+ * @design PATH STRATEGY PATTERN
+ * Link resolution uses the PathStrategyFactory to select the appropriate strategy:
+ * - IntraPathStrategy: Same-page links (returns anchor hash only)
+ * - InterPathStrategy: Cross-page links (returns relative path + optional anchor)
+ * - ExternalPathStrategy: External URLs (preserved unchanged)
  * 
- * @see RecursiveScraper#execute
- * @see PageContext#getRelativePathTo
+ * @design HTML FACADE PATTERN
+ * DOM manipulation is performed through HtmlFacade abstraction, allowing
+ * the same code to work with both Puppeteer pages (browser context) and
+ * JSDOM (server context for post-processing).
+ * 
+ * @see PathStrategyFactory - Strategy selection
+ * @see HtmlFacadeFactory - DOM abstraction factory
  * @see CssDownloader
  */
 class LinkRewriter {
@@ -25,12 +35,16 @@ class LinkRewriter {
    * @param {Config} config - Configuration object.
    * @param {Logger} logger - Logger instance.
    * @param {CssDownloader} cssDownloader - CSS downloader instance.
+   * @param {PathStrategyFactory} [pathStrategyFactory=null] - Optional custom factory.
    */
-  constructor(config, logger, cssDownloader) {
+  constructor(config, logger, cssDownloader, pathStrategyFactory = null) {
     this.config = config;
     this.logger = logger;
     this.cssDownloader = cssDownloader;
     this.blockIDMapper = new BlockIDMapper();
+    
+    // Initialize path strategy factory (use provided or create default)
+    this.pathStrategyFactory = pathStrategyFactory || new PathStrategyFactory(config, logger);
   }
 
   /**
@@ -67,9 +81,8 @@ class LinkRewriter {
         return 0;
       }
       
-      const html = await fs.readFile(htmlFilePath, 'utf-8');
-      const dom = new JSDOM(html);
-      const document = dom.window.document;
+      // Use HtmlFacade for context-agnostic DOM manipulation
+      const facade = await HtmlFacadeFactory.fromFile(htmlFilePath);
       
       // Create ID-to-Context map for robust lookup
       const idToContextMap = new Map();
@@ -84,7 +97,8 @@ class LinkRewriter {
       const pageDir = path.dirname(htmlFilePath);
       
       if (this.cssDownloader) {
-        const cssResult = await this.cssDownloader.downloadAndRewriteCss(dom, pageDir, pageContext.url);
+        // CssDownloader still needs the raw DOM for now
+        const cssResult = await this.cssDownloader.downloadAndRewriteCss(facade.getDom(), pageDir, pageContext.url);
         if (cssResult.modified) {
           modified = true;
           this.logger.success(
@@ -94,10 +108,10 @@ class LinkRewriter {
         }
       }
       
-      const links = document.querySelectorAll('a[href]');
+      const links = await facade.query('a[href]');
       
       for (const link of links) {
-        const href = link.getAttribute('href');
+        const href = await facade.getAttribute(link, 'href');
         if (!href) continue;
         
         let absoluteUrl;
@@ -117,33 +131,30 @@ class LinkRewriter {
           
           // Fallback: Try to find by ID if URL lookup failed
           if (!targetContext) {
-            const idMatch = urlPart.match(/29[a-f0-9]{30}/i);
+            const idMatch = urlPart.match(/([a-f0-9]{32})/i);
             if (idMatch) {
-              const id = idMatch[0];
+              const id = idMatch[1];
               targetContext = idToContextMap.get(id);
             }
           }
           
           if (targetContext) {
-            let newHref;
-            
-            // If target is the same page, only use hash (if present)
-            // This prevents reloading the page when clicking internal anchors
-            if (targetContext.id === pageContext.id) {
-              newHref = this._buildAnchorHash(blockIdRaw, targetContext, blockMapCache);
-              if (!newHref) {
-                newHref = 'index.html';
+            // Use PathStrategyFactory for unified path resolution
+            const newHref = this.pathStrategyFactory.resolvePath(
+              pageContext,
+              targetContext,
+              {
+                blockId: blockIdRaw,
+                blockMapCache
               }
-            } else {
-              // Different page: resolve full relative path + hash
-              const relativePath = pageContext.getRelativePathTo(targetContext);
-              const hash = this._buildAnchorHash(blockIdRaw, targetContext, blockMapCache);
-              newHref = relativePath + hash;
-            }
+            );
 
-            link.setAttribute('href', newHref);
+            // Handle edge case: same page with no block ID returns empty string
+            const finalHref = newHref === '' ? 'index.html' : newHref;
+
+            await facade.setAttribute(link, 'href', finalHref);
             rewriteCount++;
-            this.logger.debug('LINK-REWRITE', `${pageContext.title}: ${href} -> ${newHref}`);
+            this.logger.debug('LINK-REWRITE', `${pageContext.title}: ${href} -> ${finalHref}`);
           }
         } catch (error) {
           continue;
@@ -151,8 +162,7 @@ class LinkRewriter {
       }
       
       if (rewriteCount > 0 || modified) {
-        const modifiedHtml = dom.serialize();
-        await fs.writeFile(htmlFilePath, modifiedHtml, { encoding: 'utf-8' });
+        await facade.saveToFile(htmlFilePath);
         if (rewriteCount > 0) {
           this.logger.success('LINK-REWRITE', `Rewrote ${rewriteCount} links in ${pageContext.title}`);
         }
@@ -167,27 +177,73 @@ class LinkRewriter {
   }
 
   /**
-   * Parse href to separate URL and raw block ID
+   * Parse href to separate URL and raw block ID.
+   * 
+   * @description Extracts the URL portion and any block ID anchor from a full href.
+   * Notion uses block IDs after the hash symbol (e.g., #29d979eeca9f4abc...).
+   * 
    * @private
    * @param {string} href - Full href attribute
-   * @returns {Object} { urlPart, blockIdRaw }
+   * @returns {Object} { urlPart: string, blockIdRaw: string|null }
+   * 
+   * @example
+   * _parseHref('https://notion.so/page-abc#29d979eeca9f')
+   * // Returns: { urlPart: 'https://notion.so/page-abc', blockIdRaw: '29d979eeca9f' }
    */
   _parseHref(href) {
-    const parts = href.split('#');
-    const urlPart = parts[0].split('?')[0];
-    const blockIdRaw = parts.length > 1 ? parts[1] : null;
+    // Split on hash first to get block ID
+    const hashIndex = href.indexOf('#');
+    let urlPart = href;
+    let blockIdRaw = null;
+    
+    if (hashIndex !== -1) {
+      urlPart = href.substring(0, hashIndex);
+      blockIdRaw = href.substring(hashIndex + 1);
+      
+      // Validate block ID format (should be hex characters)
+      if (blockIdRaw && !/^[a-f0-9-]+$/i.test(blockIdRaw)) {
+        // Not a valid block ID format, might be a generic anchor
+        // Still preserve it for the hash
+      }
+    }
+    
+    // Remove query string from URL part
+    const queryIndex = urlPart.indexOf('?');
+    if (queryIndex !== -1) {
+      urlPart = urlPart.substring(0, queryIndex);
+    }
+    
     return { urlPart, blockIdRaw };
   }
 
   /**
-   * Build anchor hash for block ID
-   * Converts raw block ID to formatted UUID using block map if available
+   * Build anchor hash for block ID.
+   * 
+   * @description Converts raw block ID to formatted UUID using block map if available.
+   * This ensures block anchors work correctly in the offline version.
+   * 
+   * Algorithm:
+   * 1. If no blockIdRaw provided, return empty string
+   * 2. If block map cache available for target page, look up formatted ID
+   * 3. If found in map, return '#' + formattedId
+   * 4. If not found, fall back to formatting raw ID as UUID
+   * 5. Always preserve the block ID even without a map (use raw/formatted fallback)
    * 
    * @private
-   * @param {string|null} blockIdRaw - Raw block ID from URL
+   * @param {string|null} blockIdRaw - Raw block ID from URL (e.g., '29d979eeca9f4abc...')
    * @param {PageContext} targetContext - Target page context
-   * @param {Map<string, Map>} blockMapCache - Cache of block ID maps
+   * @param {Map<string, Map>} blockMapCache - Cache of block ID maps (pageId -> blockMap)
    * @returns {string} Formatted hash (e.g., '#29d979ee-ca9f-...') or empty string
+   * 
+   * @example
+   * // With block map cache hit
+   * _buildAnchorHash('29d979eeca9f4abc', targetCtx, cache)
+   * // Returns: '#29d979ee-ca9f-4abc-...'
+   * 
+   * @example
+   * // Without block map (fallback formatting)
+   * _buildAnchorHash('29d979eeca9f4abc', targetCtx, null)
+   * // Returns: '#29d979ee-ca9f-4abc-...' (UUID formatted)
    */
   _buildAnchorHash(blockIdRaw, targetContext, blockMapCache) {
     if (!blockIdRaw) {
@@ -197,13 +253,14 @@ class LinkRewriter {
     // Get block map for target page if cache provided
     if (blockMapCache && targetContext.id) {
       const blockMap = blockMapCache.get(targetContext.id);
-      if (blockMap) {
+      if (blockMap && blockMap.size > 0) {
         const formattedId = this.blockIDMapper.getFormattedId(blockIdRaw, blockMap);
         return '#' + formattedId;
       }
     }
 
-    // Fallback: format the raw ID directly
+    // Fallback: format the raw ID directly as UUID
+    // This ensures block IDs are preserved even without a block map
     const formattedId = this.blockIDMapper.getFormattedId(blockIdRaw, null);
     return '#' + formattedId;
   }

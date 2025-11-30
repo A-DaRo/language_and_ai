@@ -3,6 +3,7 @@ const fs = require('fs/promises');
 const path = require('path');
 const crypto = require('crypto');
 const FileSystemUtils = require('../utils/FileSystemUtils');
+const { HtmlFacadeFactory } = require('../html');
 
 /**
  * @classdesc Downloads and manages assets (images, files, etc.) from Notion pages.
@@ -61,28 +62,32 @@ class AssetDownloader {
     const imagesDir = path.join(outputDir, 'images');
     await fs.mkdir(imagesDir, { recursive: true });
     
-    // Extract all image URLs and background images
-    const assets = await page.evaluate(() => {
-      const results = [];
-      
-      // Get all img tags
-      document.querySelectorAll('img').forEach(img => {
-        if (img.src && img.src.startsWith('http')) {
-          results.push({ url: img.src, type: 'img' });
-        }
-      });
-      
-      // Get background images from inline styles
-      document.querySelectorAll('[style*="background"]').forEach(elem => {
-        const style = elem.getAttribute('style');
+    // Create HtmlFacade for DOM operations
+    const facade = HtmlFacadeFactory.forPage(page);
+    
+    // Extract all image URLs using HtmlFacade
+    const assets = [];
+    
+    // Get all img tags
+    const imgElements = await facade.query('img');
+    for (const img of imgElements) {
+      const src = await facade.getAttribute(img, 'src');
+      if (src && src.startsWith('http')) {
+        assets.push({ url: src, type: 'img', element: img });
+      }
+    }
+    
+    // Get background images from inline styles
+    const bgElements = await facade.query('[style*="background"]');
+    for (const elem of bgElements) {
+      const style = await facade.getAttribute(elem, 'style');
+      if (style) {
         const urlMatch = style.match(/url\(['"]?(https?:\/\/[^'")\s]+)['"]?\)/);
         if (urlMatch) {
-          results.push({ url: urlMatch[1], type: 'background' });
+          assets.push({ url: urlMatch[1], type: 'background', element: elem, originalStyle: style });
         }
-      });
-      
-      return results;
-    });
+      }
+    }
     
     this.logger.info('IMAGE', `Found ${assets.length} assets to process.`);
     
@@ -126,27 +131,22 @@ class AssetDownloader {
       }
     }
     
-    // Rewrite asset paths in the HTML
+    // Rewrite asset paths in the HTML using HtmlFacade
     this.logger.info('IMAGE', 'Rewriting asset paths in the HTML...');
-    await page.evaluate(map => {
-      // Rewrite img src
-      document.querySelectorAll('img').forEach(img => {
-        if (map[img.src]) {
-          img.src = map[img.src];
+    
+    // Rewrite img src using stored element references
+    for (const asset of assets) {
+      if (asset.type === 'img' && urlMap[asset.url]) {
+        await facade.setAttribute(asset.element, 'src', urlMap[asset.url]);
+      } else if (asset.type === 'background' && urlMap[asset.url]) {
+        // Rewrite background images in inline styles
+        let newStyle = asset.originalStyle;
+        if (newStyle.includes(asset.url)) {
+          newStyle = newStyle.replace(asset.url, urlMap[asset.url]);
+          await facade.setAttribute(asset.element, 'style', newStyle);
         }
-      });
-      
-      // Rewrite background images in inline styles
-      document.querySelectorAll('[style*="background"]').forEach(elem => {
-        let style = elem.getAttribute('style');
-        Object.keys(map).forEach(originalUrl => {
-          if (style.includes(originalUrl)) {
-            style = style.replace(originalUrl, map[originalUrl]);
-          }
-        });
-        elem.setAttribute('style', style);
-      });
-    }, urlMap);
+      }
+    }
     
     this.logger.success('IMAGE', `Downloaded ${successCount}/${assets.length} assets and rewritten paths.`);
   }

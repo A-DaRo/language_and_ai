@@ -2,6 +2,8 @@
  * @fileoverview Download task handler
  * @module worker/handlers/DownloadHandler
  * @description Handles IPC_DOWNLOAD messages in worker process.
+ * 
+ * Uses HtmlFacade abstraction for DOM operations.
  */
 
 const Logger = require('../../core/Logger');
@@ -10,6 +12,7 @@ const ScrapingPipeline = require('../pipeline/ScrapingPipeline');
 const NavigationStep = require('../pipeline/steps/NavigationStep');
 const CookieConsentStep = require('../pipeline/steps/CookieConsentStep');
 const ExpansionStep = require('../pipeline/steps/ExpansionStep');
+const ToggleCaptureStep = require('../pipeline/steps/ToggleCaptureStep');
 const AssetDownloadStep = require('../pipeline/steps/AssetDownloadStep');
 const LinkRewriterStep = require('../pipeline/steps/LinkRewriterStep');
 const HtmlWriteStep = require('../pipeline/steps/HtmlWriteStep');
@@ -22,7 +25,6 @@ const BlockIDExtractor = require('../../extraction/BlockIDExtractor');
 const BlockIDMapper = require('../../processing/BlockIDMapper');
 
 const path = require('path');
-const { JSDOM } = require('jsdom');
 
 /**
  * @class DownloadHandler
@@ -93,11 +95,20 @@ class DownloadHandler {
     };
 
     // Construct the scraping pipeline
+    // Pipeline order:
+    // 1. Navigate to page
+    // 2. Handle cookie consent
+    // 3. Expand content (scroll for lazy-loading)
+    // 4. Capture toggle states (dual-state for offline interactivity)
+    // 5. Download assets (images, CSS, files)
+    // 6. Rewrite links for offline navigation
+    // 7. Write final HTML to disk
     const pipeline = new ScrapingPipeline(
       [
         new NavigationStep(),
         new CookieConsentStep(this.cookieHandler),
         new ExpansionStep(this.contentExpander),
+        new ToggleCaptureStep(),  // NEW: Captures toggle states and injects controller
         new AssetDownloadStep(
           this.assetDownloader,
           this.cssDownloader,
@@ -124,6 +135,7 @@ class DownloadHandler {
         savedPath: payload.savePath,
         assetsDownloaded: pipelineContext.stats.assetsDownloaded,
         linksRewritten: pipelineContext.stats.linksRewritten,
+        togglesCaptured: pipelineContext.stats.togglesCaptured || 0,
         blockMapSaved: true
       };
 
@@ -135,18 +147,14 @@ class DownloadHandler {
 
   /**
    * Extract block IDs from saved HTML and save mapping
+   * Uses BlockIDExtractor with HtmlFacade abstraction
    * @private
    * @param {Object} payload - Download payload
    */
   async _extractAndSaveBlockIds(payload) {
     try {
-      const fs = require('fs/promises');
-      const htmlContent = await fs.readFile(payload.savePath, 'utf-8');
-      const dom = new JSDOM(htmlContent);
-      const document = dom.window.document;
-
-      // Extract block IDs from HTML
-      const blockMap = this.blockIDExtractor.extractBlockIDs(document);
+      // Extract block IDs using the new facade-based method
+      const blockMap = await this.blockIDExtractor.extractBlockIDsFromFile(payload.savePath);
 
       // Save mapping to disk
       if (blockMap.size > 0) {

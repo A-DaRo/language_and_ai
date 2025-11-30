@@ -16,6 +16,12 @@
  * @property {string} RESULT - Task result response
  * @property {string} SET_COOKIES - Broadcast cookies to worker
  * @property {string} UPDATE_REGISTRY - Update title registry after discovery completion
+ * @property {string} QUERY_HIDDEN_FILE - Worker queries master about hidden file status
+ * @property {string} HIDDEN_FILE_STATUS - Master responds with hidden file status
+ * @property {string} REGISTER_HIDDEN_FILE - Worker registers a new hidden file for processing
+ * @property {string} HIDDEN_FILE_REGISTERED - Master confirms hidden file registration
+ * @property {string} HIDDEN_FILE_COMPLETE - Worker reports hidden file download complete
+ * @property {string} HIDDEN_FILE_FAILED - Worker reports hidden file download failed
  */
 
 /**
@@ -34,7 +40,15 @@ const MESSAGE_TYPES = {
   // Worker -> Master responses
   READY: 'IPC_READY',
   RESULT: 'IPC_RESULT',
-  LOG: 'IPC_LOG'
+  LOG: 'IPC_LOG',
+  
+  // Hidden File Registry IPC (bidirectional)
+  QUERY_HIDDEN_FILE: 'IPC_QUERY_HIDDEN_FILE',
+  HIDDEN_FILE_STATUS: 'IPC_HIDDEN_FILE_STATUS',
+  REGISTER_HIDDEN_FILE: 'IPC_REGISTER_HIDDEN_FILE',
+  HIDDEN_FILE_REGISTERED: 'IPC_HIDDEN_FILE_REGISTERED',
+  HIDDEN_FILE_COMPLETE: 'IPC_HIDDEN_FILE_COMPLETE',
+  HIDDEN_FILE_FAILED: 'IPC_HIDDEN_FILE_FAILED'
 };
 
 /**

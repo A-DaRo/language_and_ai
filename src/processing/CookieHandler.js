@@ -15,6 +15,9 @@
  * @see PageProcessor#scrapePage
  * @see Config
  */
+
+const { HtmlFacadeFactory } = require('../html');
+
 class CookieHandler {
   /**
    * @param {Config} config - Configuration object for retry settings and behavior flags.
@@ -138,15 +141,21 @@ class CookieHandler {
     }
 
     try {
-      return await page.evaluate(() => {
-        const buttons = Array.from(document.querySelectorAll('div[role="button"]'));
-        const rejectButton = buttons.find(btn => btn.textContent && btn.textContent.includes('Reject'));
-        if (rejectButton) {
-          rejectButton.click();
+      // Create HtmlFacade for DOM operations
+      const facade = HtmlFacadeFactory.forPage(page);
+      
+      // Query all button-role divs
+      const buttons = await facade.query('div[role="button"]');
+      
+      for (const btn of buttons) {
+        const text = await facade.getTextContent(btn);
+        if (text && text.includes('Reject')) {
+          await btn.click();
           return true;
         }
-        return false;
-      });
+      }
+      
+      return false;
     } catch (error) {
       this.logger.error('COOKIE', 'Error while attempting to click the reject button', error);
       return false;
@@ -170,18 +179,26 @@ class CookieHandler {
       });
       this.logger.info('COOKIE', 'Confirmation dialog detected.');
 
-      const okButtonClicked = await page.evaluate(() => {
-        const dialog = document.querySelector('div[role="dialog"][aria-modal="true"]');
-        if (dialog) {
-          const buttons = Array.from(dialog.querySelectorAll('div[role="button"]'));
-          const okButton = buttons.find(btn => btn.textContent && btn.textContent.trim().toLowerCase() === 'ok');
-          if (okButton) {
-            okButton.click();
-            return true;
+      // Create HtmlFacade for DOM operations
+      const facade = HtmlFacadeFactory.forPage(page);
+      
+      // Find the dialog and its buttons
+      const dialog = await facade.queryOne('div[role="dialog"][aria-modal="true"]');
+      let okButtonClicked = false;
+      
+      if (dialog) {
+        // Query buttons within the dialog - need to use page.evaluate for scoped query
+        const buttons = await facade.query('div[role="dialog"][aria-modal="true"] div[role="button"]');
+        
+        for (const btn of buttons) {
+          const text = await facade.getTextContent(btn);
+          if (text && text.trim().toLowerCase() === 'ok') {
+            await btn.click();
+            okButtonClicked = true;
+            break;
           }
         }
-        return false;
-      });
+      }
 
       if (okButtonClicked) {
         this.logger.info('COOKIE', 'Clicked "OK" button. Waiting for stability...');
