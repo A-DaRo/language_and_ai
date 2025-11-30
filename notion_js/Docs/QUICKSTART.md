@@ -103,5 +103,4 @@ The scraper requires the target Notion page URL to be configured.
 ## Advanced Usage
 
 For advanced configuration and architectural details, refer to:
-*   `Docs/README.md`: Comprehensive documentation.
-*   `Docs/ARCHITECTURE.md`: Internal system architecture.
+*   `Docs/ARCHITECTURE.md`: Comprehensive documentation, and system architecture.
