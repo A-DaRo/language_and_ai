@@ -122,10 +122,10 @@ describe('TaskRunner', () => {
     };
     
     await taskRunner.execute(MESSAGE_TYPES.DISCOVER, payload1);
-    const firstPage = taskRunner.page;
+    const firstPage = taskRunner.discoveryHandler.page;
     
     await taskRunner.execute(MESSAGE_TYPES.DISCOVER, payload2);
-    const secondPage = taskRunner.page;
+    const secondPage = taskRunner.discoveryHandler.page;
     
     expect(firstPage).toBe(secondPage); // Same page reused
   });
@@ -139,9 +139,9 @@ describe('TaskRunner', () => {
     };
     
     await taskRunner.execute(MESSAGE_TYPES.DISCOVER, payload);
-    expect(taskRunner.page).toBeTruthy();
+    expect(taskRunner.discoveryHandler.page).toBeTruthy();
     
     await taskRunner.cleanup();
-    expect(taskRunner.page).toBeNull();
+    expect(taskRunner.discoveryHandler.page).toBeNull();
   });
 });

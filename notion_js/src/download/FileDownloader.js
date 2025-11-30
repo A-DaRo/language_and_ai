@@ -245,8 +245,7 @@ class FileDownloader {
         if (downloadUrl) {
              this.logger.info('FILE', `Captured hidden download URL: ${downloadUrl}`);
              
-             // Use timestamp as index to avoid conflicts
-             const filename = this.nameExtractor.extractFilename(downloadUrl, text, Date.now() % 10000, 'files');
+             const filename = this.nameExtractor.extractFilename(downloadUrl, text, 'files');
              const localFilePath = path.join(filesDir, filename);
              
              if (!this.downloadStrategy.hasDownloaded(downloadUrl)) {

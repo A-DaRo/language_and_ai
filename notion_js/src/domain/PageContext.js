@@ -48,6 +48,10 @@ class PageContext {
     this.isNestedUnderParent = false;
     this.targetFilePath = null;
 
+    // Pre-computed path segments for IPC serialization safety
+    // Computed at creation time when parentContext is available
+    this.pathSegments = this._computePathSegments();
+
     // Initialize path calculator
     this.pathCalculator = new PathCalculator();
   }
@@ -61,6 +65,37 @@ class PageContext {
   _extractNotionId(url) {
     const match = url.match(/([a-f0-9]{32})/i);
     return match ? match[1] : url;
+  }
+
+  /**
+   * Compute path segments from root to this page.
+   * Called at construction time when parentContext chain is available.
+   * This array survives JSON serialization for IPC transport.
+   * @private
+   * @returns {string[]} Array of sanitized directory names from root to this page
+   */
+  _computePathSegments() {
+    const segments = [];
+    let current = this;
+
+    while (current) {
+      // Only include pages with depth > 0 (skip root in path)
+      if (current.depth > 0 && current.title && current.title !== 'untitled') {
+        segments.unshift(FileSystemUtils.sanitizeFilename(current.title));
+      }
+      current = current.parentContext;
+    }
+
+    return segments;
+  }
+
+  /**
+   * Get path segments for this context.
+   * Uses pre-computed array which survives IPC serialization.
+   * @returns {string[]} Path segments from root to this page
+   */
+  getPathSegments() {
+    return this.pathSegments || [];
   }
 
   /**
@@ -181,7 +216,9 @@ class PageContext {
       subsection: this.subsection,
       childIds: this.childIds,
       isNestedUnderParent: this.isNestedUnderParent,
-      targetFilePath: this.targetFilePath
+      targetFilePath: this.targetFilePath,
+      // Pre-computed path segments survive IPC serialization
+      pathSegments: this.pathSegments || []
     };
   }
 
@@ -209,6 +246,12 @@ class PageContext {
     context.targetFilePath = json.targetFilePath;
     context.rawTitle = json.rawTitle || context.rawTitle;
     context.title = json.title || FileSystemUtils.sanitizeFilename(context.rawTitle);
+
+    // Restore pre-computed path segments from serialized data
+    // This is critical for path resolution after IPC deserialization
+    if (json.pathSegments && Array.isArray(json.pathSegments)) {
+      context.pathSegments = json.pathSegments;
+    }
 
     if (contextMap && json.parentId) {
       context.parentContext = contextMap.get(json.parentId) || null;

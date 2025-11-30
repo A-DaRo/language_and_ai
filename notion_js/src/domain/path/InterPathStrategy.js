@@ -197,15 +197,19 @@ class InterPathStrategy extends PathStrategy {
   }
 
   /**
-   * Get path segments for a context by traversing parent chain.
+   * Get path segments for a context.
+   * Prefers pre-computed pathSegments (survives IPC serialization).
+   * Falls back to parent chain traversal if not available.
    * 
    * @private
    * @param {PageContext} context - Page context to get segments for
    * @returns {string[]} Array of sanitized path segments (excluding root)
    * 
-   * @description Traverses the parent chain from the context up to the root,
-   * collecting sanitized titles. Root pages (depth=0) are excluded since
-   * they live directly in the base output directory.
+   * @description 
+   * Priority order:
+   * 1. Pre-computed pathSegments array (IPC-safe, computed at construction)
+   * 2. getPathSegments() method if available
+   * 3. Manual parent chain traversal (only works pre-serialization)
    * 
    * @example
    * // For a page at depth 2 with parents: Root → Section → Page
@@ -213,6 +217,20 @@ class InterPathStrategy extends PathStrategy {
    * // Returns: ['Section', 'Page']
    */
   _getPathSegments(context) {
+    // Priority 1: Use pre-computed pathSegments (survives IPC serialization)
+    if (context.pathSegments && Array.isArray(context.pathSegments) && context.pathSegments.length > 0) {
+      return [...context.pathSegments];  // Return copy to prevent mutation
+    }
+
+    // Priority 2: Use getPathSegments() method if available
+    if (typeof context.getPathSegments === 'function') {
+      const segments = context.getPathSegments();
+      if (segments && segments.length > 0) {
+        return [...segments];
+      }
+    }
+
+    // Priority 3: Fallback to parent chain traversal (only works pre-serialization)
     const segments = [];
     let current = context;
 

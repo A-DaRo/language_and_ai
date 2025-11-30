@@ -22,7 +22,8 @@ describe('WorkerProxy (master-side)', () => {
     bus.once('WORKER:READY', (payload) => {
       try {
         expect(payload.workerId).toBe('worker-1');
-        expect(proxy.state).toBe(WorkerState.IDLE);
+        // Use proper accessor via stateManager
+        expect(proxy.stateManager.getState()).toBe(WorkerState.IDLE);
         done();
       } catch (err) {
         done(err);
@@ -78,7 +79,8 @@ describe('WorkerProxy (master-side)', () => {
       try {
         expect(workerId).toBe('worker-2');
         expect(seenComplete).toBe(true);
-        expect(proxy.state).toBe(WorkerState.IDLE);
+        // Use proper accessor via stateManager
+        expect(proxy.stateManager.getState()).toBe(WorkerState.IDLE);
         done();
       } catch (err) {
         done(err);

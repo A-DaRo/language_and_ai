@@ -93,7 +93,7 @@ describe('DashboardController', () => {
 
       expect(controller.dashboard.setMode).toHaveBeenCalledWith('discovery', { total: 100 });
       expect(controller.dashboard.updateHeader).toHaveBeenCalledWith(
-        expect.stringContaining('DISCOVERY')
+        expect.stringContaining('Discovery Phase')
       );
     });
 
@@ -134,7 +134,7 @@ describe('DashboardController', () => {
 
       expect(controller.dashboard.updateWorkerStatus).toHaveBeenCalledWith(
         1, // worker-2 maps to slot 1
-        '[BUSY] Downloading page X'
+        '[BUSY] Worker 2: Downloading page X [PagesAssigned: 1]'
       );
     });
 
@@ -143,7 +143,7 @@ describe('DashboardController', () => {
 
       expect(controller.dashboard.updateWorkerStatus).toHaveBeenCalledWith(
         0, // worker-1 maps to slot 0
-        '[IDLE] Waiting for task...'
+        '[IDLE] Worker 1: Waiting for task...'
       );
     });
 
@@ -152,7 +152,7 @@ describe('DashboardController', () => {
 
       expect(controller.dashboard.updateWorkerStatus).toHaveBeenCalledWith(
         2, // worker-3 maps to slot 2
-        '[IDLE] Waiting for task...'
+        '[IDLE] Worker 3: Waiting for task...'
       );
     });
 
@@ -172,7 +172,7 @@ describe('DashboardController', () => {
         task: { description: 'Task A' }
       });
 
-      expect(controller.dashboard.updateWorkerStatus).toHaveBeenCalledWith(0, '[BUSY] Task A');
+      expect(controller.dashboard.updateWorkerStatus).toHaveBeenCalledWith(0, '[BUSY] Worker 1: Task A [PagesAssigned: 1]');
 
       // Worker 2 becomes busy
       mockEventBus.emit('WORKER:BUSY', {
@@ -180,14 +180,14 @@ describe('DashboardController', () => {
         task: { description: 'Task B' }
       });
 
-      expect(controller.dashboard.updateWorkerStatus).toHaveBeenCalledWith(1, '[BUSY] Task B');
+      expect(controller.dashboard.updateWorkerStatus).toHaveBeenCalledWith(1, '[BUSY] Worker 2: Task B [PagesAssigned: 1]');
 
       // Worker 1 becomes idle
       mockEventBus.emit('WORKER:IDLE', { workerId: 'worker-1' });
 
       expect(controller.dashboard.updateWorkerStatus).toHaveBeenCalledWith(
         0,
-        '[IDLE] Waiting for task...'
+        '[IDLE] Worker 1: Waiting for task...'
       );
     });
   });
@@ -228,7 +228,8 @@ describe('DashboardController', () => {
         const headerCalls = controller.dashboard.updateHeader.mock.calls;
         const lastCall = headerCalls[headerCalls.length - 1][0];
         
-        expect(lastCall).toMatch(/Elapsed: 2:0[5-6]/);
+        // Format is "Xm Ys" (e.g., "2m 5s")
+        expect(lastCall).toMatch(/Elapsed: 2m [5-6]s/);
         done();
       }, 1100);
     });
@@ -241,7 +242,8 @@ describe('DashboardController', () => {
         const headerCalls = controller.dashboard.updateHeader.mock.calls;
         const lastCall = headerCalls[headerCalls.length - 1][0];
         
-        expect(lastCall).toMatch(/Elapsed: 0:0[5-6]/);
+        // Format is "Xm Ys" (e.g., "0m 5s")
+        expect(lastCall).toMatch(/Elapsed: 0m [5-6]s/);
         done();
       }, 1100);
     });

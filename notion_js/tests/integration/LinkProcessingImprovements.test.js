@@ -172,16 +172,18 @@ describe('Link Processing Improvements - Integration Tests', () => {
       // Create page contexts
       const root = new PageContext('https://notion.so/root-29root', 'Root', 0);
       root.htmlFilePath = htmlFilePath;
+      root.pathSegments = []; // Root has empty pathSegments
 
       const targetPage = new PageContext('https://notion.so/section-29def', 'Section', 1, root, root.id);
-      targetPage.htmlFilePath = path.join(tempDir, 'section', 'index.html');
+      targetPage.htmlFilePath = path.join(tempDir, 'Section', 'index.html');
+      targetPage.pathSegments = ['Section']; // Set after construction since parentContext is passed but pathSegments computed at construction
 
       // Save block map for target page
       const blockMap = new Map([
         ['29d979eeca9f81f7b82fe4b983834212', '29d979ee-ca9f-81f7-b82f-e4b983834212']
       ]);
 
-      const sectionDir = path.join(tempDir, 'section');
+      const sectionDir = path.join(tempDir, 'Section');
       await fs.mkdir(sectionDir, { recursive: true });
 
       const mapper = new BlockIDMapper();
@@ -206,8 +208,10 @@ describe('Link Processing Improvements - Integration Tests', () => {
       // Check that HTML was modified
       const modifiedHtml = await fs.readFile(htmlFilePath, 'utf-8');
 
-      // Should contain relative path to section + formatted block ID
-      expect(modifiedHtml).toContain('section/index.html#29d979ee-ca9f-81f7-b82f-e4b983834212');
+      // Should contain relative path to Section + formatted block ID
+      // Root (pathSegments: []) -> Section (pathSegments: ['Section'])
+      // Result: Section/index.html#blockid
+      expect(modifiedHtml).toContain('Section/index.html#29d979ee-ca9f-81f7-b82f-e4b983834212');
     });
 
     it('should handle same-page links with block anchors', async () => {
@@ -250,13 +254,15 @@ describe('Link Processing Improvements - Integration Tests', () => {
     it('should handle complete flow from discovery to link rewriting', async () => {
       // Setup: Create a simple hierarchy
       const root = new PageContext('https://notion.so/index-29root', 'Index', 0);
+      root.pathSegments = []; // Root has empty segments
+      
       const about = new PageContext('https://notion.so/about-29about', 'About', 1, root, root.id);
+      about.pathSegments = ['About']; // Child has its sanitized title
 
-      // Save HTML files
-      const indexDir = path.join(tempDir, 'index');
-      const aboutDir = path.join(tempDir, 'about');
+      // Save HTML files - use capitalized directory names matching pathSegments
+      const indexDir = tempDir; // Root is at tempDir itself
+      const aboutDir = path.join(tempDir, 'About');
 
-      await fs.mkdir(indexDir, { recursive: true });
       await fs.mkdir(aboutDir, { recursive: true });
 
       root.htmlFilePath = path.join(indexDir, 'index.html');
@@ -316,12 +322,15 @@ describe('Link Processing Improvements - Integration Tests', () => {
       const rewrittenIndex = await fs.readFile(root.htmlFilePath, 'utf-8');
       const rewrittenAbout = await fs.readFile(about.htmlFilePath, 'utf-8');
 
-      // Index should link to about with relative path and formatted block ID
-      expect(rewrittenIndex).toContain('about/index.html');
+      // Index (root, pathSegments: []) -> About (pathSegments: ['About'])
+      // Result: About/index.html
+      expect(rewrittenIndex).toContain('About/index.html');
       expect(rewrittenIndex).toContain('#22222222-2222-2222-2222-222222222222');
 
-      // About should link back to index with relative path
-      expect(rewrittenAbout).toContain('../index/index.html');
+      // About (pathSegments: ['About']) -> Index (root, pathSegments: [])
+      // upLevels: 1, downSegments: []
+      // Result: ../index.html
+      expect(rewrittenAbout).toContain('../index.html');
       expect(rewrittenAbout).toContain('#11111111-1111-1111-1111-111111111111');
     });
   });

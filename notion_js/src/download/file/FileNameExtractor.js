@@ -37,8 +37,8 @@ class FileNameExtractor {
       '.zip', '.rar', '.7z', '.tar', '.gz', '.tgz',
       // Code files
       '.py', '.js', '.ts', '.java', '.cpp', '.c', '.h', '.cs', '.rb', '.go',
-      // Data files
-      '.ipynb', '.json', '.xml', '.txt', '.md', '.csv', '.yaml', '.yml',
+      // Data files .csv excluded.
+      '.ipynb', '.json', '.xml', '.txt', '.md', '.yaml', '.yml',
       // Media
       '.mp4', '.avi', '.mov', '.mp3', '.wav', '.ogg', '.webm',
       // Images

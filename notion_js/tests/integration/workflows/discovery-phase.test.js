@@ -62,16 +62,16 @@ describe('Discovery Phase Workflow', () => {
 
     // Simulate discovery sequence
     queueManager.enqueueDiscovery(root, true);
-    expect(queueManager.discoveryQueue.length).toBe(1);
+    expect(queueManager.discoveryQueue.getLength()).toBe(1);
 
     // Root discovered, children added
     queueManager.enqueueDiscovery(child1);
     queueManager.enqueueDiscovery(child2);
-    expect(queueManager.discoveryQueue.length).toBe(3);
+    expect(queueManager.discoveryQueue.getLength()).toBe(3);
 
     // Child1 discovered, grandchild added
     queueManager.enqueueDiscovery(grandchild);
-    expect(queueManager.discoveryQueue.length).toBe(4);
+    expect(queueManager.discoveryQueue.getLength()).toBe(4);
 
     // Analyze graph topology using edge classification
     graphAnalyzer.addTreeEdge(root.url, child1.url, child1.title);
@@ -162,7 +162,7 @@ describe('Discovery Phase Workflow', () => {
     queueManager.enqueueDiscovery(depth2);
 
     // Verify all enqueued
-    expect(queueManager.discoveryQueue.length).toBe(4);
+    expect(queueManager.discoveryQueue.getLength()).toBe(4);
 
     // Dequeue should follow breadth-first ordering
     const task1 = queueManager.nextDiscovery();
@@ -193,6 +193,6 @@ describe('Discovery Phase Workflow', () => {
     expect(enqueued2).toBe(false);
 
     // Queue should only have one item
-    expect(queueManager.discoveryQueue.length).toBe(1);
+    expect(queueManager.discoveryQueue.getLength()).toBe(1);
   });
 });

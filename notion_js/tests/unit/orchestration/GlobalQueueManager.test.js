@@ -27,8 +27,9 @@ describe('GlobalQueueManager', () => {
     const duplicate = queueManager.enqueueDiscovery(root, false);
     expect(duplicate).toBe(false);
 
-    expect(queueManager.discoveryQueue.length).toBe(1);
-    expect(queueManager.maxDepth).toBe(0);
+    // Use proper accessors instead of direct property access
+    expect(queueManager.discoveryQueue.getLength()).toBe(1);
+    expect(queueManager.discoveryQueue.getMaxDepth()).toBe(0);
   });
 
   test('next disc retrieves task and increments pending count', () => {
@@ -42,7 +43,8 @@ describe('GlobalQueueManager', () => {
     const task = queueManager.nextDiscovery();
     expect(task).toBeTruthy();
     expect(task.pageContext).toBe(ctx);
-    expect(queueManager.pendingDiscovery).toBe(1);
+    // Use proper accessor for pending count
+    expect(queueManager.discoveryQueue.getPendingCount()).toBe(1);
   });
 
   test('completeDiscovery creates child contexts from links', () => {
@@ -64,8 +66,8 @@ describe('GlobalQueueManager', () => {
     expect(newContexts[0].depth).toBe(1);
     expect(newContexts[1].depth).toBe(1);
 
-    // check title registry
-    expect(queueManager.idToTitleMap.get(parent.id)).toBe('Parent Title');
+    // Use proper accessor for title registry
+    expect(queueManager.titleRegistry.get(parent.id)).toBe('Parent Title');
   });
 
   test('isDiscoveryComplete returns true when queue and pending are empty', () => {

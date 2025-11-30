@@ -58,19 +58,66 @@ class IntraPathStrategy extends PathStrategy {
    * @override
    * @param {PageContext} sourceContext - Origin page context
    * @param {PageContext} targetContext - Destination page context
-   * @returns {boolean} True if both contexts refer to the same page
+   * @param {string} [targetHref] - Original href for anchor-only detection
+   * @returns {boolean} True if both contexts refer to the same page or href is anchor-only
    * 
-   * @description Returns true when source and target have the same page ID,
-   * indicating an in-page link (anchor) rather than cross-page navigation.
+   * @description Returns true when:
+   * 1. The href is anchor-only (starts with #) - always intra-page
+   * 2. Source and target have the same page ID
+   * This enables correct handling of ToC links and in-page navigation.
    */
-  supports(sourceContext, targetContext) {
-    // Guard against null/undefined contexts
-    if (!sourceContext || !targetContext) {
+  supports(sourceContext, targetContext, targetHref = null) {
+    // Guard against null/undefined source context
+    if (!sourceContext) {
       return false;
     }
 
-    // Same page if IDs match
+    // Method 1: Anchor-only links are always intra-page
+    // This handles ToC entries like "#29d979ee-ca9f-81cf-..."
+    if (this._isAnchorOnly(targetHref)) {
+      return true;
+    }
+
+    // Method 2: Guard against null target for non-anchor links
+    if (!targetContext) {
+      return false;
+    }
+
+    // Method 3: Same page if IDs match
     return sourceContext.id === targetContext.id;
+  }
+
+  /**
+   * Check if href is an anchor-only link.
+   * @private
+   * @param {string} href - Link href to check
+   * @returns {boolean} True if href starts with '#'
+   */
+  _isAnchorOnly(href) {
+    return href && typeof href === 'string' && href.startsWith('#');
+  }
+
+  /**
+   * Extract block ID from various href formats.
+   * @private
+   * @param {string} href - Link href
+   * @returns {string|null} Block ID or null if not found
+   */
+  _extractBlockIdFromHref(href) {
+    if (!href || typeof href !== 'string') {
+      return null;
+    }
+
+    // Extract fragment after #
+    const hashIndex = href.indexOf('#');
+    if (hashIndex !== -1) {
+      const fragment = href.substring(hashIndex + 1);
+      // Validate it looks like a Notion block ID (32 hex chars with optional dashes)
+      if (/^[a-f0-9-]{32,36}$/i.test(fragment)) {
+        return fragment;
+      }
+    }
+    return null;
   }
 
   /**
@@ -91,10 +138,12 @@ class IntraPathStrategy extends PathStrategy {
    * @param {PageContext} targetContext - Destination page context (same as source)
    * @param {Object} [options={}] - Resolution options
    * @param {string} [options.blockId] - Target block ID for anchor
+   * @param {string} [options.targetHref] - Original href (for anchor-only extraction)
    * @param {Map<string, Map<string, string>>} [options.blockMapCache] - Block ID mapping cache
    * @returns {string} Anchor hash (e.g., '#29d979ee-ca9f-...') or empty string
    * 
    * @description For same-page links:
+   * - If href is anchor-only: Return it as-is or with formatting
    * - If blockId provided: Returns formatted anchor hash
    * - If no blockId: Returns empty string (link to current location)
    * 
@@ -102,7 +151,18 @@ class IntraPathStrategy extends PathStrategy {
    * falling back to standard UUID formatting.
    */
   resolve(sourceContext, targetContext, options = {}) {
-    const { blockId, blockMapCache } = options;
+    const { blockId, blockMapCache, targetHref } = options;
+
+    // If we have an anchor-only href, extract and format the block ID from it
+    if (this._isAnchorOnly(targetHref)) {
+      const extractedBlockId = this._extractBlockIdFromHref(targetHref);
+      if (extractedBlockId) {
+        const formattedId = this._formatBlockId(extractedBlockId, targetContext || sourceContext, blockMapCache);
+        return `#${formattedId}`;
+      }
+      // Return the anchor as-is if we can't extract a block ID
+      return targetHref;
+    }
 
     // No block ID means link to current location
     if (!blockId) {

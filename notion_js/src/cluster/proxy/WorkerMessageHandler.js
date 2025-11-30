@@ -36,7 +36,7 @@ class WorkerMessageHandler {
       validateMessage(message);
 
       if (message.type === MESSAGE_TYPES.READY) {
-        this._handleReady(message);
+        this._handleReady(message, stateManager);
       } else if (message.type === MESSAGE_TYPES.RESULT) {
         this._handleResult(message, stateManager);
       } else {
@@ -68,10 +68,14 @@ class WorkerMessageHandler {
    * Handle READY signal from worker
    * @private
    * @param {Object} message - Ready message
+   * @param {Object} stateManager - Worker state manager
    * @returns {void}
    */
-  _handleReady(message) {
+  _handleReady(message, stateManager) {
     this.logger.info('WorkerMessageHandler', `Worker ${this.workerId} is ready (PID: ${message.pid})`);
+
+    // Transition from INITIALIZING to IDLE
+    stateManager.markIdle();
 
     this.eventBus.emit('WORKER:READY', {
       workerId: this.workerId,

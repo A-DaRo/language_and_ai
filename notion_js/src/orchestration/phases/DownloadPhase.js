@@ -60,12 +60,17 @@ class DownloadPhase extends PhaseStrategy {
       const titleRegistry = this.queueManager.getTitleRegistry();
       const pageTitle = context.getDisplayTitle(titleRegistry);
 
+      // Get path segments for relative path computation in worker
+      // This enables proper source-relative link rewriting
+      const pathSegments = context.getPathSegments ? context.getPathSegments() : [];
+
       // Execute download
       const workerId = await this.browserManager.execute(MESSAGE_TYPES.DOWNLOAD, {
         url: context.url,
         pageId: context.id,
         parentId: context.parentId,
         depth: context.depth,
+        pathSegments: pathSegments,  // NEW: Enable source-relative path computation
         savePath: savePath,
         cookies: this.orchestrator.cookies,
         linkRewriteMap: Object.fromEntries(linkRewriteMap),

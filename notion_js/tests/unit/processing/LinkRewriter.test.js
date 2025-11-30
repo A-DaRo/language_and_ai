@@ -42,6 +42,8 @@ describe('LinkRewriter', () => {
       depth: 0
     });
     parentContext.htmlFilePath = '/tmp/output/Parent/index.html';
+    // Root page has empty pathSegments (depth 0)
+    parentContext.pathSegments = [];
     
     const childContext = createMockPageContext({
       url: 'https://notion.so/Child-29' + 'b'.repeat(30),
@@ -49,6 +51,9 @@ describe('LinkRewriter', () => {
       depth: 1
     });
     childContext.htmlFilePath = '/tmp/output/Parent/Child/index.html';
+    childContext.parentContext = parentContext;
+    // Child at depth 1 includes only its own title in pathSegments
+    childContext.pathSegments = ['Child'];
     parentContext.addChild(childContext);
     
     const html = `
@@ -73,8 +78,11 @@ describe('LinkRewriter', () => {
     expect(fs.writeFile).toHaveBeenCalled();
     
     // Verify the rewritten HTML was saved
+    // Root (pathSegments: []) -> Child (pathSegments: ['Child'])
+    // commonDepth: 0, upLevels: 0, downSegments: ['Child']
+    // Result: Child/index.html
     const savedHtml = fs.writeFile.mock.calls[0][1];
-    expect(savedHtml).toMatch(/href="(\.\.\/)Child\/index\.html"/); // Relative path with ../ prefix
+    expect(savedHtml).toMatch(/href="Child\/index\.html"/); // Relative path from root to child
     expect(savedHtml).toMatch(/href="https:\/\/external\.com"/); // External unchanged
   });
 
@@ -98,6 +106,7 @@ describe('LinkRewriter', () => {
       depth: 0
     });
     root.htmlFilePath = '/tmp/output/Root/index.html';
+    root.pathSegments = []; // Root has empty segments
     
     const childA = createMockPageContext({
       url: 'https://notion.so/ChildA-29' + 'a'.repeat(30),
@@ -106,6 +115,7 @@ describe('LinkRewriter', () => {
     });
     childA.htmlFilePath = '/tmp/output/Root/ChildA/index.html';
     childA.parentContext = root;
+    childA.pathSegments = ['ChildA']; // Set after construction
     
     const childB = createMockPageContext({
       url: 'https://notion.so/ChildB-29' + 'b'.repeat(30),
@@ -114,6 +124,7 @@ describe('LinkRewriter', () => {
     });
     childB.htmlFilePath = '/tmp/output/Root/ChildB/index.html';
     childB.parentContext = root;
+    childB.pathSegments = ['ChildB']; // Set after construction
     
     const html = `
       <html>
@@ -157,6 +168,7 @@ describe('LinkRewriter', () => {
       depth: 0
     });
     parentContext.htmlFilePath = '/tmp/output/Parent/index.html';
+    parentContext.pathSegments = []; // Root has empty segments
     
     const childId = '29' + 'b'.repeat(30);
     const childContext = createMockPageContext({
@@ -165,6 +177,8 @@ describe('LinkRewriter', () => {
       depth: 1
     });
     childContext.htmlFilePath = '/tmp/output/Parent/Child/index.html';
+    childContext.parentContext = parentContext;
+    childContext.pathSegments = ['Child']; // Set after construction
     parentContext.addChild(childContext);
     
     // HTML contains links with just the ID or different URL format but same ID
@@ -189,7 +203,9 @@ describe('LinkRewriter', () => {
     expect(count).toBe(2);
     const savedHtml = fs.writeFile.mock.calls[0][1];
     // Both links should point to the same relative path
-    const matches = savedHtml.match(/href="(\.\.\/)Child\/index\.html"/g);
+    // Root (pathSegments: []) -> Child (pathSegments: ['Child'])
+    // Result: Child/index.html (no ../ needed from root)
+    const matches = savedHtml.match(/href="Child\/index\.html"/g);
     expect(matches).toHaveLength(2);
   });
 });

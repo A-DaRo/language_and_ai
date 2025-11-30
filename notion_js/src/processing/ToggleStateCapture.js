@@ -63,6 +63,7 @@ class ToggleStateCapture {
      * @param {Logger} logger - Logger instance for progress tracking
      * @param {Object} [options={}] - Configuration options
      * @param {number} [options.animationWait=300] - Wait time for toggle animations (ms)
+     * @param {number} [options.contentWait=2000] - Max wait time for content to appear (ms)
      * @param {number} [options.maxToggles=100] - Maximum toggles to capture (prevents runaway)
      * @param {Array<string>} [options.skipPatterns=[]] - Text patterns to skip (destructive actions)
      */
@@ -70,6 +71,7 @@ class ToggleStateCapture {
         this.logger = logger;
         this.options = {
             animationWait: options.animationWait || 300,
+            contentWait: options.contentWait || 2000,
             maxToggles: options.maxToggles || 100,
             skipPatterns: options.skipPatterns || ['delete', 'remove', 'share', 'export', 'duplicate']
         };
@@ -187,7 +189,9 @@ class ToggleStateCapture {
         
         // Click to toggle state
         await toggleElement.click();
-        await this._waitForAnimation(page);
+        
+        // Wait for content to appear (not just animation)
+        await this._waitForContentChange(facade, page, toggleElement, currentHtml);
         
         // Capture opposite state HTML
         const oppositeHtml = await this._getToggleContentHtml(facade, page, toggleElement);
@@ -260,24 +264,106 @@ class ToggleStateCapture {
             const block = el.closest('[data-block-id]');
             if (!block) return '';
             
-            // Notion toggle content is typically in:
-            // 1. A sibling div with notion-toggle-content class
-            // 2. A child container that's hidden/shown
-            // 3. The last child element of the block
-            const contentArea = 
-                block.querySelector('.notion-toggle-content') ||
-                block.querySelector('[style*="display: none"]') ||
-                block.querySelector('[style*="display: block"]') ||
-                block.querySelector('[data-content-editable-leaf]')?.parentElement ||
-                block.lastElementChild;
+            const blockId = block.getAttribute('data-block-id');
             
-            if (!contentArea || contentArea === el) {
-                // If content area is the button itself, return empty
-                return '';
+            // Strategy 1: Find sibling content container with matching ID reference
+            const siblingContent = document.querySelector(
+                `[data-content-for="${blockId}"], [data-toggle-content="${blockId}"]`
+            );
+            if (siblingContent) {
+                return siblingContent.outerHTML;
             }
             
-            return contentArea.outerHTML;
+            // Strategy 2: Check aria-controls attribute for controlled element
+            const ariaControls = el.getAttribute('aria-controls');
+            if (ariaControls) {
+                const controlledElement = document.getElementById(ariaControls);
+                if (controlledElement) {
+                    return controlledElement.outerHTML;
+                }
+            }
+            
+            // Strategy 3: Find next sibling with toggle content characteristics
+            let sibling = block.nextElementSibling;
+            while (sibling) {
+                const classes = sibling.className || '';
+                // Look for content containers that aren't other blocks
+                if ((classes.includes('toggle-content') || 
+                     classes.includes('notion-column-list') ||
+                     !sibling.hasAttribute('data-block-id')) &&
+                    sibling.children.length > 0) {
+                    return sibling.outerHTML;
+                }
+                // Stop if we hit another data-block-id (different block)
+                if (sibling.hasAttribute('data-block-id')) break;
+                sibling = sibling.nextElementSibling;
+            }
+            
+            // Strategy 4: Look for indented child content blocks
+            const indentedContent = block.querySelector(
+                ':scope > div:not([role="button"]):not(:first-child)'
+            );
+            if (indentedContent && indentedContent !== el.closest('div')) {
+                // Verify it has substantial content (not just icons)
+                const height = indentedContent.offsetHeight;
+                if (height > 30) {
+                    return indentedContent.outerHTML;
+                }
+            }
+            
+            // Strategy 5: Height-based detection for expanded content
+            const candidates = block.querySelectorAll(':scope > div');
+            for (const candidate of candidates) {
+                const style = window.getComputedStyle(candidate);
+                const height = parseFloat(style.height) || candidate.offsetHeight;
+                // Skip tiny elements (icons, buttons) and the toggle trigger itself
+                if (height > 50 && candidate !== el.parentElement && candidate !== el) {
+                    return candidate.outerHTML;
+                }
+            }
+            
+            // Strategy 6: Legacy fallbacks
+            const contentArea = 
+                block.querySelector('.notion-toggle-content') ||
+                block.querySelector('[data-content-editable-leaf]')?.parentElement?.parentElement;
+            
+            if (contentArea && contentArea !== el && contentArea !== el.parentElement) {
+                return contentArea.outerHTML;
+            }
+            
+            return '';
         }, toggleElement.handle);
+    }
+
+    /**
+     * Wait for content to appear after toggle click.
+     * Polls for content change with timeout.
+     * @async
+     * @private
+     * @param {HtmlFacade} facade - HtmlFacade instance
+     * @param {import('puppeteer').Page} page - Puppeteer page
+     * @param {Object} toggleElement - Toggle element wrapper
+     * @param {string} previousHtml - HTML content before click
+     */
+    async _waitForContentChange(facade, page, toggleElement, previousHtml) {
+        const startTime = Date.now();
+        const checkInterval = 100;
+        const timeout = this.options.contentWait;
+        
+        while (Date.now() - startTime < timeout) {
+            const currentHtml = await this._getToggleContentHtml(facade, page, toggleElement);
+            
+            // Content changed and is not empty - success
+            if (currentHtml !== previousHtml && currentHtml !== '') {
+                return;
+            }
+            
+            // Wait before next check
+            await new Promise(resolve => setTimeout(resolve, checkInterval));
+        }
+        
+        // Timeout reached - continue with animation wait as fallback
+        await this._waitForAnimation(page);
     }
 
     /**
