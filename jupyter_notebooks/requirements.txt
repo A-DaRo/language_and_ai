@@ -1,0 +1,14 @@
+# Project requirements for QUICK_DATA_EXPLOR notebook and utils
+# Pin versions to known stable releases (adjust if needed for your environment)
+pandas==2.2.2
+numpy==1.26.1
+matplotlib==3.8.1
+seaborn==0.13.2
+plotly==5.16.0
+kaleido==0.2.1
+tqdm==4.66.1
+torch==2.2.2
+psutil==5.9.5
+
+# Optional / Common dependencies (will be installed as transitive deps):
+# python-dateutil, pytz, six (installed by pandas/matplotlib)

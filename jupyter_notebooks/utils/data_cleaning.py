@@ -172,20 +172,36 @@ def flatten_list_column(series: pd.Series) -> pd.Series:
     Joins list elements with space separator.
     """
     def flatten_item(x):
-        # Handle NaN/None first
-        if pd.isna(x):
-            return ''
-        # Handle list/tuple/set
-        if isinstance(x, (list, tuple, set)):
-            # Recursively flatten nested structures
+        # Treat list-like inputs first (list/tuple/set/np.ndarray/Series)
+        if isinstance(x, (list, tuple, set, np.ndarray, pd.Series)):
             flattened = []
+            # Iterate and flatten nested list-like structures
             for item in x:
-                if isinstance(item, (list, tuple, set)):
-                    flattened.extend(str(i) for i in item if pd.notna(i))
-                elif pd.notna(item):
-                    flattened.append(str(item))
+                if isinstance(item, (list, tuple, set, np.ndarray, pd.Series)):
+                    for sub in item:
+                        try:
+                            if not pd.isna(sub):
+                                flattened.append(str(sub))
+                        except Exception:
+                            # If pd.isna() fails (e.g., for an array), fall back to non-null check
+                            if sub is not None:
+                                flattened.append(str(sub))
+                else:
+                    try:
+                        if not pd.isna(item):
+                            flattened.append(str(item))
+                    except Exception:
+                        if item is not None:
+                            flattened.append(str(item))
             return ' '.join(flattened)
-        # Handle scalar values
+
+        # For scalars: check NaN and return empty string
+        try:
+            if pd.isna(x):
+                return ''
+        except (TypeError, ValueError):
+            # If pd.isna fails (rare), move on and return string
+            pass
         return str(x)
     
     return series.apply(flatten_item)
