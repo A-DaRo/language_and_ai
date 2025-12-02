@@ -170,11 +170,13 @@ class LinkRewriterStep extends PipelineStep {
       return targetRootPath.startsWith('./') ? targetRootPath : './' + targetRootPath;
     }
     
-    // Extract target directory (remove /index.html)
-    const targetPath = targetRootPath.replace(/\/index\.html$/, '');
+    // Extract target directory (remove index.html with optional leading slash)
+    // Handles both "Section/index.html" and "index.html" (root page)
+    const targetPath = targetRootPath.replace(/\/?index\.html$/, '');
     
     // Compute relative path using Node's path module
     // This handles all the ../ navigation correctly
+    // For root page, targetPath is empty, use '.' to represent root directory
     let relative = path.relative(sourceDir, targetPath || '.');
     
     // Convert backslashes to forward slashes (Windows compatibility)
@@ -189,6 +191,12 @@ class LinkRewriterStep extends PipelineStep {
     // Ensure proper format
     if (!relative.startsWith('.') && !relative.startsWith('/')) {
       relative = './' + relative;
+    }
+    
+    // For paths ending with '..' (navigating up), append /index.html directly
+    // For paths ending with a directory name, append /index.html
+    if (relative.endsWith('..')) {
+      return relative + '/index.html';
     }
     
     return relative + '/index.html';

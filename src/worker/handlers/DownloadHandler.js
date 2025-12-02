@@ -12,7 +12,6 @@ const ScrapingPipeline = require('../pipeline/ScrapingPipeline');
 const NavigationStep = require('../pipeline/steps/NavigationStep');
 const CookieConsentStep = require('../pipeline/steps/CookieConsentStep');
 const ExpansionStep = require('../pipeline/steps/ExpansionStep');
-const ToggleCaptureStep = require('../pipeline/steps/ToggleCaptureStep');
 const AssetDownloadStep = require('../pipeline/steps/AssetDownloadStep');
 const LinkRewriterStep = require('../pipeline/steps/LinkRewriterStep');
 const HtmlWriteStep = require('../pipeline/steps/HtmlWriteStep');
@@ -98,17 +97,15 @@ class DownloadHandler {
     // Pipeline order:
     // 1. Navigate to page
     // 2. Handle cookie consent
-    // 3. Expand content (scroll for lazy-loading)
-    // 4. Capture toggle states (dual-state for offline interactivity)
-    // 5. Download assets (images, CSS, files)
-    // 6. Rewrite links for offline navigation
-    // 7. Write final HTML to disk
+    // 3. Expand content (scroll for lazy-loading + expand all toggles)
+    // 4. Download assets (images, CSS, files)
+    // 5. Rewrite links for offline navigation
+    // 6. Write final HTML to disk
     const pipeline = new ScrapingPipeline(
       [
         new NavigationStep(),
         new CookieConsentStep(this.cookieHandler),
         new ExpansionStep(this.contentExpander),
-        new ToggleCaptureStep(),  // NEW: Captures toggle states and injects controller
         new AssetDownloadStep(
           this.assetDownloader,
           this.cssDownloader,
@@ -135,7 +132,6 @@ class DownloadHandler {
         savedPath: payload.savePath,
         assetsDownloaded: pipelineContext.stats.assetsDownloaded,
         linksRewritten: pipelineContext.stats.linksRewritten,
-        togglesCaptured: pipelineContext.stats.togglesCaptured || 0,
         blockMapSaved: true
       };
 

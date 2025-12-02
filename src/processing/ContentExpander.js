@@ -1,23 +1,16 @@
 /**
- * @classdesc Prepares Notion pages for scraping by triggering lazy-loading and closing overlays.
+ * @classdesc Prepares Notion pages for scraping by triggering lazy-loading,
+ * expanding toggles, and closing overlays.
  * 
- * **Architecture Change (v2.0)**: Toggle expansion is now handled separately by:
- * - {@link ToggleStateCapture} - Captures dual-state (collapsed/expanded) content
- * - {@link ToggleCaptureStep} - Pipeline step that orchestrates capture + injection
- * - {@link OfflineToggleController} - Runtime JavaScript for offline interactivity
+ * **Architecture Change (v3.0)**: Toggle expansion is now simplified.
+ * All toggles are expanded permanently for offline capture. No interactivity
+ * is preserved - the offline version shows all content in expanded state.
  * 
- * This class now focuses solely on:
+ * This class handles:
  * - Scrolling to bottom to trigger lazy-loaded content
+ * - Expanding all toggle blocks so their content is visible
  * - Closing overlays/modals that might obscure content
  * 
- * The previous aggressive expansion approach was disabled because:
- * - It destroyed toggle interactivity (all toggles permanently expanded)
- * - Risk of clicking destructive actions (delete, share, export)
- * - Breaking page layout with simultaneous expansions
- * 
- * @see ToggleStateCapture
- * @see ToggleCaptureStep
- * @see OfflineToggleController
  * @see PageProcessor#scrapePage
  */
 
@@ -34,36 +27,29 @@ class ContentExpander {
   }
   
   /**
-   * @summary Expand all content on the page (scroll only).
+   * @summary Expand all content on the page.
    * 
    * @description Executes the page preparation workflow:
    * 1. Scrolls to page bottom to trigger lazy-loaded content
-   * 
-   * **Note**: Toggle expansion is now handled by {@link ToggleCaptureStep}
-   * in the scraping pipeline. This method only triggers lazy-loading.
+   * 2. Expands all toggle blocks so content is captured
    * 
    * @param {Page} page - Puppeteer page instance.
    * @returns {Promise<void>}
-   * 
-   * @see _scrollToBottom
-   * @see ToggleCaptureStep
    */
   async expandAll(page) {
     await this._scrollToBottom(page);
+    await this._expandAllToggles(page);
   }
   
   /**
-   * @summary Prepare page for scraping (scroll and close overlays).
-   * 
-   * @description Replaces the aggressive expansion with a gentler approach:
-   * 1. Scrolls to bottom to trigger lazy-loading
-   * 2. Attempts to close any open overlays/modals that might obscure content
+   * @summary Prepare page for scraping (scroll, expand toggles, close overlays).
    * 
    * @param {Page} page - Puppeteer page instance.
    * @returns {Promise<void>}
    */
   async preparePage(page) {
     await this._scrollToBottom(page);
+    await this._expandAllToggles(page);
     await this._closeOverlays(page);
   }
 
@@ -99,6 +85,92 @@ class ContentExpander {
     
     this.logger.info('SCROLL', 'Reached bottom of page. Waiting for content to stabilize...');
     await new Promise(resolve => setTimeout(resolve, this.config.WAIT_AFTER_SCROLL));
+  }
+  
+  /**
+   * @summary Expand all toggle blocks on the page.
+   * 
+   * @description Finds all Notion toggle blocks and clicks them to expand.
+   * Uses the aria-expanded attribute to identify collapsed toggles.
+   * Toggles are expanded permanently for offline capture.
+   * 
+   * Safety features:
+   * - Skips potentially destructive toggles (delete, share, export)
+   * - Waits for content to load after each expansion
+   * - Limits maximum toggles to prevent infinite loops
+   * 
+   * @param {Page} page - Puppeteer page instance.
+   * @returns {Promise<{expanded: number, skipped: number}>} Expansion statistics
+   * @private
+   */
+  async _expandAllToggles(page) {
+    this.logger.info('TOGGLE', 'Expanding all toggle blocks...');
+    
+    const result = await page.evaluate(async () => {
+      const stats = { expanded: 0, skipped: 0, errors: 0 };
+      const maxToggles = 100;
+      const animationWait = 300;
+      const contentWait = 500;
+      
+      // Patterns to skip (potentially destructive actions)
+      const skipPatterns = ['delete', 'remove', 'share', 'export', 'duplicate'];
+      
+      // Find all toggle buttons that are currently collapsed
+      const getCollapsedToggles = () => {
+        return Array.from(document.querySelectorAll(
+          '.notion-toggle-block [role="button"][aria-expanded="false"]'
+        ));
+      };
+      
+      // Check if toggle text contains dangerous patterns
+      const shouldSkip = (button) => {
+        const text = (button.textContent || '').toLowerCase();
+        return skipPatterns.some(pattern => text.includes(pattern));
+      };
+      
+      // Wait for a specified time
+      const wait = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+      
+      // Expand toggles iteratively (some may be nested)
+      let iteration = 0;
+      const maxIterations = 5;
+      
+      while (iteration < maxIterations) {
+        const toggles = getCollapsedToggles();
+        if (toggles.length === 0) break;
+        
+        for (const button of toggles) {
+          if (stats.expanded >= maxToggles) break;
+          
+          try {
+            if (shouldSkip(button)) {
+              stats.skipped++;
+              continue;
+            }
+            
+            // Click to expand
+            button.click();
+            stats.expanded++;
+            
+            // Wait for animation and content to load
+            await wait(animationWait);
+          } catch (error) {
+            stats.errors++;
+          }
+        }
+        
+        // Wait for any async content loading
+        await wait(contentWait);
+        iteration++;
+      }
+      
+      return stats;
+    });
+    
+    this.logger.success('TOGGLE', 
+      `Expanded ${result.expanded} toggle(s), skipped ${result.skipped}, errors ${result.errors}`);
+    
+    return result;
   }
   
   /**

@@ -68,14 +68,50 @@ class DiscoveryHandler {
       subsection: link.subsection
     }));
 
-    // Resolve page name from URL
-    const finalUrl = this.page.url();
+    // Resolve page name from H1 element (primary) or fallback to URL/title
     let pageName = null;
-
-    const nameMatch = finalUrl.match(/\/([^\/]+?)(-29[a-f0-9]{30})/i);
-    if (nameMatch && nameMatch[1]) {
-      pageName = nameMatch[1].replace(/-/g, ' ');
-    } else {
+    
+    // Primary: Extract from H1 element with Notion-specific selectors
+    // Notion page titles are in <h1> elements with specific attributes
+    pageName = await this.page.evaluate(() => {
+      // Try to find the main page title H1
+      // Notion uses H1 with placeholder="New page" for page titles
+      const h1Selectors = [
+        'h1[placeholder="New page"]',  // Main page title
+        'h1[data-content-editable-leaf="true"]',  // Alternative selector
+        '.notion-page-block h1',  // Page block title
+        'h1'  // Generic fallback
+      ];
+      
+      for (const selector of h1Selectors) {
+        const h1 = document.querySelector(selector);
+        if (h1) {
+          // Get text content, handling nested spans
+          // The text might be directly in H1 or in a nested span
+          const text = h1.textContent || h1.innerText || '';
+          const trimmed = text.trim();
+          
+          // Skip if it's just the placeholder or empty
+          if (trimmed && trimmed !== 'New page' && trimmed !== 'Untitled') {
+            return trimmed;
+          }
+        }
+      }
+      
+      return null;
+    });
+    
+    // Fallback: Use URL slug if H1 extraction failed
+    if (!pageName) {
+      const finalUrl = this.page.url();
+      const nameMatch = finalUrl.match(/\/([^\/]+?)(-29[a-f0-9]{30})/i);
+      if (nameMatch && nameMatch[1]) {
+        pageName = nameMatch[1].replace(/-/g, ' ');
+      }
+    }
+    
+    // Final fallback: Use page title or URL
+    if (!pageName) {
       const pageTitle = await this.page.title();
       if (pageTitle && pageTitle !== 'Untitled' && pageTitle !== 'Notion') {
         pageName = pageTitle;
