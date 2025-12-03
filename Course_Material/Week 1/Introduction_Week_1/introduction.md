@@ -1,16 +1,14 @@
-```markdown
 # 📚 Introduction
 
 | Property | Value |
 | :--- | :--- |
 | **Week** | Week 1 |
 | **Book Chapters** | Empty |
-| **Slides** | [week1.pdf](week1.pdf), [week1_inperson_slides.pdf](week1_inperson_slides.pdf) |
-| **Recordings** | [tue.video.yuja.com/P/V…448486](https://tue.video.yuja.com/P/VideoManagement/MediaLibrary/Users/u-oD0ckDKj/MyMediaCollections/e1da2362-5417-4be4-9f03-b74947ac789e/WatchVideo/5448486) |
+| **Slides** | [week1.md](/files/week1.md), [week1_inperson_slides.md](files/week1_inperson_slides.md) |
 
-***
+---
 
-**Table of Contents**
+## Table of Contents
 
 - [🎽 Warm-up Questions](#%F0%9F%8E%BD-warm-up-questions)
 - [📺 Lecture Videos](#%F0%9F%93%BA-lecture-videos)
@@ -23,38 +21,45 @@
 - [⚖️ tf\*idf](#%E2%9A%96%EF%B8%8F-tfidf)
   - [🚩 Task 2](#%F0%9F%9A%A9-task-2)
 
-***
+---
 
 ## 🎽 Warm-up Questions
-***
 
 > ℹ️ These questions are intended to prime your brain for the materials we will be covering in the videos below. They are optional, and there are no expectations wrt the answers.
 
-*   Text is (on a surface level at least) a fairly low-fi medium; there are some characters, generally limited to whatever is included in [unicode](https://unicode-table.com/en/). These characters form sequences, which we understand as words. Words form sentences, which form paragraphs, which form a text. If a computer were to process a text, a first step could be to split this text into meaningful units. This process is called tokenization. What do you think would be a good heuristic to tokenize a text? Or rather: how to best chop up this blob of characters that is a text?
-*   Computers display sequences of characters (which you may know as strings) pretty well—as demonstrated by the text on this page). However, doing any sort of math to extract patterns from these strings is difficult. Can you think of a way to represent words in a particular text as numbers? Can you think of ways this representation might be shared between different pieces of text?
-*   Let's evaluate your idea from the previous question: does it have a fixed size (meaning, will the size of the representation be the same if the sentences are longer or shorter)? Does it provide information about the structure (or order) of the sentences? Do you have an idea how to add these kind of features to your representation?
+- Text is (on a surface level at least) a fairly low-fi medium; there are some characters, generally limited to whatever is included in [unicode](https://unicode-table.com/en/). These characters form sequences, which we understand as words. Words form sentences, which form paragraphs, which form a text. If a computer were to process a text, a first step could be to split this text into meaningful units. This process is called tokenization. What do you think would be a good heuristic to tokenize a text? Or rather: how to best chop up this blob of characters that is a text?
+
+- Computers display sequences of characters (which you may know as strings) pretty well—as demonstrated by the text on this page). However, doing any sort of math to extract patterns from these strings is difficult. Can you think of a way to represent words in a particular text as numbers? Can you think of ways this representation might be shared between different pieces of text?
+
+- Let's evaluate your idea from the previous question: does it have a fixed size (meaning, will the size of the representation be the same if the sentences are longer or shorter)? Does it provide information about the structure (or order) of the sentences? Do you have an idea how to add these kind of features to your representation?
 
 ## 📺 Lecture Videos
-***
+
+---
 
 > 🖼️ Slides will be made available at the top of the page!
 
 ### 1️⃣ **Personal Introduction**
+
 [Video Placeholder]
 
 ### 2️⃣ **Course Information**
+
 [Video Placeholder]
 
 ### 3️⃣ **Why is Language Difficult?**
+
 [Video Placeholder]
 
 ### 4️⃣ **Text Mining Preliminaries**
+
 [Video Placeholder]
 
 > 💡 Please note that the Student Hours have been replaced by an in-person lecture on Thursdays.
 
+---
+
 ## 📏 Distances
-***
 
 Remember that our Euclidean Distance function can be defined as 👇​
 $$\sqrt{\sum_{i=1}^{n}\left(\vec{p}_{i}-\vec{q}_{i}\right)^{2}}$$
@@ -70,8 +75,9 @@ $$\frac{\vec{p} \bullet \vec{q}}{ \sqrt{\vec{p} \bullet \vec{p}} \cdot \sqrt{\ve
 Here $\bullet$ explicitly denotes the dot product 👇​
 $$\sum_{i=1}^n \vec{p}_i \cdot \vec{q}_i$$
 
+---
+
 ### 🚩 Task 1
-***
 
 Given the following set of vectors:
 $$\begin{array}{l|ll}

@@ -6,8 +6,6 @@
 | **Book Chapters** | Empty |
 | **Slides** | Empty |
 | **Recordings** | Empty |
-| **Solutions** | [lab\_1\_solutions.py (File)](files/lab_1_solutions.py), [lab\_1\_solutions-update-1.py (File)](files/lab_1_solutions-update-1.py) |
-
 ***
 
 > 💡 Welcome to the first lab session! [Before you start this practical session](https://example.com/before-starting): this introduction practical requires coding up most things yourself. Generally, we will mostly be working with libraries to do this.
