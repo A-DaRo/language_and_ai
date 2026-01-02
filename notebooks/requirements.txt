@@ -1,4 +1,4 @@
-# Project requirements for QUICK_DATA_EXPLOR notebook and utils
+# Project requirements for notebooks and utils
 # Pin versions to known stable releases (adjust if needed for your environment)
 pandas==2.2.2
 numpy==1.26.1
