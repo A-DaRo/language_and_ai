@@ -1,0 +1,31 @@
+# conf/laptop/pipeline.yaml - Laptop-specific overrides
+
+defaults:
+  - /base/pipeline
+
+execution:
+  enable_cuda_graphs: false
+  enable_torch_compile: false
+  numa_pinning: false
+
+dataloader:
+  batch_size: 16
+  num_workers: 2
+  persistent_workers: false
+  prefetch_factor: 2
+  pin_memory: true
+
+precision:
+  dtype: "float16"
+  use_grad_scaler: true
+
+gliner:
+  batch_size: 8
+
+subset:
+  enabled: true
+  size: 10000
+
+logging:
+  level: "DEBUG"
+  wandb_enabled: false

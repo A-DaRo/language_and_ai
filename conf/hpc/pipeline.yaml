@@ -1,0 +1,30 @@
+# conf/hpc/pipeline.yaml - HPC-specific overrides (A100/H100)
+
+defaults:
+  - /base/pipeline
+
+execution:
+  enable_cuda_graphs: true
+  enable_torch_compile: true
+  numa_pinning: true
+
+dataloader:
+  batch_size: 256
+  num_workers: 8
+  persistent_workers: true
+  prefetch_factor: 4
+  pin_memory: true
+
+precision:
+  dtype: "bfloat16"
+  use_grad_scaler: false
+
+gliner:
+  batch_size: 128
+
+subset:
+  enabled: false
+
+logging:
+  level: "INFO"
+  wandb_enabled: true

@@ -1,0 +1,76 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "neuro-stylometry"
+version = "0.1.0"
+description = "Neuro-Symbolic Stylometry Pipeline with Pollution Mitigation"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+authors = [
+    {name = "Your Name", email = "your.email@university.edu"}
+]
+
+dependencies = [
+    # Core ML
+    "torch>=2.2.0",
+    "transformers>=4.37.0",
+    "datasets>=2.16.0",
+    
+    # Arrow/Data
+    "pyarrow>=14.0.0",
+    "pandas>=2.2.0",
+    
+    # GLiNER
+    "gliner>=0.2.0",
+    
+    # NLP
+    "spacy>=3.7.0",
+    "tokenizers>=0.15.0",
+    
+    # Configuration
+    "omegaconf>=2.3.0",
+    "hydra-core>=1.3.0",
+    
+    # CLI
+    "click>=8.1.0",
+    
+    # Utilities
+    "tqdm>=4.66.0",
+    "numpy>=1.26.0",
+    "scikit-learn>=1.4.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-cov>=4.1.0",
+    "ruff>=0.2.0",
+    "mypy>=1.8.0",
+    "pre-commit>=3.6.0",
+]
+notebooks = [
+    "jupyter>=1.0.0",
+    "matplotlib>=3.8.0",
+    "seaborn>=0.13.0",
+]
+hpc = [
+    "nvidia-ml-py>=12.0.0",  # For detailed GPU monitoring
+]
+
+[project.scripts]
+neuro-stylometry = "neuro_stylometry.__main__:cli"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+ignore_missing_imports = true

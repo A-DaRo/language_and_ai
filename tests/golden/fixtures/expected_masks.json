@@ -1,0 +1,14 @@
+{
+  "expected_masks": [
+    {
+      "post_id": "test_001",
+      "detected_spans": [],
+      "masked_text": "I really enjoy programming in Python. It's such a versatile language."
+    },
+    {
+      "post_id": "test_002",
+      "detected_spans": [],
+      "masked_text": "The weather today is beautiful. Perfect for a walk outside."
+    }
+  ]
+}

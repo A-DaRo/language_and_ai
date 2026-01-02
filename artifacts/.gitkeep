@@ -1,0 +1,6 @@
+# artifacts/
+# Generated artifacts directory (gitignored)
+# This directory will contain:
+# - data/: Processed datasets
+# - models/: Trained model checkpoints
+# - reports/: Generated reports

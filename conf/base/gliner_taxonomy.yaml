@@ -1,0 +1,49 @@
+# conf/base/gliner_taxonomy.yaml - Pollution detection taxonomy for GLiNER
+
+# Demographic pollution categories to detect and mask
+taxonomy:
+  - name: "GENDER"
+    description: "Gender self-identification (he/him, she/her, they/them, pronouns)"
+    examples:
+      - "I'm a woman"
+      - "as a man"
+      - "I identify as"
+      - "my pronouns are"
+  
+  - name: "AGE"
+    description: "Age mentions and generational markers"
+    examples:
+      - "I'm 25 years old"
+      - "as a millennial"
+      - "born in 1990"
+      - "Gen Z here"
+  
+  - name: "NATIONALITY"
+    description: "Nationality and country of origin"
+    examples:
+      - "I'm American"
+      - "as a Canadian"
+      - "from the UK"
+      - "born in Germany"
+  
+  - name: "POLITICAL"
+    description: "Political leaning self-identification"
+    examples:
+      - "as a liberal"
+      - "I'm conservative"
+      - "left-leaning"
+      - "right-wing"
+  
+  - name: "PERSONALITY"
+    description: "MBTI and personality type mentions"
+    examples:
+      - "I'm an INTJ"
+      - "as an introvert"
+      - "extroverted person"
+      - "feeling type"
+
+# Detection configuration
+detection_config:
+  flat_ner: true
+  threshold: 0.85
+  multi_label: false

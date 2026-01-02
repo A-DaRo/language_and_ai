@@ -1,0 +1,40 @@
+# conf/base/pipeline.yaml - Base configuration (shared across all environments)
+
+gliner:
+  model: "urchade/gliner_large-v2.1"
+  confidence_threshold: 0.85
+  batch_size: 32
+  device: "cuda"
+
+encoder:
+  model: "roberta-base"
+  hidden_dim: 768
+  max_length: 512
+
+paths:
+  raw_data: "${oc.env:SOBR_DATA_PATH,./artifacts/data/sobr_raw}"
+  output: "./artifacts"
+
+dataloader:
+  batch_size: 32
+  num_workers: 4
+  persistent_workers: false
+  prefetch_factor: 2
+  pin_memory: true
+
+execution:
+  enable_cuda_graphs: false
+  enable_torch_compile: false
+  numa_pinning: false
+
+precision:
+  dtype: "float32"
+  use_grad_scaler: false
+
+subset:
+  enabled: false
+  size: null
+
+logging:
+  level: "INFO"
+  wandb_enabled: false
