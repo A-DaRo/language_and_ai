@@ -6,6 +6,7 @@ Ensures zero-copy access and prevents author leakage across train/val/test split
 
 import pyarrow as pa
 import pyarrow.feather as feather
+import pyarrow.compute as pc
 from pathlib import Path
 from typing import Dict, Tuple, List, Optional
 import numpy as np
@@ -126,6 +127,48 @@ class SOBRDataset:
             'val': val_indices,
             'test': test_indices,
         }
+
+    @staticmethod
+    def _sanitize_arrow_table(table: pa.Table) -> pa.Table:
+        """Sanitize Arrow table for Hugging Face `datasets` conversion.
+
+        The `datasets` library can fail when encountering dictionary-encoded columns
+        whose dictionary value type is `null` (e.g., `dictionary<values=null,...>`),
+        which commonly arises when a split has an all-null dictionary column.
+
+        Strategy:
+        - For dictionary columns with a `null` value_type, cast to `string`.
+          This preserves missingness while avoiding invalid `null` dictionary values.
+        """
+
+        if table.num_rows == 0:
+            return table
+
+        updated_columns = []
+        updated_names = []
+
+        for name in table.column_names:
+            col = table[name]
+            col_type = col.type
+
+            if pa.types.is_dictionary(col_type) and (
+                pa.types.is_null(col_type.value_type) or col.null_count == table.num_rows
+            ):
+                # Cast dictionary<null> (or all-null dictionary) -> string; keep nulls.
+                try:
+                    # Prefer compute.cast because it handles chunked arrays well.
+                    casted = pc.cast(col, pa.string())
+                except Exception:
+                    casted = col.cast(pa.string())
+
+                updated_columns.append(casted)
+                updated_names.append(name)
+                continue
+
+            updated_columns.append(col)
+            updated_names.append(name)
+
+        return pa.table(updated_columns, names=updated_names)
     
     def get_huggingface_dataset(self) -> DatasetDict:
         """
@@ -134,18 +177,18 @@ class SOBRDataset:
         Returns:
             DatasetDict with 'train', 'validation', 'test' splits.
         """
-        # Convert Arrow Table to pandas (efficient for indexed selection)
-        df = self.table.to_pandas()
-        
-        # Create datasets for each split
+        # Create datasets for each split (slice as Arrow first, then sanitize)
         datasets = {}
         for split_name, indices in self.splits.items():
-            split_df = df.iloc[indices].reset_index(drop=True)
-            
-            # Convert back to HuggingFace Dataset
             hf_name = 'validation' if split_name == 'val' else split_name
-            datasets[hf_name] = Dataset.from_pandas(split_df, preserve_index=False)
-        
+
+            split_table = self.table.take(pa.array(indices, type=pa.int64()))
+            split_table = self._sanitize_arrow_table(split_table)
+
+            # Avoid pandas -> arrow conversion issues with all-null categoricals.
+            data_dict = split_table.to_pydict()
+            datasets[hf_name] = Dataset.from_dict(data_dict)
+
         return DatasetDict(datasets)
     
     def get_split_indices(self, split: str) -> List[int]:

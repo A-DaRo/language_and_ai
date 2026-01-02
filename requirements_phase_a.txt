@@ -1,0 +1,41 @@
+# Phase A: Pollution Detection & Mitigation Dependencies
+# Install with: pip install -r requirements_phase_a.txt
+
+# Core ML
+torch>=2.2.0
+transformers>=4.37.0
+datasets>=2.16.0
+
+# Arrow/Data
+pyarrow>=14.0.0
+pandas>=2.2.0
+
+# GLiNER
+gliner>=0.2.0
+
+# NLP
+spacy>=3.7.0
+tokenizers>=0.15.0
+
+# Configuration
+omegaconf>=2.3.0
+
+# CLI
+click>=8.1.0
+
+# Utilities
+tqdm>=4.66.0
+numpy>=1.26.0
+scikit-learn>=1.4.0
+
+# System
+psutil>=5.9.0
+
+# Jupyter (optional, for notebooks)
+jupyter>=1.0.0
+matplotlib>=3.8.0
+seaborn>=0.13.0
+
+# Testing (optional, for development)
+pytest>=8.0.0
+pytest-cov>=4.1.0
