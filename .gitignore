@@ -34,8 +34,7 @@ env/
 *.swo
 *~
 
-# datasets, all csv files
-datasets/
+# all csv files
 *.csv
 
 # Jupyter
