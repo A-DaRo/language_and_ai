@@ -21,8 +21,10 @@ import pandas as pd
 from .base import PollutionFilterStrategy
 from ..gliner_detector import GLiNERDetector
 from ..masker import SpanMasker
+from ..explicit_recall import compute_explicit_recall
 from ..embedder import FrozenEmbedder
 from ..leace import LEACEComputer
+from ..probe import compute_amnesic_drop
 from ...data_engine.dataset import SOBRDataset
 from ...data_engine.schemas import SOBR_SCHEMA, POLLUTION_LOG_SCHEMA
 
@@ -99,10 +101,13 @@ class HPCFilterStrategy(PollutionFilterStrategy):
         
         # Step 2: GLiNER detection + masking
         logger.info("Step 1/3: Pollution Detection & Masking")
+        taxonomy_config, constraints_config = self._load_taxonomy_config(config)
         gliner = GLiNERDetector(
             device=self.device,
             max_length=512,
             confidence_threshold=config.get("gliner_threshold", 0.85),
+            taxonomy_config=taxonomy_config,
+            constraints_config=constraints_config,
         )
         
         # Detect spans
@@ -110,11 +115,15 @@ class HPCFilterStrategy(PollutionFilterStrategy):
         entities_batch = gliner.detect_spans_long(
             posts,
             batch_size=self.batch_size,
+            show_progress=True,
         )
         
         # Mask spans
         logger.info("  Applying typed masks...")
-        masker = SpanMasker(tokenizer=gliner.model.data_processor.transformer_tokenizer)
+        masker = SpanMasker(
+            tokenizer=gliner.model.data_processor.transformer_tokenizer,
+            entity_to_mask=gliner.get_mask_tokens(),
+        )
         masked_texts, pollution_logs = masker.mask_batch(posts, entities_batch, post_ids)
         
         total_spans = sum(len(entities) for entities in entities_batch)
@@ -133,6 +142,7 @@ class HPCFilterStrategy(PollutionFilterStrategy):
             batch_size=self.batch_size,
             show_progress=True,
         )
+        embeddings_cpu = embeddings.detach().to("cpu", dtype=torch.float32)
         
         # Move embeddings to GPU for full-batch LEACE
         embeddings = embeddings.to(self.device)
@@ -148,6 +158,7 @@ class HPCFilterStrategy(PollutionFilterStrategy):
             embedding_dim=embedder.get_embedding_dim(),
             regularization=config.get("leace_regularization", 1e-5),
             device=self.device,
+            force_cpu=config.get("leace_force_cpu", False),
         )
         
         # Full-batch computation (no accumulation needed)
@@ -177,6 +188,40 @@ class HPCFilterStrategy(PollutionFilterStrategy):
             "device": self.device,
             "use_bf16": self.use_bf16,
         }
+
+        if config.get("gliner_compute_explicit_recall", False):
+            recall = compute_explicit_recall(
+                posts,
+                entities_batch,
+                gliner.taxonomy.get_reference_patterns(),
+            )
+            metadata["explicit_recall"] = recall
+
+        if config.get("probe_compute_amnesic_drop", False):
+            labels = self._extract_labels(table, config)
+            max_samples = config.get("probe_max_samples")
+            if max_samples and len(embeddings_cpu) > max_samples:
+                embeddings_before = embeddings_cpu[:max_samples]
+                labels_probe = labels[:max_samples]
+            else:
+                embeddings_before = embeddings_cpu
+                labels_probe = labels
+
+            P_cpu = projection_matrix.detach().to("cpu", dtype=torch.float32)
+            embeddings_after = embeddings_before @ P_cpu.T
+            acc_before, acc_after, amnesic_drop = compute_amnesic_drop(
+                embeddings_before,
+                embeddings_after,
+                labels_probe,
+                train_split=config.get("probe_train_split", 0.8),
+                random_state=config.get("seed", 42),
+            )
+            metadata["probe"] = {
+                "accuracy_before": acc_before,
+                "accuracy_after": acc_after,
+                "amnesic_drop": amnesic_drop,
+                "max_samples": int(len(embeddings_before)),
+            }
         
         logger.info("Phase A complete!")
         return metadata
@@ -232,4 +277,26 @@ class HPCFilterStrategy(PollutionFilterStrategy):
         feather.write_feather(logs_table, output_path)
         
         logger.info(f"  Saved {len(pollution_logs)} pollution log entries")
+
+    def _load_taxonomy_config(self, config: Dict[str, Any]) -> tuple:
+        """Load taxonomy config (labels, masks, constraints) if provided."""
+        taxonomy_path = config.get("gliner_taxonomy_path")
+        if not taxonomy_path:
+            return None, None
+
+        from omegaconf import OmegaConf
+
+        path = Path(taxonomy_path)
+        if not path.is_absolute():
+            repo_root = Path(__file__).resolve().parents[4]
+            path = repo_root / path
+
+        if not path.exists():
+            logger.warning(f"GLiNER taxonomy config not found: {path}")
+            return None, None
+
+        cfg = OmegaConf.to_container(OmegaConf.load(path), resolve=True)
+        taxonomy_cfg = cfg.get("taxonomy", {})
+        constraints_cfg = taxonomy_cfg.get("width_constraints", {})
+        return taxonomy_cfg, constraints_cfg
 # HPCFilterStrategy - HPC implementation with CUDA Graphs and full-batch LEACE

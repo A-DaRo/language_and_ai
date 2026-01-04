@@ -66,6 +66,7 @@ class LEACEComputer:
         embedding_dim: int,
         regularization: float = 1e-5,
         device: str = "cuda",
+        force_cpu: bool = False,
     ):
         """
         Initialize LEACE computer.
@@ -78,10 +79,11 @@ class LEACEComputer:
         self.embedding_dim = embedding_dim
         self.regularization = regularization
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
+        self.force_cpu = force_cpu
         
         logger.info(
             f"LEACEComputer initialized: dim={embedding_dim}, "
-            f"reg={regularization}, device={self.device}"
+            f"reg={regularization}, device={self.device}, force_cpu={self.force_cpu}"
         )
     
     def compute_projection(
@@ -115,14 +117,15 @@ class LEACEComputer:
             )
         
         # Move to device
-        embeddings = embeddings.to(self.device)
-        labels = labels.to(self.device)
+        compute_device = torch.device("cpu") if self.force_cpu else self.device
+        embeddings = embeddings.to(compute_device, dtype=torch.float32)
+        labels = labels.to(compute_device)
         
         # Compute covariance statistics
-        stats = self._compute_covariance_stats(embeddings, labels)
+        stats = self._compute_covariance_stats(embeddings, labels, device=compute_device)
         
         # Compute projection matrix
-        projection_matrix = self._compute_projection_from_stats(stats)
+        projection_matrix = self._compute_projection_from_stats(stats, device=compute_device)
         
         # Verify idempotence
         self._verify_idempotence(projection_matrix)
@@ -257,6 +260,7 @@ class LEACEComputer:
         self,
         embeddings: torch.Tensor,
         labels: torch.Tensor,
+        device: Optional[torch.device] = None,
     ) -> CovarianceStats:
         """
         Compute covariance statistics from embeddings and labels.
@@ -268,9 +272,9 @@ class LEACEComputer:
         Returns:
             CovarianceStats.
         """
-        # Force CPU for numerical stability and to avoid CUDA linalg driver issues.
-        embeddings = embeddings.detach().to("cpu", dtype=torch.float32)
-        labels = labels.detach().to("cpu")
+        compute_device = device or embeddings.device
+        embeddings = embeddings.detach().to(compute_device, dtype=torch.float32)
+        labels = labels.detach().to(compute_device)
 
         num_samples, embedding_dim = embeddings.shape
 
@@ -321,6 +325,7 @@ class LEACEComputer:
     def _compute_projection_from_stats(
         self,
         stats: CovarianceStats,
+        device: Optional[torch.device] = None,
     ) -> torch.Tensor:
         """
         Compute projection matrix from covariance statistics.
@@ -336,19 +341,24 @@ class LEACEComputer:
         """
         d = self.embedding_dim
 
-        # Work on CPU for stability and to match accumulated stats storage.
-        label_means_cpu = stats.label_means.detach().to("cpu", dtype=torch.float64)
-        global_mean_cpu = stats.global_mean.detach().to("cpu", dtype=torch.float64)
-        within_cov_cpu = stats.within_class_cov.detach().to("cpu", dtype=torch.float64)
+        compute_device = device or stats.within_class_cov.device
+        compute_dtype = torch.float64 if compute_device.type == "cpu" else torch.float32
+
+        label_means = stats.label_means.detach().to(compute_device, dtype=compute_dtype)
+        global_mean = stats.global_mean.detach().to(compute_device, dtype=compute_dtype)
+        within_cov = stats.within_class_cov.detach().to(compute_device, dtype=compute_dtype)
 
         # Center label means (k, d)
-        centered_means = label_means_cpu - global_mean_cpu.unsqueeze(0)
+        centered_means = label_means - global_mean.unsqueeze(0)
 
         # Regularize within-class covariance
-        Sigma_c = within_cov_cpu + float(self.regularization) * torch.eye(d, dtype=torch.float64)
+        Sigma_c = within_cov + float(self.regularization) * torch.eye(
+            d, dtype=compute_dtype, device=compute_device
+        )
 
-        # Preferred path: compute a true projector using a symmetric inverse sqrt on CPU.
-        # This avoids fragile CUDA cuSOLVER paths and yields an (almost) exactly idempotent P.
+        self._log_condition_numbers(Sigma_c, centered_means, device=compute_device)
+
+        # Preferred path: compute a true projector using a symmetric inverse sqrt.
         try:
             # Symmetric eigendecomposition
             evals, evecs = torch.linalg.eigh(Sigma_c)
@@ -366,17 +376,17 @@ class LEACEComputer:
             tol = float(S.max().item()) * 1e-6
             r = int((S > tol).sum().item())
             if r == 0:
-                P_cpu = torch.eye(d, dtype=torch.float64)
+                P_comp = torch.eye(d, dtype=compute_dtype, device=compute_device)
             else:
                 V = Vh[:r].T  # (d, r), orthonormal
-                P_whitened = torch.eye(d, dtype=torch.float64) - (V @ V.T)
-                P_cpu = sqrt @ P_whitened @ inv_sqrt
+                P_whitened = torch.eye(d, dtype=compute_dtype, device=compute_device) - (V @ V.T)
+                P_comp = sqrt @ P_whitened @ inv_sqrt
 
-            P = P_cpu.to(dtype=torch.float32, device=self.device)
+            P = P_comp.to(dtype=torch.float32, device=self.device)
             logger.info(f"Computed projection matrix: {P.shape}")
             return P
         except Exception as e:
-            logger.warning(f"CPU-eigendecomposition LEACE path failed, falling back: {e}")
+            logger.warning(f"Eigendecomposition LEACE path failed, falling back: {e}")
 
         # Fallback: use robust Cholesky + pseudo-inverse factorization.
         # This path is less strictly idempotent but keeps the pipeline running.
@@ -394,6 +404,26 @@ class LEACEComputer:
         P = I - M
         logger.info(f"Computed projection matrix (fallback): {P.shape}")
         return P
+
+    def _log_condition_numbers(
+        self,
+        Sigma_c: torch.Tensor,
+        centered_means: torch.Tensor,
+        device: Optional[torch.device] = None,
+    ) -> None:
+        """Log condition numbers for diagnostic stability checks."""
+        try:
+            cond_c = torch.linalg.cond(Sigma_c).item()
+            logger.info(f"LEACE cond(Sigma_c): {cond_c:.2e}")
+        except Exception as e:
+            logger.warning(f"Failed to compute cond(Sigma_c): {e}")
+
+        try:
+            label_cov = (centered_means.T @ centered_means) / max(1, centered_means.shape[0])
+            cond_z = torch.linalg.cond(label_cov).item()
+            logger.info(f"LEACE cond(label_cov): {cond_z:.2e}")
+        except Exception as e:
+            logger.warning(f"Failed to compute cond(label_cov): {e}")
 
     def _robust_cholesky(self, matrix: torch.Tensor) -> torch.Tensor:
         """Robust Cholesky wrapper with GPU->CPU fallback.
@@ -457,11 +487,17 @@ class LEACEComputer:
         P = projection_matrix
         P_squared = P @ P
         
-        error = torch.abs(P_squared - P).max().item()
-        
-        if error > tolerance:
+        diff = P_squared - P
+        numerator = torch.linalg.norm(diff, ord="fro").item()
+        denominator = torch.linalg.norm(P, ord="fro").item()
+        rel_error = numerator / max(denominator, 1e-12)
+
+        if rel_error > tolerance:
             logger.warning(
-                f"Idempotence check: |P^2 - P|_max = {error:.2e} > {tolerance:.2e}"
+                f"Idempotence check: ||P^2 - P||_F / ||P||_F = {rel_error:.2e} "
+                f"> {tolerance:.2e}"
             )
         else:
-            logger.info(f"Idempotence verified: |P^2 - P|_max = {error:.2e}")
+            logger.info(
+                f"Idempotence verified: ||P^2 - P||_F / ||P||_F = {rel_error:.2e}"
+            )

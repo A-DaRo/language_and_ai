@@ -41,6 +41,7 @@ dependencies = [
     "tqdm>=4.66.0",
     "numpy>=1.26.0",
     "scikit-learn>=1.4.0",
+    "psutil>=5.9.0",
 ]
 
 [project.optional-dependencies]

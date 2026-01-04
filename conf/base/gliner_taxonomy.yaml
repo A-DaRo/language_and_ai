@@ -1,0 +1,78 @@
+taxonomy:
+  target_label_prompts:
+    age_statement:
+      - "age statement"
+      - "self-identified age"
+    birth_year_statement:
+      - "birth year statement"
+      - "born in year"
+    gender_indicator:
+      - "gender self-identification"
+      - "self-identified gender"
+    nationality_statement:
+      - "nationality statement"
+      - "self-identified nationality"
+    country_of_origin:
+      - "country of origin"
+      - "place of origin"
+    demonym:
+      - "demonym"
+      - "nationality adjective"
+    personality_type_identifier:
+      - "personality type identifier"
+      - "self-identified personality type"
+    mbti_type:
+      - "MBTI type"
+      - "MBTI identifier"
+    political_affiliation:
+      - "political affiliation"
+      - "self-identified political affiliation"
+    ideology_self_id:
+      - "political ideology"
+      - "self-identified political ideology"
+
+  distractor_labels:
+    - "third person reference"
+    - "third-person demographic mention"
+    - "quote attribution"
+    - "historical figure"
+    - "fictional character"
+
+  mask_tokens:
+    age_statement: "[MASK:AGE]"
+    birth_year_statement: "[MASK:BIRTH_YEAR]"
+    gender_indicator: "[MASK:GENDER]"
+    nationality_statement: "[MASK:NATIONALITY]"
+    country_of_origin: "[MASK:COUNTRY]"
+    demonym: "[MASK:DEMONYM]"
+    personality_type_identifier: "[MASK:PERSONALITY]"
+    mbti_type: "[MASK:MBTI]"
+    political_affiliation: "[MASK:POLITICAL]"
+    ideology_self_id: "[MASK:IDEOLOGY]"
+
+  width_constraints:
+    age_statement: 5
+    birth_year_statement: 6
+    gender_indicator: 4
+    nationality_statement: 5
+    country_of_origin: 5
+    demonym: 4
+    personality_type_identifier: 6
+    mbti_type: 4
+    political_affiliation: 5
+    ideology_self_id: 5
+    default: 12
+
+  reference_patterns:
+    age_statement:
+      - "(?i)\\bI\\s*(?:am|'m)\\s*\\d{1,2}\\b"
+    birth_year_statement:
+      - "(?i)\\b(?:born\\s+in|born\\s+around)\\s*\\d{4}\\b"
+    gender_indicator:
+      - "(?i)\\bI\\s*(?:am|'m)\\s*(?:a\\s+)?(?:man|woman|male|female)\\b"
+    nationality_statement:
+      - "(?i)\\bI\\s*(?:am|'m)\\s*(?:an?\\s+)?[A-Z][a-z]+\\b"
+    country_of_origin:
+      - "(?i)\\bI\\s*(?:am|'m)\\s*from\\s+[A-Z][a-z]+(?:\\s+[A-Z][a-z]+)?\\b"
+    mbti_type:
+      - "(?i)\\b(?:INTJ|INTP|ENTJ|ENTP|INFJ|INFP|ENFJ|ENFP|ISTJ|ISFJ|ESTJ|ESFJ|ISTP|ISFP|ESTP|ESFP)\\b"

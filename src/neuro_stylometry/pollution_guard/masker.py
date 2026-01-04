@@ -7,7 +7,7 @@ Implements: FR-08 (Safe Masking), GLiNER_Implementation_Strategy.md Section 2.3
 """
 
 import logging
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional
 from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
@@ -39,7 +39,7 @@ class SpanMasker:
     Implements: FR-08
     """
     
-    # Entity type -> Typed mask token mapping
+    # Default entity type -> Typed mask token mapping
     ENTITY_TO_MASK = {
         "age_statement": "[MASK:AGE]",
         "birth_year_statement": "[MASK:BIRTH_YEAR]",
@@ -53,7 +53,11 @@ class SpanMasker:
         "ideology_self_id": "[MASK:IDEOLOGY]",
     }
     
-    def __init__(self, tokenizer=None):
+    def __init__(
+        self,
+        tokenizer=None,
+        entity_to_mask: Optional[Dict[str, str]] = None,
+    ):
         """
         Initialize masker.
         
@@ -61,6 +65,7 @@ class SpanMasker:
             tokenizer: Optional HuggingFace tokenizer for validation.
         """
         self.tokenizer = tokenizer
+        self.entity_to_mask = entity_to_mask or dict(self.ENTITY_TO_MASK)
         
         # Validate single-token encoding if tokenizer provided
         if self.tokenizer:
@@ -68,7 +73,7 @@ class SpanMasker:
     
     def _validate_mask_tokens(self) -> None:
         """Validate that mask tokens are encoded as single tokens."""
-        for entity_type, mask_token in self.ENTITY_TO_MASK.items():
+        for entity_type, mask_token in self.entity_to_mask.items():
             token_ids = self.tokenizer.encode(mask_token, add_special_tokens=False)
             if len(token_ids) != 1:
                 logger.warning(
@@ -107,7 +112,7 @@ class SpanMasker:
             span_text = entity["text"]
             
             # Get typed mask token
-            mask_token = self.ENTITY_TO_MASK.get(entity_type, "[MASK:UNKNOWN]")
+            mask_token = self.entity_to_mask.get(entity_type, "[MASK:UNKNOWN]")
             
             # Apply mask (reverse order ensures character offsets remain valid)
             masked_text = masked_text[:start] + mask_token + masked_text[end:]

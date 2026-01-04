@@ -110,6 +110,8 @@ class PhaseAPipeline:
             pollution_logs_path=pollution_logs_path,
             metadata=metadata,
         )
+
+        self._check_quality_gates(metadata)
         
         logger.info("=" * 80)
         logger.info("PHASE A COMPLETE")
@@ -119,3 +121,32 @@ class PhaseAPipeline:
         logger.info(f"Pollution logs: {pollution_logs_path}")
         
         return artifacts
+
+    def _check_quality_gates(self, metadata: Dict[str, Any]) -> None:
+        """Check explicit recall and amnesic drop against configured thresholds."""
+        enforce = self.config.get("enforce_quality_thresholds", False)
+
+        recall_threshold = self.config.get("gliner_explicit_recall_threshold")
+        recall = metadata.get("explicit_recall", {}).get("overall")
+        if recall_threshold is not None and recall is not None:
+            if recall < recall_threshold:
+                msg = (
+                    f"Explicit recall {recall:.2%} < "
+                    f"threshold {recall_threshold:.2%} (FR-26)"
+                )
+                if enforce:
+                    raise RuntimeError(msg)
+                logger.warning(msg)
+
+        probe_threshold = self.config.get("probe_amnesic_drop_threshold")
+        probe = metadata.get("probe", {})
+        amnesic_drop = probe.get("amnesic_drop")
+        if probe_threshold is not None and amnesic_drop is not None:
+            if amnesic_drop < probe_threshold:
+                msg = (
+                    f"Amnesic drop {amnesic_drop:.2%} < "
+                    f"threshold {probe_threshold:.2%} (PA-PROBE-03)"
+                )
+                if enforce:
+                    raise RuntimeError(msg)
+                logger.warning(msg)

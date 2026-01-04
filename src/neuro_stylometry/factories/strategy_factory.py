@@ -68,6 +68,15 @@ class StrategyFactory:
                 "embedder_batch_size": 32,
                 "leace_regularization": 1e-5,
                 "use_full_batch_leace": True,
+                "gliner_taxonomy_path": "conf/base/gliner_taxonomy.yaml",
+                "gliner_compute_explicit_recall": True,
+                "gliner_explicit_recall_threshold": 0.95,
+                "probe_compute_amnesic_drop": True,
+                "probe_amnesic_drop_threshold": 0.30,
+                "probe_train_split": 0.8,
+                "probe_max_samples": 20000,
+                "leace_force_cpu": False,
+                "enforce_quality_thresholds": False,
             }
         else:  # LAPTOP
             return {
@@ -77,4 +86,13 @@ class StrategyFactory:
                 "leace_regularization": 1e-5,
                 "leace_batch_size": 50,
                 "max_samples": 1000,  # Use subset
+                "gliner_taxonomy_path": "conf/base/gliner_taxonomy.yaml",
+                "gliner_compute_explicit_recall": True,
+                "gliner_explicit_recall_threshold": 0.95,
+                "probe_compute_amnesic_drop": True,
+                "probe_amnesic_drop_threshold": 0.30,
+                "probe_train_split": 0.8,
+                "probe_max_samples": 20000,
+                "leace_force_cpu": True,
+                "enforce_quality_thresholds": False,
             }

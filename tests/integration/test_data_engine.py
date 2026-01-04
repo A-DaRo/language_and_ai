@@ -107,10 +107,32 @@ class TestDataEngine:
         val_ratio = val_rows / total_rows
         test_ratio = test_rows / total_rows
         
-        # Allow 5% tolerance due to author-level rounding
-        assert 0.75 <= train_ratio <= 0.85, f"Train ratio {train_ratio:.2%} outside [75%, 85%]"
-        assert 0.05 <= val_ratio <= 0.15, f"Val ratio {val_ratio:.2%} outside [5%, 15%]"
-        assert 0.05 <= test_ratio <= 0.15, f"Test ratio {test_ratio:.2%} outside [5%, 15%]"
+        # Author-stratified splits can skew row ratios on small datasets.
+        # Validate author ratios strictly, row ratios loosely.
+        author_col = sobr_dataset.table['author_id'].to_pandas()
+        train_authors = set(author_col.iloc[list(sobr_dataset.splits['train'])])
+        val_authors = set(author_col.iloc[list(sobr_dataset.splits['val'])])
+        test_authors = set(author_col.iloc[list(sobr_dataset.splits['test'])])
+        total_authors = len(train_authors) + len(val_authors) + len(test_authors)
+
+        train_author_ratio = len(train_authors) / total_authors
+        val_author_ratio = len(val_authors) / total_authors
+        test_author_ratio = len(test_authors) / total_authors
+
+        assert 0.75 <= train_author_ratio <= 0.85, (
+            f"Train author ratio {train_author_ratio:.2%} outside [75%, 85%]"
+        )
+        assert 0.05 <= val_author_ratio <= 0.15, (
+            f"Val author ratio {val_author_ratio:.2%} outside [5%, 15%]"
+        )
+        assert 0.05 <= test_author_ratio <= 0.15, (
+            f"Test author ratio {test_author_ratio:.2%} outside [5%, 15%]"
+        )
+
+        # Row ratios: allow wider tolerance for small datasets
+        assert 0.60 <= train_ratio <= 0.90, f"Train ratio {train_ratio:.2%} outside [60%, 90%]"
+        assert 0.02 <= val_ratio <= 0.25, f"Val ratio {val_ratio:.2%} outside [2%, 25%]"
+        assert 0.02 <= test_ratio <= 0.25, f"Test ratio {test_ratio:.2%} outside [2%, 25%]"
     
     def test_huggingface_conversion(self, sobr_dataset):
         """Test conversion to HuggingFace DatasetDict."""
