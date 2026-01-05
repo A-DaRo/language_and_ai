@@ -25,25 +25,51 @@ For HPC features:
 pip install -e ".[hpc]"
 ```
 
-## Quick Start
+## To begin
+
+1. Make sure to have all SOBR csv files in `datasets/`
+
+2. Create unified arrow dataset
 
 ```bash
 # Convert raw data to Arrow format
-neuro-stylometry convert-data --input-dir ./data/raw --output-path ./artifacts/data/sobr_unified.arrow
+python scripts/convert_pandas_to_arrow.py
+```
 
-# Run Phase A (pollution detection and mitigation)
-neuro-stylometry run-phase-a --dataset ./artifacts/data/sobr_unified.arrow --output-dir ./artifacts/phase_a
+3. Create laptop partition
 
-# Run Phase D (constrained training)
-neuro-stylometry run-phase-d --dataset ./artifacts/data/sobr_clean.arrow --projection ./artifacts/phase_a/projection_matrix.pt --output-dir ./artifacts/phase_d
+```bash
+# Create laptop arrow partition from unified table
+python scripts/create_laptop_dataset.py
+```
 
-# Run verification
-neuro-stylometry verify --model-a ./artifacts/phase_d/model_dirty --model-b ./artifacts/phase_d/model_clean --output ./artifacts/reports/comparison_report.md
+4. Create finalized dataset for golden tests
+
+```bash
+# Run phase_A pipeline for golden fixtures
+python scrips/generate_golden_fixtures.py
 ```
 
 ## Documentation
 
 See `Docs_from_SM/Generated/phaseA-D_implementation_plan.md` for full specification.
+
+## Testing
+
+Comprehensive test suite with hardware-aware fixtures and auto-skip for environment-specific tests.
+
+```bash
+# Run all tests
+pytest
+
+# Run fast tests only (excludes slow/real_models)
+pytest -m "not slow and not real_models"
+
+# Run with coverage
+pytest --cov=src/neuro_stylometry --cov-report=html
+```
+
+See [tests/README.md](tests/README.md) for the complete testing guide.
 
 ## License
 

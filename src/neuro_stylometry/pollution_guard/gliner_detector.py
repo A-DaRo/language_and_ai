@@ -1,134 +1,155 @@
 """
 GLiNER Pollution Detector for SOBR Corpus.
 
-Implements the Symbolic Layer of Phase A with critical SOBR-specific safeguards:
-- Taxonomy decoupling (schema columns != prompt labels)
+Implements the Symbolic Layer of Phase A with semantic-aware context management:
+- Dynamic Prompt-Aware Budgeting (calculates effective text budget after label costs)
+- Sentence-Boundary Chunking via PySBD (preserves semantic context)
+- Fallback hard-slicing for pathological run-on sentences
 - Tokenizer-safe typed masks (registered as special tokens)
-- Distractor prompts to absorb non-self mentions
-- Center-window retention for long posts (>512 tokens)
 - Entity-specific width constraints
 
 Reference: GLiNER_Implementation_Strategy.md Sections 2.1-2.4
 Implements: FR-05 (GLiNER Integration), FR-06 (Chunking), FR-07 (Precision Filters)
 """
 
-import logging
-import torch
-from typing import List, Dict, Any, Tuple, Optional
-from dataclasses import dataclass, field
-from pathlib import Path
-from gliner import GLiNER
-from collections import deque
-from tqdm import tqdm
+from __future__ import annotations
+
 import inspect
-import warnings
+import logging
+from collections import deque
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional
+
+import torch
+from gliner import GLiNER
+from tqdm import tqdm
+
+from .semantic_chunker import (
+    BudgetConfig,
+    ChunkInfo,
+    SemanticChunker,
+    deduplicate_entities,
+    project_entity_offsets,
+)
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Taxonomy & Constraints
+# ---------------------------------------------------------------------------
 
 
 @dataclass
 class SOBRTaxonomy:
     """
     SOBR-specific taxonomy mapping.
-    
+
     Maps SOBR schema concepts to semantically anchored GLiNER prompts.
     Critical: Do NOT use schema column names directly (e.g., "judging" triggers verbs).
-    
+
     Implements: GLiNER_Implementation_Strategy.md Section 2.1
     """
 
     # Target labels (internal IDs) mapped to GLiNER prompt strings.
-    # Prompts are semantic anchors, not schema column names.
-    target_label_prompts: Dict[str, List[str]] = field(default_factory=lambda: {
-        "age_statement": [
-            "age statement",
-            "self-identified age",
-        ],
-        "birth_year_statement": [
-            "birth year statement",
-            "born in year",
-        ],
-        "gender_indicator": [
-            "gender self-identification",
-            "self-identified gender",
-        ],
-        "nationality_statement": [
-            "nationality statement",
-            "self-identified nationality",
-        ],
-        "country_of_origin": [
-            "country of origin",
-            "place of origin",
-        ],
-        "demonym": [
-            "demonym",
-            "nationality adjective",
-        ],
-        "personality_type_identifier": [
-            "personality type identifier",
-            "self-identified personality type",
-        ],
-        "mbti_type": [
-            "MBTI type",
-            "MBTI identifier",
-        ],
-        "political_affiliation": [
-            "political affiliation",
-            "self-identified political affiliation",
-        ],
-        "ideology_self_id": [
-            "political ideology",
-            "self-identified political ideology",
-        ],
-    })
+    target_label_prompts: Dict[str, List[str]] = field(
+        default_factory=lambda: {
+            "age_statement": [
+                "age statement",
+                "self-identified age",
+            ],
+            "birth_year_statement": [
+                "birth year statement",
+                "born in year",
+            ],
+            "gender_indicator": [
+                "gender self-identification",
+                "self-identified gender",
+            ],
+            "nationality_statement": [
+                "nationality statement",
+                "self-identified nationality",
+            ],
+            "country_of_origin": [
+                "country of origin",
+                "place of origin",
+            ],
+            "demonym": [
+                "demonym",
+                "nationality adjective",
+            ],
+            "personality_type_identifier": [
+                "personality type identifier",
+                "self-identified personality type",
+            ],
+            "mbti_type": [
+                "MBTI type",
+                "MBTI identifier",
+            ],
+            "political_affiliation": [
+                "political affiliation",
+                "self-identified political affiliation",
+            ],
+            "ideology_self_id": [
+                "political ideology",
+                "self-identified political ideology",
+            ],
+        }
+    )
 
     # Distractor labels: absorb non-self demographic mentions
-    distractor_labels: List[str] = field(default_factory=lambda: [
-        "third person reference",
-        "third-person demographic mention",
-        "quote attribution",
-        "historical figure",
-        "fictional character",
-    ])
+    distractor_labels: List[str] = field(
+        default_factory=lambda: [
+            "third person reference",
+            "third-person demographic mention",
+            "quote attribution",
+            "historical figure",
+            "fictional character",
+        ]
+    )
 
     # Internal label -> typed mask token mapping (one-to-one)
-    mask_tokens: Dict[str, str] = field(default_factory=lambda: {
-        "age_statement": "[MASK:AGE]",
-        "birth_year_statement": "[MASK:BIRTH_YEAR]",
-        "gender_indicator": "[MASK:GENDER]",
-        "nationality_statement": "[MASK:NATIONALITY]",
-        "country_of_origin": "[MASK:COUNTRY]",
-        "demonym": "[MASK:DEMONYM]",
-        "personality_type_identifier": "[MASK:PERSONALITY]",
-        "mbti_type": "[MASK:MBTI]",
-        "political_affiliation": "[MASK:POLITICAL]",
-        "ideology_self_id": "[MASK:IDEOLOGY]",
-    })
+    mask_tokens: Dict[str, str] = field(
+        default_factory=lambda: {
+            "age_statement": "[MASK:AGE]",
+            "birth_year_statement": "[MASK:BIRTH_YEAR]",
+            "gender_indicator": "[MASK:GENDER]",
+            "nationality_statement": "[MASK:NATIONALITY]",
+            "country_of_origin": "[MASK:COUNTRY]",
+            "demonym": "[MASK:DEMONYM]",
+            "personality_type_identifier": "[MASK:PERSONALITY]",
+            "mbti_type": "[MASK:MBTI]",
+            "political_affiliation": "[MASK:POLITICAL]",
+            "ideology_self_id": "[MASK:IDEOLOGY]",
+        }
+    )
 
     # Internal label -> reference regex patterns (for explicit recall)
-    reference_patterns: Dict[str, List[str]] = field(default_factory=lambda: {
-        "age_statement": [
-            r"(?i)\bI\s*(?:am|'m)\s*\d{1,2}\b",
-        ],
-        "birth_year_statement": [
-            r"(?i)\b(?:born\s+in|born\s+around)\s*\d{4}\b",
-        ],
-        "gender_indicator": [
-            r"(?i)\bI\s*(?:am|'m)\s*(?:a\s+)?(?:man|woman|male|female)\b",
-        ],
-        "nationality_statement": [
-            r"(?i)\bI\s*(?:am|'m)\s*(?:an?\s+)?[A-Z][a-z]+\b",
-        ],
-        "country_of_origin": [
-            r"(?i)\bI\s*(?:am|'m)\s*from\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)?\b",
-        ],
-        "mbti_type": [
-            r"(?i)\b(?:INTJ|INTP|ENTJ|ENTP|INFJ|INFP|ENFJ|ENFP|ISTJ|ISFJ|ESTJ|ESFJ|ISTP|ISFP|ESTP|ESFP)\b",
-        ],
-    })
+    reference_patterns: Dict[str, List[str]] = field(
+        default_factory=lambda: {
+            "age_statement": [
+                r"(?i)\bI\s*(?:am|'m)\s*\d{1,2}\b",
+            ],
+            "birth_year_statement": [
+                r"(?i)\b(?:born\s+in|born\s+around)\s*\d{4}\b",
+            ],
+            "gender_indicator": [
+                r"(?i)\bI\s*(?:am|'m)\s*(?:a\s+)?(?:man|woman|male|female)\b",
+            ],
+            "nationality_statement": [
+                r"(?i)\bI\s*(?:am|'m)\s*(?:an?\s+)?[A-Z][a-z]+\b",
+            ],
+            "country_of_origin": [
+                r"(?i)\bI\s*(?:am|'m)\s*from\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)?\b",
+            ],
+            "mbti_type": [
+                r"(?i)\b(?:INTJ|INTP|ENTJ|ENTP|INFJ|INFP|ENFJ|ENFP|ISTJ|ISFJ|ESTJ|ESFJ|ISTP|ISFP|ESTP|ESFP)\b",
+            ],
+        }
+    )
 
     @classmethod
-    def from_config(cls, config: Dict[str, Any]) -> "SOBRTaxonomy":
+    def from_config(cls, config: Dict[str, Any]) -> SOBRTaxonomy:
         """Create taxonomy from a configuration dictionary."""
         default = cls()
         return cls(
@@ -137,16 +158,14 @@ class SOBRTaxonomy:
             mask_tokens=config.get("mask_tokens", default.mask_tokens),
             reference_patterns=config.get("reference_patterns", default.reference_patterns),
         )
-    
+
     def get_inference_labels(self) -> List[str]:
         """
         Get combined labels for GLiNER inference (targets + distractors).
-        
+
         Returns:
             Deduplicated list of labels for inference.
         """
-        # GLiNER is prompted with free-text label strings. For reliable detection,
-        # we map our internal IDs to model-friendly prompts.
         labels: List[str] = []
         for prompts in self.target_label_prompts.values():
             labels.extend(prompts)
@@ -167,25 +186,25 @@ class SOBRTaxonomy:
 
     def normalize_label(self, label: str) -> str:
         """Map a prompt label (or internal label) to the internal label ID."""
-        # Fast-path: already internal
         if label in self.get_target_labels() or label in self.distractor_labels:
             return label
         return self._prompt_to_internal(label)
 
     def _prompt_to_internal(self, prompt_label: str) -> str:
+        """Reverse lookup: prompt string -> internal label ID."""
         reverse = {}
         for internal, prompts in self.target_label_prompts.items():
             for prompt in prompts:
                 reverse[prompt] = internal
         return reverse.get(prompt_label, prompt_label)
-    
+
     def filter_distractors(self, entities: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
         Remove distractor entities from detection results.
-        
+
         Args:
             entities: Raw GLiNER detection results.
-            
+
         Returns:
             Filtered entities containing only target labels.
         """
@@ -201,80 +220,94 @@ class SOBRTaxonomy:
 class EntityWidthConstraints:
     """
     Entity-specific token width constraints.
-    
+
     Implements: GLiNER_Implementation_Strategy.md Section 2.2
     """
-    
-    # Maximum token widths per entity type
-    max_widths: Dict[str, int] = field(default_factory=lambda: {
-        "age_statement": 5,          # "I am 25 years old"
-        "birth_year_statement": 6,   # "I was born in 1995"
-        "gender_indicator": 4,       # "As a woman"
-        "nationality_statement": 5,  # "I'm German American"
-        "country_of_origin": 5,      # "I'm from New Zealand"
-        "demonym": 4,                # "I'm a Brit"
-        "personality_type_identifier": 6,  # "I'm an INTP person"
-        "mbti_type": 4,              # "I'm INTJ"
-        "political_affiliation": 5,  # "I'm a liberal democrat"
-        "ideology_self_id": 5,       # "I'm left-wing progressive"
-        "default": 12,               # Fallback
-    })
+
+    max_widths: Dict[str, int] = field(
+        default_factory=lambda: {
+            "age_statement": 5,
+            "birth_year_statement": 6,
+            "gender_indicator": 4,
+            "nationality_statement": 5,
+            "country_of_origin": 5,
+            "demonym": 4,
+            "personality_type_identifier": 6,
+            "mbti_type": 4,
+            "political_affiliation": 5,
+            "ideology_self_id": 5,
+            "default": 12,
+        }
+    )
 
     @classmethod
-    def from_config(cls, config: Dict[str, Any]) -> "EntityWidthConstraints":
+    def from_config(cls, config: Dict[str, Any]) -> EntityWidthConstraints:
         """Create width constraints from a configuration dictionary."""
         default = cls()
         merged = dict(default.max_widths)
         merged.update({k: int(v) for k, v in config.items()})
         return cls(max_widths=merged)
-    
+
     def get_max_width(self, entity_type: str) -> int:
         """Get maximum token width for entity type."""
         return self.max_widths.get(entity_type, self.max_widths["default"])
 
 
+# ---------------------------------------------------------------------------
+# GLiNER Detector
+# ---------------------------------------------------------------------------
+
+
 class GLiNERDetector:
     """
-    GLiNER-based pollution span detector with SOBR-specific safeguards.
-    
-    Key Features:
-    - Tokenizer-safe mask registration (prevents fragmentation)
-    - Center-window retention for long posts
-    - Precision filtering (width constraints + confidence threshold)
-    - Distractor-aware inference
-    
+    GLiNER-based pollution span detector with semantic-aware context management.
+
+    Architecture:
+    - Dynamic Prompt-Aware Budgeting: Calculates effective text budget after label costs
+    - Sentence-Boundary Chunking: PySBD-based segmentation preserves semantic context
+    - Fallback Hard-Slicing: Handles pathological run-on sentences
+    - Precision Filtering: Width constraints + confidence threshold
+
     Implements: FR-05, FR-06, FR-07
     """
-    
+
+    # Class-level model cache to avoid reloading
+    _MODEL_CACHE: Dict[tuple, GLiNER] = {}
+
     def __init__(
         self,
         model_name: str = "urchade/gliner_large-v2.1",
         device: str = "cuda",
         max_length: int = 512,
         confidence_threshold: float = 0.85,
-        center_window_keep: int = 100,  # Keep center 100 tokens for long posts
         taxonomy: Optional[SOBRTaxonomy] = None,
         constraints: Optional[EntityWidthConstraints] = None,
         taxonomy_config: Optional[Dict[str, Any]] = None,
         constraints_config: Optional[Dict[str, Any]] = None,
+        budget_config: Optional[BudgetConfig] = None,
+        # Legacy parameters (ignored but accepted for backward compatibility)
+        center_window_keep: int = 100,
     ):
         """
-        Initialize GLiNER detector with SOBR safeguards.
-        
+        Initialize GLiNER detector with semantic-aware context management.
+
         Args:
             model_name: GLiNER model identifier.
             device: PyTorch device (cuda/cpu).
             max_length: Maximum sequence length for GLiNER.
             confidence_threshold: Minimum confidence for accepting spans (>= 0.85).
-            center_window_keep: Number of center tokens to keep in long posts.
             taxonomy: SOBR taxonomy (defaults to SOBRTaxonomy()).
             constraints: Entity width constraints (defaults to EntityWidthConstraints()).
+            taxonomy_config: Dict to construct taxonomy from config.
+            constraints_config: Dict to construct constraints from config.
+            budget_config: Configuration for dynamic budgeting.
+            center_window_keep: DEPRECATED - Ignored. Semantic chunking handles this.
         """
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
         self.max_length = max_length
         self.confidence_threshold = confidence_threshold
-        self.center_window_keep = center_window_keep
-        
+
+        # Initialize taxonomy and constraints
         if taxonomy is None and taxonomy_config is not None:
             taxonomy = SOBRTaxonomy.from_config(taxonomy_config)
         if constraints is None and constraints_config is not None:
@@ -282,79 +315,97 @@ class GLiNERDetector:
 
         self.taxonomy = taxonomy or SOBRTaxonomy()
         self.constraints = constraints or EntityWidthConstraints()
-        
-        # Load GLiNER model (CPU first to avoid CUDA OOM during `from_pretrained` move)
-        cache_key = (model_name, str(self.device), int(max_length))
-        cached = getattr(GLiNERDetector, "_MODEL_CACHE", {}).get(cache_key)
-        if cached is not None:
-            self.model = cached
-        else:
-            logger.info(f"Loading GLiNER model: {model_name}")
-            model = GLiNER.from_pretrained(
-                model_name,
-                map_location="cpu",
-                max_length=max_length,
-            )
 
-            # Move to requested device (may still be CPU depending on availability)
-            if self.device.type == "cuda":
-                # Best-effort VRAM reduction
-                try:
-                    model = model.half()
-                except Exception:
-                    pass
-            try:
-                model = model.to(self.device)
-            except Exception:
-                # If moving fails for any reason, keep on CPU but keep detector consistent.
-                model = model.to("cpu")
-                self.device = torch.device("cpu")
+        # Budget configuration for semantic chunker
+        self.budget_config = budget_config or BudgetConfig(model_max_length=max_length)
 
-            model.eval()
-            self.model = model
+        # Load GLiNER model
+        self.model = self._load_model(model_name)
 
-            if not hasattr(GLiNERDetector, "_MODEL_CACHE"):
-                GLiNERDetector._MODEL_CACHE = {}
-            GLiNERDetector._MODEL_CACHE[cache_key] = self.model
-
-        # Register typed mask tokens as special tokens (CRITICAL: prevents fragmentation)
+        # Register typed mask tokens as special tokens
         self._register_mask_tokens()
-        
+
+        # Initialize semantic chunker
+        self.chunker = SemanticChunker(
+            tokenizer=self.tokenizer,
+            config=self.budget_config,
+        )
+
         logger.info(f"GLiNERDetector initialized on {self.device}")
-    
+
+    @property
+    def tokenizer(self):
+        """Access the underlying transformer tokenizer."""
+        return self.model.data_processor.transformer_tokenizer
+
+    def _load_model(self, model_name: str) -> GLiNER:
+        """
+        Load GLiNER model with caching and device management.
+
+        Args:
+            model_name: HuggingFace model identifier.
+
+        Returns:
+            Loaded GLiNER model.
+        """
+        cache_key = (model_name, str(self.device), self.max_length)
+
+        if cache_key in GLiNERDetector._MODEL_CACHE:
+            return GLiNERDetector._MODEL_CACHE[cache_key]
+
+        logger.info(f"Loading GLiNER model: {model_name}")
+
+        # Load to CPU first to avoid OOM during from_pretrained
+        model = GLiNER.from_pretrained(
+            model_name,
+            map_location="cpu",
+            max_length=self.max_length,
+        )
+
+        # Move to requested device
+        if self.device.type == "cuda":
+            try:
+                model = model.half()
+            except Exception:
+                pass
+
+        try:
+            model = model.to(self.device)
+        except Exception:
+            logger.warning("Failed to move model to CUDA, falling back to CPU")
+            model = model.to("cpu")
+            self.device = torch.device("cpu")
+
+        model.eval()
+        GLiNERDetector._MODEL_CACHE[cache_key] = model
+
+        return model
+
     def _register_mask_tokens(self) -> None:
         """
         Register typed mask tokens as special tokens in tokenizer.
-        
-        Critical: Prevents tokenizer fragmentation of mask strings.
-        Implements: GLiNER_Implementation_Strategy.md Section 1.2
-        """
-        # Define typed mask tokens (from taxonomy mapping)
-        mask_tokens = list(dict.fromkeys(self.taxonomy.get_mask_tokens().values()))
-        
-        # Access the underlying transformer tokenizer
-        tokenizer = self.model.data_processor.transformer_tokenizer
 
-        # Ensure GLiNER/HF tokenization has an explicit max_length to avoid
-        # "Default to no truncation" behavior on some tokenizers.
+        Critical: Prevents tokenizer fragmentation of mask strings.
+        """
+        mask_tokens = list(dict.fromkeys(self.taxonomy.get_mask_tokens().values()))
+        tokenizer = self.tokenizer
+
+        # Set explicit max_length
         try:
             tokenizer.model_max_length = int(self.max_length)
         except Exception:
             pass
-        
-        # Add special tokens (only if not already present)
-        num_added = tokenizer.add_special_tokens({'additional_special_tokens': mask_tokens})
-        
+
+        # Add special tokens
+        num_added = tokenizer.add_special_tokens({"additional_special_tokens": mask_tokens})
+
         if num_added > 0:
             logger.info(f"Registered {num_added} typed mask tokens as special tokens")
-            # Resize model embeddings to accommodate new tokens (robustly)
-            resized = self._resize_model_embeddings(len(tokenizer))
-            if not resized:
+            if not self._resize_model_embeddings(len(tokenizer)):
                 raise RuntimeError(
-                    "Failed to resize GLiNER embeddings after adding special tokens; "
-                    "mask tokens may cause out-of-range token IDs."
+                    "Failed to resize GLiNER embeddings after adding special tokens"
                 )
-        
+
         # Verify single-token encoding
         for mask_token in mask_tokens:
             token_ids = tokenizer.encode(mask_token, add_special_tokens=False)
@@ -363,19 +414,9 @@ class GLiNERDetector:
                     f"Mask token {mask_token} encoded as {len(token_ids)} tokens: {token_ids}"
                 )
 
-    def get_mask_tokens(self) -> Dict[str, str]:
-        """Expose mask tokens for downstream masking."""
-        return self.taxonomy.get_mask_tokens()
-
     def _resize_model_embeddings(self, new_vocab_size: int) -> bool:
-        """Resize the underlying transformer token embeddings.
-
-        GLiNER wraps an underlying transformer/encoder. Depending on the GLiNER
-        version/model class, `resize_token_embeddings` may live on different
-        nested objects. We search dynamically rather than hardcoding depth.
-        """
-
-        # Fast-paths for common attribute layouts
+        """Resize the underlying transformer token embeddings."""
+        # Search common attribute paths
         for obj in (
             self.model,
             getattr(self.model, "model", None),
@@ -397,19 +438,17 @@ class GLiNERDetector:
                 except Exception:
                     pass
 
-        # Generic BFS over reachable attributes (bounded to avoid cycles)
+        # BFS fallback for nested structures
         visited: set[int] = set()
-        q = deque([self.model])
+        queue = deque([self.model])
         steps = 0
-        while q and steps < 500:
+
+        while queue and steps < 500:
             steps += 1
-            cur = q.popleft()
-            if cur is None:
+            cur = queue.popleft()
+            if cur is None or id(cur) in visited:
                 continue
-            cur_id = id(cur)
-            if cur_id in visited:
-                continue
-            visited.add(cur_id)
+            visited.add(id(cur))
 
             fn = getattr(cur, "resize_token_embeddings", None)
             if callable(fn):
@@ -421,29 +460,25 @@ class GLiNERDetector:
                         fn(new_vocab_size)
                     return True
                 except Exception:
-                    # Keep searching; some wrappers may expose the method but fail.
                     pass
 
-            # Enqueue children from __dict__ to avoid triggering properties.
             try:
                 for v in vars(cur).values():
-                    if v is None:
-                        continue
-                    # Traverse modules, processors, token layers, etc.
-                    if hasattr(v, "__dict__") or isinstance(v, (list, tuple, dict)):
-                        q.append(v)
-                # Expand simple containers
-                if isinstance(cur, dict):
-                    for v in cur.values():
-                        q.append(v)
-                elif isinstance(cur, (list, tuple)):
-                    for v in cur:
-                        q.append(v)
+                    if v is not None and hasattr(v, "__dict__"):
+                        queue.append(v)
             except Exception:
                 continue
 
         return False
-    
+
+    def get_mask_tokens(self) -> Dict[str, str]:
+        """Expose mask tokens for downstream masking."""
+        return self.taxonomy.get_mask_tokens()
+
+    # -----------------------------------------------------------------------
+    # Detection Methods
+    # -----------------------------------------------------------------------
+
     def detect_spans(
         self,
         texts: List[str],
@@ -451,69 +486,109 @@ class GLiNERDetector:
         show_progress: bool = False,
     ) -> List[List[Dict[str, Any]]]:
         """
-        Detect pollution spans in texts (short texts, <= max_length).
-        
+        Detect pollution spans in texts (any length).
+
+        Uses semantic-aware chunking for texts exceeding the token budget.
+
         Args:
             texts: List of input texts.
             batch_size: Batch size for inference.
-            
+            show_progress: Show progress bar.
+
         Returns:
-            List of detected spans per text. Each span is a dict with:
+            List of detected spans per text. Each span dict contains:
                 - text: Detected span text
-                - label: Entity type
+                - label: Entity type (internal label)
                 - score: Confidence score
                 - start: Character start offset
                 - end: Character end offset
         """
-        # Get inference labels (targets + distractors)
         labels = self.taxonomy.get_inference_labels()
-        
-        # Run inference.
-        # Note: GLiNER's `predict_entities` expects a single text (str) per call.
-        all_entities: List[List[Dict[str, Any]]] = []
-        iterator = range(0, len(texts), batch_size)
+        all_results: List[List[Dict[str, Any]]] = []
+
+        iterator = texts
         if show_progress:
-            iterator = tqdm(iterator, desc="GLiNER detection", unit="batch")
-        for i in iterator:
-            batch_texts = texts[i:i + batch_size]
-            for text in batch_texts:
-                entities = self.model.predict_entities(
-                    text,
+            iterator = tqdm(texts, desc="GLiNER detection", unit="text")
+
+        for text in iterator:
+            if not text or not text.strip():
+                all_results.append([])
+                continue
+
+            # Chunk text using semantic-aware strategy
+            chunks = self.chunker.chunk_text(text, labels)
+
+            if not chunks:
+                all_results.append([])
+                continue
+
+            # Detect entities in each chunk
+            doc_entities: List[Dict[str, Any]] = []
+
+            for chunk_info in chunks:
+                chunk_entities = self._detect_in_chunk(
+                    chunk_info.text,
                     labels,
                     threshold=self.confidence_threshold,
-                    max_length=self.max_length,
                 )
-                all_entities.append(entities)
-        
-        # Post-process: filter distractors and apply width constraints
-        filtered_entities = []
-        tokenizer = self.model.data_processor.transformer_tokenizer
-        
-        for text, entities in zip(texts, all_entities):
-            # Filter distractors
-            entities = self.taxonomy.filter_distractors(entities)
-            
-            # Apply width constraints
-            valid_entities = []
-            for entity in entities:
-                # Tokenize span to get token count
-                span_tokens = tokenizer.encode(entity["text"], add_special_tokens=False)
-                token_count = len(span_tokens)
-                
-                max_width = self.constraints.get_max_width(entity["label"])
-                
-                if token_count <= max_width:
-                    valid_entities.append(entity)
-                else:
-                    logger.debug(
-                        f"Filtered span '{entity['text']}' ({entity['label']}): "
-                        f"{token_count} tokens > max {max_width}"
-                    )
-            
-            filtered_entities.append(valid_entities)
-        
-        return filtered_entities
-    
+
+                # Project offsets to document-global coordinates
+                for entity in chunk_entities:
+                    projected = project_entity_offsets(entity, chunk_info)
+                    doc_entities.append(projected)
+
+            # Deduplicate entities from overlapping chunks
+            doc_entities = deduplicate_entities(doc_entities)
+
+            all_results.append(doc_entities)
+
+        return all_results
+
+    def _detect_in_chunk(
+        self,
+        text: str,
+        labels: List[str],
+        threshold: float,
+    ) -> List[Dict[str, Any]]:
+        """
+        Run GLiNER inference on a single chunk.
+
+        Args:
+            text: Chunk text (guaranteed to fit within budget).
+            labels: Inference labels.
+            threshold: Confidence threshold.
+
+        Returns:
+            List of detected entities with chunk-local offsets.
+        """
+        # Run inference
+        entities = self.model.predict_entities(
+            text,
+            labels,
+            threshold=threshold,
+            max_length=self.max_length,
+        )
+
+        # Filter distractors
+        entities = self.taxonomy.filter_distractors(entities)
+
+        # Apply width constraints
+        valid_entities = []
+        for entity in entities:
+            span_tokens = self.tokenizer.encode(entity["text"], add_special_tokens=False)
+            token_count = len(span_tokens)
+            max_width = self.constraints.get_max_width(entity["label"])
+
+            if token_count <= max_width:
+                valid_entities.append(entity)
+            else:
+                logger.debug(
+                    f"Filtered span '{entity['text']}' ({entity['label']}): "
+                    f"{token_count} tokens > max {max_width}"
+                )
+
+        return valid_entities
+
     def detect_spans_long(
         self,
         texts: List[str],
@@ -521,246 +596,27 @@ class GLiNERDetector:
         show_progress: bool = False,
     ) -> List[List[Dict[str, Any]]]:
         """
-        Detect pollution spans in long texts with center-window retention.
-        
-        For texts > max_length, uses overlapping chunking with center-window retention
-        to mitigate edge effects.
-        
-        Implements: GLiNER_Implementation_Strategy.md Section 2.4
-        
+        Detect pollution spans in long texts.
+
+        This method is now an alias for detect_spans(), which handles all text
+        lengths through semantic-aware chunking.
+
         Args:
-            texts: List of input texts (can be > max_length).
+            texts: List of input texts (any length).
             batch_size: Batch size for inference.
-            
+            show_progress: Show progress bar.
+
         Returns:
-            List of detected spans per text (deduplicated across chunks).
+            List of detected spans per text.
         """
-        tokenizer = self.model.data_processor.transformer_tokenizer
-        all_results = []
-        
-        text_iter = texts
-        if show_progress:
-            text_iter = tqdm(texts, desc="GLiNER long-text detection", unit="text")
-        for text in text_iter:
-            # Tokenize to check length
-            with warnings.catch_warnings():
-                warnings.filterwarnings(
-                    "ignore",
-                    message="Token indices sequence length is longer than the specified maximum sequence length",
-                )
-                tokens = tokenizer.encode(text, add_special_tokens=False)
-            
-            if len(tokens) <= self.max_length:
-                # Short text: use standard detection
-                result = self.detect_spans(
-                    [text],
-                    batch_size=batch_size,
-                    show_progress=False,
-                )[0]
-                all_results.append(result)
-            else:
-                # Long text: use chunking with center-window retention
-                result = self._detect_with_chunking(
-                    text,
-                    tokens,
-                    tokenizer,
-                    batch_size,
-                    threshold=self.confidence_threshold,
-                )
-                # Some models degrade confidence on long/repetitive inputs. If we
-                # get zero spans, retry with a lower long-text-only threshold.
-                if not result and self.confidence_threshold > 0.5:
-                    result = self._detect_with_chunking(
-                        text,
-                        tokens,
-                        tokenizer,
-                        batch_size,
-                        threshold=0.5,
-                    )
-                all_results.append(result)
-        
-        return all_results
-    
-    def _detect_with_chunking(
-        self,
-        text: str,
-        tokens: List[int],
-        tokenizer,
-        batch_size: int,
-        threshold: float,
-    ) -> List[Dict[str, Any]]:
+        return self.detect_spans(texts, batch_size=batch_size, show_progress=show_progress)
+
+    def get_effective_budget(self) -> int:
         """
-        Detect spans in long text using overlapping chunking.
-        
-        Args:
-            text: Input text.
-            tokens: Pre-tokenized token IDs.
-            tokenizer: HuggingFace tokenizer.
-            batch_size: Batch size.
-            
+        Get the current effective text budget.
+
         Returns:
-            Deduplicated list of detected spans.
+            Number of text tokens that fit after accounting for prompt costs.
         """
-        chunk_size = self.max_length
-        if chunk_size <= 0:
-            return []
-
-        if self.center_window_keep >= chunk_size or self.center_window_keep <= 0:
-            overlap = 0
-        else:
-            overlap = (chunk_size - self.center_window_keep) // 2
-
-        # Token offsets for the original text (used to map chunk -> original offsets)
-        try:
-            with warnings.catch_warnings():
-                warnings.filterwarnings(
-                    "ignore",
-                    message="Token indices sequence length is longer than the specified maximum sequence length",
-                )
-                encoded = tokenizer(
-                    text,
-                    add_special_tokens=False,
-                    return_offsets_mapping=True,
-                )
-            offsets = encoded["offset_mapping"]
-        except Exception:
-            offsets = None
-
-        if not offsets:
-            # Fallback: no offset mapping available; use decode-based chunking
-            logger.warning("Tokenizer does not provide offsets; chunk offsets may be imprecise")
-            offsets = [(0, 0)] * len(tokens)
-
-        chunks = []
-        chunk_char_offsets = []
-
-        # Create overlapping chunks in token space
-        start = 0
-        while start < len(tokens):
-            end = min(start + chunk_size, len(tokens))
-            char_start = offsets[start][0]
-            char_end = offsets[end - 1][1] if end - 1 < len(offsets) else len(text)
-            chunk_text = text[char_start:char_end]
-
-            chunks.append(chunk_text)
-            chunk_char_offsets.append(char_start)
-
-            if end >= len(tokens):
-                break
-
-            start += max(1, chunk_size - overlap)
-
-        # Detect spans in all chunks
-        all_chunk_entities = self._detect_spans_with_threshold(
-            chunks,
-            batch_size=batch_size,
-            threshold=threshold,
-        )
-
-        collected_entities = []
-
-        for chunk_idx, (chunk_text, entities, char_offset) in enumerate(
-            zip(chunks, all_chunk_entities, chunk_char_offsets)
-        ):
-            is_first = (chunk_idx == 0)
-            is_last = (chunk_idx == len(chunks) - 1)
-
-            # Build token offsets for the chunk to do center-window filtering
-            try:
-                chunk_encoded = tokenizer(
-                    chunk_text,
-                    add_special_tokens=False,
-                    return_offsets_mapping=True,
-                )
-                chunk_offsets = chunk_encoded["offset_mapping"]
-            except Exception:
-                chunk_offsets = []
-
-            if not chunk_offsets or overlap == 0 or is_first or is_last:
-                # Keep all entities; adjust offsets to original text
-                for entity in entities:
-                    entity = dict(entity)
-                    entity["start"] += char_offset
-                    entity["end"] += char_offset
-                    collected_entities.append(entity)
-                continue
-
-            left_edge = overlap // 2
-            right_edge = len(chunk_offsets) - (overlap // 2)
-            if right_edge < left_edge:
-                left_edge = 0
-                right_edge = len(chunk_offsets)
-
-            if left_edge < len(chunk_offsets):
-                char_left = chunk_offsets[left_edge][0]
-            else:
-                char_left = 0
-
-            if right_edge - 1 < len(chunk_offsets) and right_edge > 0:
-                char_right = chunk_offsets[right_edge - 1][1]
-            else:
-                char_right = len(chunk_text)
-
-            for entity in entities:
-                span_start = entity["start"]
-                if char_left <= span_start < char_right:
-                    entity = dict(entity)
-                    entity["start"] += char_offset
-                    entity["end"] += char_offset
-                    collected_entities.append(entity)
-
-        # Deduplicate by (start, end, label), keeping highest score
-        dedup = {}
-        for entity in collected_entities:
-            key = (entity["start"], entity["end"], entity["label"])
-            prev = dedup.get(key)
-            if prev is None or entity.get("score", 0.0) > prev.get("score", 0.0):
-                dedup[key] = entity
-
-        return list(dedup.values())
-
-    def _detect_spans_with_threshold(
-        self,
-        texts: List[str],
-        batch_size: int,
-        threshold: float,
-    ) -> List[List[Dict[str, Any]]]:
-        """Internal helper to run detection with an explicit threshold."""
         labels = self.taxonomy.get_inference_labels()
-
-        all_entities: List[List[Dict[str, Any]]] = []
-        for i in range(0, len(texts), batch_size):
-            batch_texts = texts[i:i + batch_size]
-            for text in batch_texts:
-                entities = self.model.predict_entities(
-                    text,
-                    labels,
-                    threshold=threshold,
-                    max_length=self.max_length,
-                )
-                all_entities.append(entities)
-
-        # Post-process: filter distractors and apply width constraints
-        filtered_entities = []
-        tokenizer = self.model.data_processor.transformer_tokenizer
-
-        for text, entities in zip(texts, all_entities):
-            entities = self.taxonomy.filter_distractors(entities)
-
-            valid_entities = []
-            for entity in entities:
-                span_tokens = tokenizer.encode(entity["text"], add_special_tokens=False)
-                token_count = len(span_tokens)
-                max_width = self.constraints.get_max_width(entity["label"])
-
-                if token_count <= max_width:
-                    valid_entities.append(entity)
-                else:
-                    logger.debug(
-                        f"Filtered span '{entity['text']}' ({entity['label']}): "
-                        f"{token_count} tokens > max {max_width}"
-                    )
-
-            filtered_entities.append(valid_entities)
-
-        return filtered_entities
+        return self.chunker.calculate_effective_budget(labels)

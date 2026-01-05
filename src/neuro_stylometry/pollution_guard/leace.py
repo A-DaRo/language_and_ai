@@ -48,6 +48,25 @@ class CovarianceStats:
     global_sum: Optional[torch.Tensor] = None            # (d,)
 
 
+@dataclass
+class ConceptCovarianceStats:
+        """Accumulated covariance statistics for multi-dimensional concept vectors Z.
+
+        This is the general LEACE case (Theorem 4.1/4.2): Z may be multi-label,
+        continuous, or a concatenation of multiple demographic attributes.
+
+        We accumulate raw moments to compute:
+            Σ_XX = E[XX^T] - μ_X μ_X^T
+            Σ_XZ = E[XZ^T] - μ_X μ_Z^T
+        """
+
+        num_samples: int
+        sum_x: torch.Tensor  # (d,)
+        sum_z: torch.Tensor  # (k,)
+        sum_xx: torch.Tensor  # (d, d)
+        sum_xz: torch.Tensor  # (d, k)
+
+
 class LEACEComputer:
     """
     Compute LEACE projection matrix from embeddings and labels.
@@ -131,6 +150,88 @@ class LEACEComputer:
         self._verify_idempotence(projection_matrix)
         
         return projection_matrix
+
+    def compute_projection_from_concepts(
+        self,
+        embeddings: torch.Tensor,
+        concepts: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute LEACE projection from embeddings and a concept design matrix Z.
+
+        Args:
+            embeddings: (n, d) float tensor.
+            concepts: (n, k) float tensor.
+
+        Returns:
+            Projection matrix P of shape (d, d).
+        """
+        if embeddings.shape[0] != concepts.shape[0]:
+            raise ValueError(
+                f"Embeddings ({embeddings.shape[0]}) and concepts ({concepts.shape[0]}) "
+                "must have same number of samples"
+            )
+        if embeddings.shape[1] != self.embedding_dim:
+            raise ValueError(
+                f"Embedding dimension ({embeddings.shape[1]}) != expected ({self.embedding_dim})"
+            )
+
+        compute_device = torch.device("cpu") if self.force_cpu else self.device
+        X = embeddings.to(compute_device, dtype=torch.float32)
+        Z = concepts.to(compute_device, dtype=torch.float32)
+
+        stats = self._compute_concept_stats(X, Z, device=compute_device)
+        P = self._compute_projection_from_concept_stats(stats, device=compute_device)
+        self._verify_idempotence(P)
+        return P
+
+    def accumulate_batch_concepts(
+        self,
+        embeddings_batch: torch.Tensor,
+        concepts_batch: torch.Tensor,
+        accumulated_stats: Optional[ConceptCovarianceStats] = None,
+    ) -> ConceptCovarianceStats:
+        """Accumulate concept covariance stats from a batch.
+
+        Keeps computations on CPU for streaming stability/VRAM control.
+        Batch accumulation always transfers to CPU to prevent VRAM fragmentation.
+        
+        Note:
+            If force_cpu is True and embeddings are on CUDA, a warning is logged
+            and embeddings are automatically moved to CPU.
+        """
+        # Check for GPU embeddings when force_cpu is enabled
+        if self.force_cpu and embeddings_batch.device.type == "cuda":
+            logger.warning(
+                "force_cpu=True but embeddings are on CUDA. "
+                "Auto-moving to CPU for LEACE accumulation."
+            )
+
+        X = embeddings_batch.detach().to("cpu", dtype=torch.float32)
+        Z = concepts_batch.detach().to("cpu", dtype=torch.float32)
+
+        batch_stats = self._compute_concept_stats(X, Z, device=torch.device("cpu"))
+        if accumulated_stats is None:
+            return batch_stats
+
+        if accumulated_stats.sum_z.shape != batch_stats.sum_z.shape:
+            raise ValueError(
+                "Concept dimension mismatch during accumulation: "
+                f"{accumulated_stats.sum_z.shape} vs {batch_stats.sum_z.shape}"
+            )
+
+        return ConceptCovarianceStats(
+            num_samples=int(accumulated_stats.num_samples + batch_stats.num_samples),
+            sum_x=accumulated_stats.sum_x + batch_stats.sum_x,
+            sum_z=accumulated_stats.sum_z + batch_stats.sum_z,
+            sum_xx=accumulated_stats.sum_xx + batch_stats.sum_xx,
+            sum_xz=accumulated_stats.sum_xz + batch_stats.sum_xz,
+        )
+
+    def compute_projection_from_concept_stats(
+        self,
+        stats: ConceptCovarianceStats,
+    ) -> torch.Tensor:
+        return self._compute_projection_from_concept_stats(stats)
     
     def accumulate_batch(
         self,
@@ -321,6 +422,38 @@ class LEACEComputer:
             label_scatter=label_scatter,
             global_sum=global_sum,
         )
+
+    def _compute_concept_stats(
+        self,
+        embeddings: torch.Tensor,
+        concepts: torch.Tensor,
+        device: Optional[torch.device] = None,
+    ) -> ConceptCovarianceStats:
+        compute_device = device or embeddings.device
+        X = embeddings.detach().to(compute_device, dtype=torch.float32)
+        Z = concepts.detach().to(compute_device, dtype=torch.float32)
+
+        if X.ndim != 2 or Z.ndim != 2:
+            raise ValueError("Embeddings and concepts must be 2D tensors")
+        if X.shape[0] != Z.shape[0]:
+            raise ValueError("Embeddings and concepts must share the same first dimension")
+
+        n = int(X.shape[0])
+        d = int(X.shape[1])
+        if d != self.embedding_dim:
+            raise ValueError(f"Embedding dimension ({d}) != expected ({self.embedding_dim})")
+
+        sum_x = X.sum(dim=0)
+        sum_z = Z.sum(dim=0)
+        sum_xx = X.T @ X
+        sum_xz = X.T @ Z
+        return ConceptCovarianceStats(
+            num_samples=n,
+            sum_x=sum_x,
+            sum_z=sum_z,
+            sum_xx=sum_xx,
+            sum_xz=sum_xz,
+        )
     
     def _compute_projection_from_stats(
         self,
@@ -342,6 +475,7 @@ class LEACEComputer:
         d = self.embedding_dim
 
         compute_device = device or stats.within_class_cov.device
+        output_device = torch.device("cpu") if self.force_cpu else self.device
         compute_dtype = torch.float64 if compute_device.type == "cpu" else torch.float32
 
         label_means = stats.label_means.detach().to(compute_device, dtype=compute_dtype)
@@ -382,7 +516,7 @@ class LEACEComputer:
                 P_whitened = torch.eye(d, dtype=compute_dtype, device=compute_device) - (V @ V.T)
                 P_comp = sqrt @ P_whitened @ inv_sqrt
 
-            P = P_comp.to(dtype=torch.float32, device=self.device)
+            P = P_comp.to(dtype=torch.float32, device=output_device)
             logger.info(f"Computed projection matrix: {P.shape}")
             return P
         except Exception as e:
@@ -391,8 +525,8 @@ class LEACEComputer:
         # Fallback: use robust Cholesky + pseudo-inverse factorization.
         # This path is less strictly idempotent but keeps the pipeline running.
         # Fallback expects tensors on the configured device.
-        Sigma_c_dev = Sigma_c.to(dtype=torch.float32, device=self.device)
-        centered_dev = centered_means.to(dtype=torch.float32, device=self.device)
+        Sigma_c_dev = Sigma_c.to(dtype=torch.float32, device=output_device)
+        centered_dev = centered_means.to(dtype=torch.float32, device=output_device)
 
         L = self._robust_cholesky(Sigma_c_dev)
         L_pinv = self._robust_pinv(L)
@@ -400,9 +534,92 @@ class LEACEComputer:
 
         label_cov = (centered_dev.T @ centered_dev) / len(stats.label_means)
         M = Sigma_c_inv_sqrt @ label_cov @ Sigma_c_inv_sqrt
-        I = torch.eye(d, device=self.device)
+        I = torch.eye(d, device=output_device)
         P = I - M
         logger.info(f"Computed projection matrix (fallback): {P.shape}")
+        return P
+
+    def _compute_projection_from_concept_stats(
+        self,
+        stats: ConceptCovarianceStats,
+        device: Optional[torch.device] = None,
+    ) -> torch.Tensor:
+        """Compute LEACE projection using cross-covariance Σ_XZ.
+
+        Implements the general LEACE solution for multi-dimensional Z.
+        """
+
+        d = self.embedding_dim
+        compute_device = device or stats.sum_x.device
+        output_device = torch.device("cpu") if self.force_cpu else self.device
+        compute_dtype = torch.float64 if compute_device.type == "cpu" else torch.float32
+
+        n = float(max(int(stats.num_samples), 1))
+
+        sum_x = stats.sum_x.detach().to(compute_device, dtype=compute_dtype)
+        sum_z = stats.sum_z.detach().to(compute_device, dtype=compute_dtype)
+        sum_xx = stats.sum_xx.detach().to(compute_device, dtype=compute_dtype)
+        sum_xz = stats.sum_xz.detach().to(compute_device, dtype=compute_dtype)
+
+        mu_x = sum_x / n
+        mu_z = sum_z / n
+
+        Sigma_xx = (sum_xx / n) - (mu_x.unsqueeze(1) @ mu_x.unsqueeze(0))
+        Sigma_xz = (sum_xz / n) - (mu_x.unsqueeze(1) @ mu_z.unsqueeze(0))
+
+        Sigma_xx = Sigma_xx + float(self.regularization) * torch.eye(
+            d, dtype=compute_dtype, device=compute_device
+        )
+
+        try:
+            evals, evecs = torch.linalg.eigh(Sigma_xx)
+            eps = float(self.regularization)
+            evals = torch.clamp(evals, min=eps)
+
+            inv_sqrt = evecs @ torch.diag(1.0 / torch.sqrt(evals)) @ evecs.T
+            sqrt = evecs @ torch.diag(torch.sqrt(evals)) @ evecs.T
+
+            M = inv_sqrt @ Sigma_xz  # (d, k)
+            U, S, _ = torch.linalg.svd(M, full_matrices=False)
+            if S.numel() == 0:
+                P_comp = torch.eye(d, dtype=compute_dtype, device=compute_device)
+            else:
+                tol = float(S.max().item()) * 1e-6
+                r = int((S > tol).sum().item())
+                if r == 0:
+                    P_comp = torch.eye(d, dtype=compute_dtype, device=compute_device)
+                else:
+                    U_r = U[:, :r]
+                    P_white = torch.eye(d, dtype=compute_dtype, device=compute_device) - (U_r @ U_r.T)
+                    P_comp = sqrt @ P_white @ inv_sqrt
+
+            P = P_comp.to(dtype=torch.float32, device=output_device)
+            logger.info(f"Computed projection matrix (concepts): {P.shape}")
+            return P
+        except Exception as e:
+            logger.warning(f"Concept LEACE eigendecomposition path failed, falling back: {e}")
+
+        # Fallback: GPU robust Cholesky + pseudo-inverse whitening.
+        Sigma_xx_dev = Sigma_xx.to(dtype=torch.float32, device=output_device)
+        Sigma_xz_dev = Sigma_xz.to(dtype=torch.float32, device=output_device)
+
+        L = self._robust_cholesky(Sigma_xx_dev)
+        L_pinv = self._robust_pinv(L)
+        inv_sqrt = L_pinv.T
+
+        M = inv_sqrt @ Sigma_xz_dev
+        U, S, _ = torch.linalg.svd(M, full_matrices=False)
+        if S.numel() == 0:
+            return torch.eye(d, dtype=torch.float32, device=output_device)
+        tol = float(S.max().item()) * 1e-6
+        r = int((S > tol).sum().item())
+        if r == 0:
+            return torch.eye(d, dtype=torch.float32, device=output_device)
+        U_r = U[:, :r]
+        P_white = torch.eye(d, dtype=torch.float32, device=output_device) - (U_r @ U_r.T)
+        # Approximate unwhitening using L as sqrt factor.
+        P = L @ P_white @ inv_sqrt
+        logger.info(f"Computed projection matrix (concepts fallback): {P.shape}")
         return P
 
     def _log_condition_numbers(

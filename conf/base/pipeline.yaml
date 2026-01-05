@@ -1,10 +1,12 @@
 # conf/base/pipeline.yaml - Base configuration (shared across all environments)
 
+seed: 42
+
 gliner:
   model: "urchade/gliner_large-v2.1"
   confidence_threshold: 0.85
   batch_size: 32
-  device: "cuda"
+  device: "auto"  # "auto" | "cpu" | "cuda" (explicit authority)
   taxonomy_path: "conf/base/gliner_taxonomy.yaml"
   compute_explicit_recall: true
   explicit_recall_threshold: 0.95
@@ -13,9 +15,11 @@ encoder:
   model: "roberta-base"
   hidden_dim: 768
   max_length: 512
+  batch_size: 32
+  device: "auto"  # "auto" | "cpu" | "cuda"
 
 paths:
-  raw_data: "${oc.env:SOBR_DATA_PATH,./artifacts/data/sobr_raw}"
+  raw_data: "${oc.env:SOBR_DATA_PATH,./datasets}"
   output: "./artifacts"
 
 dataloader:
@@ -42,6 +46,8 @@ probe:
 
 leace:
   force_cpu: false
+  regularization: 1e-5
+  batch_size: 100
 
 quality:
   enforce_thresholds: false

@@ -197,4 +197,3 @@ def compute_amnesic_drop(
         logger.warning(f"⚠ Amnesic drop {amnesic_drop:.2%} < 30% (target not met)")
     
     return acc_before, acc_after, amnesic_drop
-# LinearProbe - Train linear probes for self-evaluation

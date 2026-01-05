@@ -11,6 +11,7 @@ import logging
 from typing import Optional
 
 from ..hardware_ops.detection import HardwareDetector, ProfileType
+from ..config import load_pipeline_config
 from ..pollution_guard.strategies.base import PollutionFilterStrategy
 from ..pollution_guard.strategies.laptop import LaptopFilterStrategy
 from ..pollution_guard.strategies.hpc import HPCFilterStrategy
@@ -61,38 +62,5 @@ class StrategyFactory:
         Returns:
             Configuration dictionary with recommended settings.
         """
-        if profile_type == ProfileType.HPC:
-            return {
-                "gliner_threshold": 0.85,
-                "gliner_batch_size": 16,
-                "embedder_batch_size": 32,
-                "leace_regularization": 1e-5,
-                "use_full_batch_leace": True,
-                "gliner_taxonomy_path": "conf/base/gliner_taxonomy.yaml",
-                "gliner_compute_explicit_recall": True,
-                "gliner_explicit_recall_threshold": 0.95,
-                "probe_compute_amnesic_drop": True,
-                "probe_amnesic_drop_threshold": 0.30,
-                "probe_train_split": 0.8,
-                "probe_max_samples": 20000,
-                "leace_force_cpu": False,
-                "enforce_quality_thresholds": False,
-            }
-        else:  # LAPTOP
-            return {
-                "gliner_threshold": 0.85,
-                "gliner_batch_size": 2,
-                "embedder_batch_size": 4,
-                "leace_regularization": 1e-5,
-                "leace_batch_size": 50,
-                "max_samples": 1000,  # Use subset
-                "gliner_taxonomy_path": "conf/base/gliner_taxonomy.yaml",
-                "gliner_compute_explicit_recall": True,
-                "gliner_explicit_recall_threshold": 0.95,
-                "probe_compute_amnesic_drop": True,
-                "probe_amnesic_drop_threshold": 0.30,
-                "probe_train_split": 0.8,
-                "probe_max_samples": 20000,
-                "leace_force_cpu": True,
-                "enforce_quality_thresholds": False,
-            }
+        mode = "hpc" if profile_type == ProfileType.HPC else "laptop"
+        return load_pipeline_config(mode=mode)

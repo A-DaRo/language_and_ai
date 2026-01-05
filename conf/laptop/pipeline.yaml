@@ -20,11 +20,25 @@ precision:
   use_grad_scaler: true
 
 gliner:
-  batch_size: 8
+  batch_size: 16
+  device: "auto"
 
 subset:
   enabled: true
   size: 10000
+
+# LEACE configuration for laptop mode
+# Note: Strict CPU enforcement for numerical stability and VRAM management
+leace:
+  device: "cpu"              # Strict CPU for stability
+  force_cpu: true            # Explicit override - embeddings moved to CPU for LEACE
+  regularization: 1e-5
+  batch_size: 50
+  compute_dtype: "float64"   # CPU uses higher precision for numerical stability
+
+# Encoder output device configuration
+encoder:
+  output_device: "cpu"       # Move embeddings to CPU after extraction (for LEACE)
 
 logging:
   level: "DEBUG"

@@ -21,6 +21,7 @@ precision:
 
 gliner:
   batch_size: 128
+  device: "cuda"
 
 subset:
   enabled: false
