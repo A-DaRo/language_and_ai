@@ -14,8 +14,9 @@ Reference: GLiNER_Implementation_Strategy.md, Architectural Proposal for Semanti
 """
 
 import logging
+import threading
 from dataclasses import dataclass, field
-from typing import List, Tuple, Optional, Any
+from typing import List, Literal, Tuple, Optional, Any
 
 import pysbd
 
@@ -51,6 +52,11 @@ class BudgetConfig:
         ent_marker_cost: Token cost per label for GLiNER's internal [ENT] markers.
         hard_split_overlap: Token overlap when falling back to hard-slicing.
         min_budget_floor: Minimum effective budget to prevent degenerate chunking.
+        mode: Chunking mode - 'single_sentence' (one chunk per sentence, default)
+              or 'accumulate' (fill chunks up to budget).
+        legacy_sequential_mode: If True, forces sequential single-chunk inference
+            (bypasses batch optimization). Useful for debugging or exact backward
+            compatibility. Default False enables batched inference.
     """
 
     model_max_length: int = 512
@@ -58,6 +64,14 @@ class BudgetConfig:
     ent_marker_cost: int = 1
     hard_split_overlap: int = 50
     min_budget_floor: int = 50
+    mode: Literal["single_sentence", "accumulate"] = "single_sentence"
+    legacy_sequential_mode: bool = False
+
+    # Optional parallelism for document-level chunking (GLiNERDetector drives this).
+    # Note: chunking is CPU-bound; threads can still help because fast tokenizers
+    # may release the GIL and because we parallelize across documents.
+    parallel_chunking_workers: int = 0
+    parallel_chunking_min_texts: int = 512
 
 
 class SemanticChunker:
@@ -97,6 +111,7 @@ class SemanticChunker:
 
         # Cache for label token costs (computed once per label set)
         self._label_cost_cache: dict[tuple[str, ...], int] = {}
+        self._label_cost_lock = threading.Lock()
 
     def calculate_effective_budget(self, labels: List[str]) -> int:
         """
@@ -114,19 +129,22 @@ class SemanticChunker:
         Returns:
             Maximum number of text tokens that can safely fit in the model window.
         """
-        # Use cache if available
+        # Use cache if available (thread-safe)
         cache_key = tuple(sorted(labels))
-        if cache_key in self._label_cost_cache:
-            total_label_cost = self._label_cost_cache[cache_key]
-        else:
+        with self._label_cost_lock:
+            total_label_cost = self._label_cost_cache.get(cache_key)
+
+        if total_label_cost is None:
             # Compute token cost for all labels
-            total_label_cost = 0
+            computed_cost = 0
             for label in labels:
                 label_tokens = self.tokenizer.encode(label, add_special_tokens=False)
                 # Cost = label tokens + [ENT] marker
-                total_label_cost += len(label_tokens) + self.config.ent_marker_cost
+                computed_cost += len(label_tokens) + self.config.ent_marker_cost
 
-            self._label_cost_cache[cache_key] = total_label_cost
+            with self._label_cost_lock:
+                # Avoid overwriting if another thread populated it.
+                total_label_cost = self._label_cost_cache.setdefault(cache_key, computed_cost)
 
         # Calculate effective budget
         total_overhead = total_label_cost + self.config.system_overhead
@@ -153,12 +171,12 @@ class SemanticChunker:
         labels: List[str],
     ) -> List[ChunkInfo]:
         """
-        Segment text into semantically coherent chunks that fit within the token budget.
+        Segment text into chunks that fit within the token budget.
 
-        Strategy:
-        1. Segment text into sentences using PySBD.
-        2. Accumulate sentences until budget is reached.
-        3. Fall back to hard-slicing for pathological run-on sentences.
+        Modes:
+        - 'single_sentence': One chunk per sentence (shortest possible inputs).
+          Hard-split only if a single sentence exceeds budget.
+        - 'accumulate': Fill chunks sentence-by-sentence up to budget.
 
         Args:
             text: Input text to chunk.
@@ -181,14 +199,77 @@ class SemanticChunker:
         # Track sentence positions in original text for offset mapping
         sentence_positions = self._compute_sentence_positions(text, sentences)
 
+        # Dispatch to mode-specific chunking
+        if self.config.mode == "single_sentence":
+            return self._chunk_single_sentence(sentence_positions, budget)
+        else:
+            return self._chunk_accumulate(sentence_positions, budget)
+
+    def _chunk_single_sentence(
+        self,
+        sentence_positions: List[Tuple[str, int, int]],
+        budget: int,
+    ) -> List[ChunkInfo]:
+        """
+        Single-sentence mode: emit one chunk per sentence.
+
+        Hard-split only when a single sentence exceeds budget.
+        This produces the shortest possible inputs for GLiNER.
+
+        Args:
+            sentence_positions: List of (text, char_start, char_end) tuples.
+            budget: Token budget per chunk.
+
+        Returns:
+            List of ChunkInfo objects (one per sentence, or multiple if hard-split).
+        """
         chunks: List[ChunkInfo] = []
-        current_sentences: List[Tuple[str, int, int]] = []  # (text, char_start, char_end)
+
+        for sent_text, char_start, char_end in sentence_positions:
+            sent_token_count = len(self.tokenizer.encode(sent_text, add_special_tokens=False))
+
+            if sent_token_count > budget:
+                # Pathological: single sentence exceeds budget -> hard-split
+                hard_chunks = self._hard_split_sentence(
+                    sent_text, char_start, budget, self.config.hard_split_overlap
+                )
+                chunks.extend(hard_chunks)
+            else:
+                # Normal case: one sentence = one chunk
+                chunks.append(
+                    ChunkInfo(
+                        text=sent_text,
+                        char_start=char_start,
+                        char_end=char_end,
+                        is_hard_split=False,
+                    )
+                )
+
+        return chunks
+
+    def _chunk_accumulate(
+        self,
+        sentence_positions: List[Tuple[str, int, int]],
+        budget: int,
+    ) -> List[ChunkInfo]:
+        """
+        Accumulate mode: fill chunks sentence-by-sentence up to budget.
+
+        Args:
+            sentence_positions: List of (text, char_start, char_end) tuples.
+            budget: Token budget per chunk.
+
+        Returns:
+            List of ChunkInfo objects.
+        """
+        chunks: List[ChunkInfo] = []
+        current_sentences: List[Tuple[str, int, int]] = []
         current_token_count = 0
 
         for sent_text, char_start, char_end in sentence_positions:
             sent_token_count = len(self.tokenizer.encode(sent_text, add_special_tokens=False))
 
-            # Phase C: Pathological case - single sentence exceeds budget
+            # Pathological case - single sentence exceeds budget
             if sent_token_count > budget:
                 # Flush any accumulated sentences first
                 if current_sentences:
@@ -203,7 +284,7 @@ class SemanticChunker:
                 chunks.extend(hard_chunks)
                 continue
 
-            # Phase B: Standard accumulation
+            # Standard accumulation
             if current_token_count + sent_token_count > budget:
                 # Budget exceeded - commit current chunk
                 if current_sentences:

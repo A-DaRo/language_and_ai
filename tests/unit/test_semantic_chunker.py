@@ -64,6 +64,7 @@ class TestBudgetConfig:
         assert config.ent_marker_cost == 1
         assert config.hard_split_overlap == 50
         assert config.min_budget_floor == 50
+        assert config.legacy_sequential_mode is False  # New default
 
     def test_custom_values(self):
         """BudgetConfig accepts custom values."""
@@ -77,6 +78,22 @@ class TestBudgetConfig:
 
         assert config.model_max_length == 1024
         assert config.system_overhead == 10
+
+    def test_legacy_sequential_mode_flag(self):
+        """BudgetConfig supports legacy_sequential_mode flag."""
+        config = BudgetConfig(legacy_sequential_mode=True)
+        assert config.legacy_sequential_mode is True
+        
+        config = BudgetConfig(legacy_sequential_mode=False)
+        assert config.legacy_sequential_mode is False
+    
+    def test_mode_options(self):
+        """BudgetConfig supports single_sentence and accumulate modes."""
+        config = BudgetConfig(mode="single_sentence")
+        assert config.mode == "single_sentence"
+        
+        config = BudgetConfig(mode="accumulate")
+        assert config.mode == "accumulate"
 
 
 class TestChunkInfo:
@@ -177,14 +194,21 @@ class TestSemanticChunker:
         assert result[0].is_hard_split is False
 
     def test_chunk_text_multiple_sentences(self, tokenizer):
-        """Multiple sentences are accumulated within budget."""
-        config = BudgetConfig(model_max_length=100, system_overhead=5, min_budget_floor=10)
+        """Multiple sentences are accumulated within budget (accumulated mode)."""
+        # Note: Must use 'accumulated' mode to merge sentences within budget.
+        # Default 'single_sentence' mode produces one chunk per sentence.
+        config = BudgetConfig(
+            model_max_length=100, 
+            system_overhead=5, 
+            min_budget_floor=10,
+            mode="accumulated",  # Required for sentence merging
+        )
         chunker = SemanticChunker(tokenizer=tokenizer, config=config)
 
         text = "First sentence. Second sentence. Third sentence."
         result = chunker.chunk_text(text, labels=["label"])
 
-        # All three sentences should fit in one chunk
+        # All three sentences should fit in one chunk (accumulated mode)
         assert len(result) == 1
         assert "First sentence" in result[0].text
 

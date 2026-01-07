@@ -36,6 +36,9 @@ class GLiNERConfig:
     taxonomy_path: str = "conf/base/gliner_taxonomy.yaml"
     compute_explicit_recall: bool = True
     explicit_recall_threshold: float = 0.95
+    # Nested blocks (v2.0 batching + chunking). Kept as dicts for forward-compat.
+    batch_inference: Dict[str, Any] = field(default_factory=dict)
+    chunking: Dict[str, Any] = field(default_factory=dict)
     
     def __post_init__(self):
         if self.device not in ("auto", "cpu", "cuda"):
@@ -49,6 +52,14 @@ class GLiNERConfig:
         if self.batch_size <= 0:
             raise ConfigValidationError(
                 f"gliner.batch_size must be positive, got {self.batch_size}"
+            )
+        if not isinstance(self.batch_inference, dict):
+            raise ConfigValidationError(
+                f"gliner.batch_inference must be a mapping, got {type(self.batch_inference).__name__}"
+            )
+        if not isinstance(self.chunking, dict):
+            raise ConfigValidationError(
+                f"gliner.chunking must be a mapping, got {type(self.chunking).__name__}"
             )
 
 

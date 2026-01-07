@@ -31,7 +31,7 @@ class SpanMasker:
     Token-aware span masker with typed mask tokens.
     
     Features:
-    - Maps entity types to typed mask tokens
+    - Maps entity types (column names) to typed mask tokens
     - Applies masks in reverse order to preserve character offsets
     - Validates single-token encoding of masks
     - Emits structured mask logs for POLLUTION_LOG_SCHEMA
@@ -39,7 +39,24 @@ class SpanMasker:
     Implements: FR-08
     """
     
-    # Default entity type -> Typed mask token mapping
+    # Default column -> Typed mask token mapping (SOBR schema columns)
+    COLUMN_TO_MASK = {
+        # Age/birth year columns
+        "birth_year": "[MASK:AGE]",
+        # Gender column
+        "female": "[MASK:GENDER]",
+        # Nationality column
+        "nationality": "[MASK:NATIONALITY]",
+        # Political leaning column
+        "political_leaning": "[MASK:POLITICAL]",
+        # MBTI personality columns (all share same mask)
+        "extrovert": "[MASK:MBTI]",
+        "sensing": "[MASK:MBTI]",
+        "feeling": "[MASK:MBTI]",
+        "judging": "[MASK:MBTI]",
+    }
+    
+    # Legacy mapping for backward compatibility
     ENTITY_TO_MASK = {
         "age_statement": "[MASK:AGE]",
         "birth_year_statement": "[MASK:BIRTH_YEAR]",
@@ -63,9 +80,14 @@ class SpanMasker:
         
         Args:
             tokenizer: Optional HuggingFace tokenizer for validation.
+            entity_to_mask: Optional custom entity/column -> mask mapping.
+                Merged over defaults (COLUMN_TO_MASK + ENTITY_TO_MASK).
         """
         self.tokenizer = tokenizer
-        self.entity_to_mask = entity_to_mask or dict(self.ENTITY_TO_MASK)
+        # Merge defaults: column-based first, then legacy, then custom
+        self.entity_to_mask = {**self.COLUMN_TO_MASK, **self.ENTITY_TO_MASK}
+        if entity_to_mask:
+            self.entity_to_mask.update(entity_to_mask)
         
         # Validate single-token encoding if tokenizer provided
         if self.tokenizer:

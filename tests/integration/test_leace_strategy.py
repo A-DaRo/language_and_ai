@@ -28,13 +28,24 @@ def device():
     return "cuda" if torch.cuda.is_available() else "cpu"
 
 
+# Default mask tokens from SOBR taxonomy (for tokenizer alignment tests)
+SOBR_MASK_TOKENS = [
+    "[MASK:AGE]",
+    "[MASK:GENDER]",
+    "[MASK:NATIONALITY]",
+    "[MASK:POLITICAL]",
+    "[MASK:MBTI]",
+]
+
+
 @pytest.fixture
 def frozen_embedder(device):
-    """Initialize frozen embedder."""
+    """Initialize frozen embedder with special tokens for tokenizer alignment."""
     return FrozenEmbedder(
         model_name="roberta-base",
         device=device,
         max_length=512,
+        special_tokens=SOBR_MASK_TOKENS,  # Critical for masked text processing
     )
 
 
@@ -115,6 +126,35 @@ class TestFrozenEmbedder:
         """Test that model weights are frozen."""
         for param in frozen_embedder.model.parameters():
             assert not param.requires_grad, "Model weights should be frozen"
+
+    def test_masked_text_embedding_with_special_tokens(self, require_real_models, frozen_embedder):
+        """Test embedding extraction on masked text (Section 5.1 requirement).
+        
+        Critical: LEACE must be computed on embeddings of MASKED text (post_masked),
+        and the embedder must encode mask tokens as single tokens, not fragments.
+        """
+        # Simulate masked text from GLiNER (Section 2 of LEACE Strategy Report)
+        masked_texts = [
+            "I am [MASK:AGE] years old and I'm a [MASK:GENDER].",
+            "I'm from [MASK:NATIONALITY] and support [MASK:POLITICAL].",
+            "My MBTI type is [MASK:MBTI].",
+        ]
+
+        embeddings = frozen_embedder.embed_texts(
+            masked_texts,
+            batch_size=2,
+            show_progress=False,
+        )
+
+        # Shape should be (num_texts, 768)
+        assert embeddings.shape == (len(masked_texts), 768)
+
+        # Verify mask tokens are encoded as single tokens (not fragmented)
+        for token in SOBR_MASK_TOKENS:
+            token_ids = frozen_embedder.tokenizer.encode(token, add_special_tokens=False)
+            assert len(token_ids) == 1, (
+                f"Mask token '{token}' should be single token, got {len(token_ids)}: {token_ids}"
+            )
 
 
 class TestLEACEComputer:

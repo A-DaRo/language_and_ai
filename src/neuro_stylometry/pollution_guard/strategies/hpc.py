@@ -169,11 +169,19 @@ class HPCFilterStrategy(PollutionFilterStrategy):
         logger.info(f"  Masked {total_spans} pollution spans")
         
         # Step 3: Embed masked texts
+        # Critical (Section 5.1 of LEACE Strategy Report):
+        # - LEACE MUST be computed on embeddings of MASKED text (post_masked), NOT raw text.
+        # - FrozenEmbedder MUST register the same typed mask tokens as GLiNERDetector.
         logger.info("Step 2/3: Embedding Masked Texts")
+        
+        # Extract mask tokens for tokenizer alignment (Section 5.1)
+        mask_tokens = list(dict.fromkeys(gliner.get_mask_tokens().values()))
+        
         embedder = FrozenEmbedder(
             model_name=str(self._cfg_get(config, "encoder.model")),
             device=self._resolve_device(self._cfg_get(config, "encoder.device")),
             max_length=int(self._cfg_get(config, "encoder.max_length")),
+            special_tokens=mask_tokens,  # Critical for tokenizer alignment
         )
         
         embeddings = embedder.embed_texts(

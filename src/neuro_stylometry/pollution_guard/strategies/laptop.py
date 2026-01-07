@@ -164,6 +164,9 @@ class LaptopFilterStrategy(PollutionFilterStrategy):
         
         # Step 3: Embed masked texts
         # Laptop mode: Extract on GPU, then move to CPU for LEACE accumulation
+        # Critical (Section 5.1 of LEACE Strategy Report):
+        # - LEACE MUST be computed on embeddings of MASKED text (post_masked), NOT raw text.
+        # - FrozenEmbedder MUST register the same typed mask tokens as GLiNERDetector.
         logger.info("Step 2/3: Embedding Masked Texts")
         
         # Determine output device for embeddings (config-driven, default to CPU for laptop)
@@ -173,11 +176,15 @@ class LaptopFilterStrategy(PollutionFilterStrategy):
         except KeyError:
             pass  # Use default "cpu"
         
+        # Extract mask tokens for tokenizer alignment (Section 5.1)
+        mask_tokens = list(dict.fromkeys(gliner.get_mask_tokens().values()))
+        
         embedder = FrozenEmbedder(
             model_name=str(self._cfg_get(config, "encoder.model")),
             device=self._resolve_device(self._cfg_get(config, "encoder.device")),
             max_length=int(self._cfg_get(config, "encoder.max_length")),
             output_device=encoder_output_device,
+            special_tokens=mask_tokens,  # Critical for tokenizer alignment
         )
         
         logger.info(f"  Laptop mode: embeddings extracted on GPU → moving to {encoder_output_device} for LEACE accumulation")

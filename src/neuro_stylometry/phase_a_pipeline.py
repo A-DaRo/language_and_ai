@@ -123,7 +123,7 @@ class PhaseAPipeline:
         raise ValueError(f"Unsupported device spec '{device_spec}' (expected 'auto'|'cpu'|'cuda')")
 
     def _load_taxonomy_bundle(self) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
-        """Load taxonomy and width-constraint configs from YAML path."""
+        """Load taxonomy config from YAML path."""
         from omegaconf import OmegaConf
 
         taxonomy_path = Path(self._cfg_get("gliner.taxonomy_path"))
@@ -138,8 +138,8 @@ class PhaseAPipeline:
         if not isinstance(cfg, dict):
             raise TypeError("Taxonomy YAML did not resolve to a mapping")
         taxonomy_cfg = cfg.get("taxonomy", {})
-        constraints_cfg = taxonomy_cfg.get("width_constraints", {})
-        return taxonomy_cfg, constraints_cfg
+        # Note: width_constraints are now embedded per-column in taxonomy_cfg
+        return taxonomy_cfg, None
 
     # --- Facade component builders (no parameter overrides) ---
     def get_detector(self) -> GLiNERDetector:
@@ -147,16 +147,51 @@ class PhaseAPipeline:
         if self._detector is not None:
             return self._detector
 
-        taxonomy_cfg, constraints_cfg = self._load_taxonomy_bundle()
+        taxonomy_cfg, _ = self._load_taxonomy_bundle()
         device = self._resolve_device(self._cfg_get("gliner.device"))
+
+        from .pollution_guard.gliner_detector import (
+            SOBRTaxonomy,
+            EntityWidthConstraints,
+            BatchInferenceConfig,
+        )
+        from .pollution_guard.semantic_chunker import BudgetConfig
+        
+        # Build taxonomy from config
+        taxonomy = SOBRTaxonomy.from_config(taxonomy_cfg)
+        
+        # Build width constraints from taxonomy (column-driven)
+        constraints = EntityWidthConstraints.from_taxonomy(taxonomy)
+        
+        # Build batch inference config from YAML (Performance Optimization v2.0)
+        batch_inference_cfg = self.config.get("gliner", {}).get("batch_inference", {})
+        batch_config = BatchInferenceConfig(
+            enable_batching=batch_inference_cfg.get("enable_batching", True),
+            batch_size=int(self._cfg_get("gliner.batch_size")),
+            num_buckets=batch_inference_cfg.get("num_buckets"),  # None = auto-compute
+            min_bucket_size=batch_inference_cfg.get("min_bucket_size", 4),
+            enable_prompt_caching=batch_inference_cfg.get("enable_prompt_caching", True),
+        )
+        
+        # Build chunking/budget config from YAML
+        chunking_cfg = self.config.get("gliner", {}).get("chunking", {})
+        budget_config = BudgetConfig(
+            model_max_length=int(self._cfg_get("encoder.max_length")),
+            mode=chunking_cfg.get("mode", "single_sentence"),
+            legacy_sequential_mode=chunking_cfg.get("legacy_sequential_mode", False),
+            parallel_chunking_workers=int(chunking_cfg.get("parallel_chunking_workers", 0)),
+            parallel_chunking_min_texts=int(chunking_cfg.get("parallel_chunking_min_texts", 512)),
+        )
 
         self._detector = GLiNERDetector(
             model_name=self._cfg_get("gliner.model"),
             device=device,
             max_length=int(self._cfg_get("encoder.max_length")),
             confidence_threshold=float(self._cfg_get("gliner.confidence_threshold")),
-            taxonomy_config=taxonomy_cfg,
-            constraints_config=constraints_cfg,
+            taxonomy=taxonomy,
+            constraints=constraints,
+            budget_config=budget_config,
+            batch_inference_config=batch_config,
         )
         return self._detector
 
@@ -173,15 +208,26 @@ class PhaseAPipeline:
         return self._masker
 
     def get_embedder(self) -> FrozenEmbedder:
-        """Return a configured FrozenEmbedder (lazy cached)."""
+        """Return a configured FrozenEmbedder (lazy cached).
+        
+        Critical (Section 5.1 of LEACE Strategy Report):
+        - The embedder MUST register the same typed mask tokens as GLiNERDetector.
+        - This ensures "[MASK:AGE]" is encoded as a single token, not subword fragments.
+        - Mask tokens are extracted from SOBRTaxonomy via the detector.
+        """
         if self._embedder is not None:
             return self._embedder
+
+        # Get mask tokens from detector for tokenizer alignment (Section 5.1)
+        detector = self.get_detector()
+        mask_tokens = list(dict.fromkeys(detector.get_mask_tokens().values()))
 
         device = self._resolve_device(self._cfg_get("encoder.device"))
         self._embedder = FrozenEmbedder(
             model_name=self._cfg_get("encoder.model"),
             device=device,
             max_length=int(self._cfg_get("encoder.max_length")),
+            special_tokens=mask_tokens,  # Critical for tokenizer alignment
         )
         return self._embedder
 

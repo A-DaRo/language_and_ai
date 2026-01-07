@@ -1,78 +1,179 @@
+# GLiNER Taxonomy Configuration - Column-Driven Schema
+#
+# Maps SOBR Arrow columns to GLiNER prompts, distractors, masks, and validation patterns.
+# All prompt/distractor selection is driven by per-row column presence (non-null values).
+#
+# SOBR demographic columns (from schemas.py):
+#   birth_year, female, nationality, political_leaning,
+#   extrovert, sensing, feeling, judging
+#
+# Reference: SOBR paper extraction methodology (Emmery et al., LREC-COLING 2024)
+
 taxonomy:
-  target_label_prompts:
-    age_statement:
-      - "age statement"
-      - "self-identified age"
-    birth_year_statement:
-      - "birth year statement"
-      - "born in year"
-    gender_indicator:
-      - "gender self-identification"
-      - "self-identified gender"
-    nationality_statement:
-      - "nationality statement"
-      - "self-identified nationality"
-    country_of_origin:
-      - "country of origin"
-      - "place of origin"
-    demonym:
-      - "demonym"
-      - "nationality adjective"
-    personality_type_identifier:
-      - "personality type identifier"
-      - "self-identified personality type"
-    mbti_type:
-      - "MBTI type"
-      - "MBTI identifier"
-    political_affiliation:
-      - "political affiliation"
-      - "self-identified political affiliation"
-    ideology_self_id:
-      - "political ideology"
-      - "self-identified political ideology"
+  # -------------------------------------------------------------------------
+  # Column-to-Prompts Mapping
+  # Each key is a SOBR Arrow column name from get_demographic_columns()
+  # -------------------------------------------------------------------------
+  column_prompts:
+    # -----------------------------------------------------------------------
+    # birth_year: Extracted from (GAA) patterns like "(F34)", "(32M)"
+    # SOBR paper: "age and gender were obtained via posts self-reporting
+    # age and gender information in the format (GAA)"
+    # -----------------------------------------------------------------------
+    birth_year:
+      prompts:
+        - "age statement"
+        - "self-identified age"
+        - "birth year statement"
+        - "born in year"
+      distractors:
+        - "third-person age mention"
+        - "historical age reference"
+      mask_token: "[MASK:AGE]"
+      width: 6
+      reference_patterns:
+        # SOBR (GAA) format: (F34), (M25), (34F), (25M), 34F, M25, etc.
+        - "\\([MFmf]\\d{1,2}\\)"
+        - "\\(\\d{1,2}[MFmf]\\)"
+        - "\\b\\d{1,2}[MFmf]\\b"
+        - "\\b[MFmf]\\d{1,2}\\b"
+        # Prose patterns
+        - "(?i)\\bI\\s*(?:am|'m)\\s*\\d{1,2}\\b"
+        - "(?i)\\b(?:born\\s+in|born\\s+around)\\s*\\d{4}\\b"
+        - "(?i)\\bI\\s+was\\s+born\\s+in\\s+\\d{4}\\b"
 
-  distractor_labels:
-    - "third person reference"
-    - "third-person demographic mention"
-    - "quote attribution"
-    - "historical figure"
-    - "fictional character"
+    # -----------------------------------------------------------------------
+    # female: Extracted from (GAA) patterns - gender component
+    # SOBR paper: "authors reporting gender F or f were labeled as female,
+    # while users reporting M or m were considered male"
+    # -----------------------------------------------------------------------
+    female:
+      prompts:
+        - "gender self-identification"
+        - "self-identified gender"
+      distractors:
+        - "third-person gender mention"
+        - "gender of another person"
+      mask_token: "[MASK:GENDER]"
+      width: 4
+      reference_patterns:
+        # SOBR (GAA) format - gender markers
+        - "\\([MFmf]\\d{1,2}\\)"
+        - "\\(\\d{1,2}[MFmf]\\)"
+        - "\\b\\d{1,2}[MFmf]\\b"
+        - "\\b[MFmf]\\d{1,2}\\b"
+        # Prose patterns
+        - "(?i)\\bI\\s*(?:am|'m)\\s*(?:a\\s+)?(?:man|woman|male|female|guy|girl)\\b"
+        - "(?i)\\bas\\s+a\\s+(?:man|woman|male|female|guy|girl)\\b"
 
-  mask_tokens:
-    age_statement: "[MASK:AGE]"
-    birth_year_statement: "[MASK:BIRTH_YEAR]"
-    gender_indicator: "[MASK:GENDER]"
-    nationality_statement: "[MASK:NATIONALITY]"
-    country_of_origin: "[MASK:COUNTRY]"
-    demonym: "[MASK:DEMONYM]"
-    personality_type_identifier: "[MASK:PERSONALITY]"
-    mbti_type: "[MASK:MBTI]"
-    political_affiliation: "[MASK:POLITICAL]"
-    ideology_self_id: "[MASK:IDEOLOGY]"
+    # -----------------------------------------------------------------------
+    # nationality: Extracted from flairs on European subreddits
+    # SOBR paper: "Nationality labels were extracted through user flairs
+    # from r/Europe, r/AskEurope, r/Eurosceptics, etc."
+    # -----------------------------------------------------------------------
+    nationality:
+      prompts:
+        - "nationality statement"
+        - "self-identified nationality"
+        - "country of origin"
+        - "place of origin"
+        - "demonym"
+      distractors:
+        - "third-person nationality mention"
+        - "nationality of another person"
+        - "country mentioned in news"
+      mask_token: "[MASK:NATIONALITY]"
+      width: 8  # Raised for compound demonyms like "South African"
+      reference_patterns:
+        # Self-identification patterns
+        - "(?i)\\bI\\s*(?:am|'m)\\s*(?:an?\\s+)?(?:American|British|Canadian|Australian|German|French|Italian|Spanish|Dutch|Belgian|Swedish|Norwegian|Danish|Finnish|Polish|Russian|Ukrainian|Irish|Scottish|Welsh|English|Indian|Chinese|Japanese|Korean|Brazilian|Mexican|Argentinian|South African)\\b"
+        - "(?i)\\bI\\s*(?:am|'m)\\s*from\\s+[A-Z][a-z]+(?:\\s+[A-Z][a-z]+)?\\b"
+        - "(?i)\\bI\\s+live\\s+in\\s+[A-Z][a-z]+(?:\\s+[A-Z][a-z]+)?\\b"
 
-  width_constraints:
-    age_statement: 5
-    birth_year_statement: 6
-    gender_indicator: 4
-    nationality_statement: 5
-    country_of_origin: 5
-    demonym: 4
-    personality_type_identifier: 6
-    mbti_type: 4
-    political_affiliation: 5
-    ideology_self_id: 5
-    default: 12
+    # -----------------------------------------------------------------------
+    # political_leaning: Extracted from r/PoliticalCompass flairs
+    # SOBR paper: "self-reports from the Political Compass in flairs...
+    # Test results are often reported in the form of: [social]-[economic]
+    # e.g., auth-left. We only considered the economic scale."
+    # -----------------------------------------------------------------------
+    political_leaning:
+      prompts:
+        - "political affiliation"
+        - "self-identified political leaning"
+        - "political ideology"
+      distractors:
+        - "third-person political mention"
+        - "political party mentioned"
+        - "politician name"
+      mask_token: "[MASK:POLITICAL]"
+      width: 6
+      reference_patterns:
+        # Political Compass format from SOBR
+        - "(?i)\\b(?:auth|lib)[-\\s]?(?:left|right|center|centre)\\b"
+        - "(?i)\\b(?:left|right|center|centre)[-\\s]?(?:auth|lib)\\b"
+        # Standalone political positions
+        - "(?i)\\bI\\s*(?:am|'m)\\s*(?:a\\s+)?(?:liberal|conservative|libertarian|socialist|communist|anarchist|centrist|moderate|progressive|leftist|right-wing|left-wing)\\b"
+        - "(?i)\\bI\\s+(?:lean|vote)\\s+(?:left|right|liberal|conservative|democrat|republican)\\b"
 
-  reference_patterns:
-    age_statement:
-      - "(?i)\\bI\\s*(?:am|'m)\\s*\\d{1,2}\\b"
-    birth_year_statement:
-      - "(?i)\\b(?:born\\s+in|born\\s+around)\\s*\\d{4}\\b"
-    gender_indicator:
-      - "(?i)\\bI\\s*(?:am|'m)\\s*(?:a\\s+)?(?:man|woman|male|female)\\b"
-    nationality_statement:
-      - "(?i)\\bI\\s*(?:am|'m)\\s*(?:an?\\s+)?[A-Z][a-z]+\\b"
-    country_of_origin:
-      - "(?i)\\bI\\s*(?:am|'m)\\s*from\\s+[A-Z][a-z]+(?:\\s+[A-Z][a-z]+)?\\b"
-    mbti_type:
-      - "(?i)\\b(?:INTJ|INTP|ENTJ|ENTP|INFJ|INFP|ENFJ|ENFP|ISTJ|ISFJ|ESTJ|ESFJ|ISTP|ISFP|ESTP|ESFP)\\b"
+    # -----------------------------------------------------------------------
+    # MBTI Personality Dimensions (extrovert, sensing, feeling, judging)
+    # SOBR paper: "Personality labels were assigned through flairs for
+    # Myers-Briggs Type Indicators on MBTI-related subreddits...
+    # split into four dimensions"
+    # -----------------------------------------------------------------------
+    extrovert:
+      prompts:
+        - "MBTI type"
+        - "personality type identifier"
+        - "self-identified personality type"
+      distractors:
+        - "third-person personality mention"
+        - "personality of fictional character"
+      mask_token: "[MASK:MBTI]"
+      width: 6
+      reference_patterns:
+        # Full 16 MBTI types (E/I is first letter)
+        - "(?i)\\b(?:INTJ|INTP|ENTJ|ENTP|INFJ|INFP|ENFJ|ENFP|ISTJ|ISFJ|ESTJ|ESFJ|ISTP|ISFP|ESTP|ESFP)\\b"
+        - "(?i)\\bI\\s*(?:am|'m)\\s*(?:an?\\s+)?(?:introvert|extrovert|extravert)\\b"
+
+    sensing:
+      prompts:
+        - "MBTI type"
+        - "personality type identifier"
+        - "cognitive function preference"
+      distractors:
+        - "third-person personality mention"
+        - "personality of fictional character"
+      mask_token: "[MASK:MBTI]"
+      width: 6
+      reference_patterns:
+        # Full 16 MBTI types (S/N is second letter)
+        - "(?i)\\b(?:INTJ|INTP|ENTJ|ENTP|INFJ|INFP|ENFJ|ENFP|ISTJ|ISFJ|ESTJ|ESFJ|ISTP|ISFP|ESTP|ESFP)\\b"
+
+    feeling:
+      prompts:
+        - "MBTI type"
+        - "personality type identifier"
+        - "cognitive function preference"
+      distractors:
+        - "third-person personality mention"
+        - "personality of fictional character"
+      mask_token: "[MASK:MBTI]"
+      width: 6
+      reference_patterns:
+        # Full 16 MBTI types (T/F is third letter)
+        - "(?i)\\b(?:INTJ|INTP|ENTJ|ENTP|INFJ|INFP|ENFJ|ENFP|ISTJ|ISFJ|ESTJ|ESFJ|ISTP|ISFP|ESTP|ESFP)\\b"
+
+    judging:
+      prompts:
+        - "MBTI type"
+        - "personality type identifier"
+        - "cognitive function preference"
+      distractors:
+        - "third-person personality mention"
+        - "personality of fictional character"
+      mask_token: "[MASK:MBTI]"
+      width: 6
+      reference_patterns:
+        # Full 16 MBTI types (J/P is fourth letter)
+        - "(?i)\\b(?:INTJ|INTP|ENTJ|ENTP|INFJ|INFP|ENFJ|ENFP|ISTJ|ISFJ|ESTJ|ESFJ|ISTP|ISFP|ESTP|ESFP)\\b"
