@@ -684,3 +684,123 @@ class TestBatchedInference:
         
         assert gliner_detector.batch_config.batch_size == 64
         assert gliner_detector.batch_config.num_buckets == 10
+
+
+class TestBiEncoderEnforcement:
+    """Test bi-encoder enforcement functionality."""
+    
+    def test_require_bi_encoder_false_allows_uni_encoder(self, device):
+        """When require_bi_encoder=False, uni-encoder models are allowed."""
+        import yaml
+        
+        config_path = Path("conf/base/gliner_taxonomy.yaml")
+        if config_path.exists():
+            with open(config_path) as f:
+                config = yaml.safe_load(f)
+            taxonomy_config = config.get("taxonomy", {})
+        else:
+            taxonomy_config = None
+        
+        # This should NOT raise (gliner_large-v2.1 is uni-encoder)
+        detector = GLiNERDetector(
+            model_name="urchade/gliner_large-v2.1",
+            device=device,
+            max_length=512,
+            confidence_threshold=0.85,
+            taxonomy_config=taxonomy_config,
+            require_bi_encoder=False,  # Allow uni-encoder
+        )
+        
+        assert detector.require_bi_encoder is False
+        # gliner_large-v2.1 is uni-encoder, so is_bi_encoder should be False
+        assert detector.is_bi_encoder is False
+    
+    def test_require_bi_encoder_true_raises_for_uni_encoder(self, device):
+        """When require_bi_encoder=True, uni-encoder models raise ValueError."""
+        import yaml
+        
+        config_path = Path("conf/base/gliner_taxonomy.yaml")
+        if config_path.exists():
+            with open(config_path) as f:
+                config = yaml.safe_load(f)
+            taxonomy_config = config.get("taxonomy", {})
+        else:
+            taxonomy_config = None
+        
+        # This should raise because gliner_large-v2.1 is uni-encoder
+        with pytest.raises(ValueError, match="require_bi_encoder=True but model"):
+            GLiNERDetector(
+                model_name="urchade/gliner_large-v2.1",
+                device=device,
+                max_length=512,
+                confidence_threshold=0.85,
+                taxonomy_config=taxonomy_config,
+                require_bi_encoder=True,  # Enforce bi-encoder
+            )
+    
+    def test_is_bi_encoder_model_helper(self):
+        """Test static helper method for checking bi-encoder support."""
+        # gliner_large-v2.1 is uni-encoder
+        result = GLiNERDetector.is_bi_encoder_model("urchade/gliner_large-v2.1")
+        assert result is False
+    
+    def test_sync_processor_max_len(self, gliner_detector):
+        """Test that processor max_len is synced with configured max_length."""
+        # Check that processor max_len matches configured max_length
+        data_processor = getattr(gliner_detector.model, "data_processor", None)
+        if data_processor is not None:
+            processor_max_len = getattr(data_processor, "max_len", None)
+            if processor_max_len is not None:
+                assert processor_max_len == gliner_detector.max_length
+
+
+class TestWordAwareBudgeting:
+    """Test word-aware budget constraints."""
+    
+    def test_budget_config_word_settings(self, gliner_detector):
+        """Test that budget config has word-aware settings."""
+        budget_config = gliner_detector.budget_config
+        
+        # Should have word-aware attributes
+        assert hasattr(budget_config, "gliner_max_words")
+        assert hasattr(budget_config, "tokens_per_word_ratio")
+        
+        # Default values
+        assert budget_config.gliner_max_words == 512
+        assert budget_config.tokens_per_word_ratio == 1.3
+    
+    def test_effective_budget_respects_word_limit(self, device):
+        """Test that effective budget respects word limit."""
+        import yaml
+        
+        config_path = Path("conf/base/gliner_taxonomy.yaml")
+        if config_path.exists():
+            with open(config_path) as f:
+                config = yaml.safe_load(f)
+            taxonomy_config = config.get("taxonomy", {})
+        else:
+            taxonomy_config = None
+        
+        # Create detector with very low word limit
+        budget_config = BudgetConfig(
+            model_max_length=512,
+            gliner_max_words=100,  # Very restrictive word limit
+            tokens_per_word_ratio=1.3,
+        )
+        
+        detector = GLiNERDetector(
+            model_name="urchade/gliner_large-v2.1",
+            device=device,
+            max_length=512,
+            confidence_threshold=0.85,
+            taxonomy_config=taxonomy_config,
+            budget_config=budget_config,
+        )
+        
+        # Effective budget should be limited by word constraint
+        # word_budget_tokens = 100 * 1.3 = 130
+        labels = detector.taxonomy.get_inference_labels()
+        effective_budget = detector.get_effective_budget()
+        
+        # Should be <= 130 (word constraint should dominate)
+        assert effective_budget <= 130

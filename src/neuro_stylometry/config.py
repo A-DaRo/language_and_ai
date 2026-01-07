@@ -36,6 +36,10 @@ class GLiNERConfig:
     taxonomy_path: str = "conf/base/gliner_taxonomy.yaml"
     compute_explicit_recall: bool = True
     explicit_recall_threshold: float = 0.95
+    # Bi-encoder enforcement and word-limit settings
+    require_bi_encoder: bool = False
+    gliner_max_words: int = 512
+    tokens_per_word_ratio: float = 1.3
     # Nested blocks (v2.0 batching + chunking). Kept as dicts for forward-compat.
     batch_inference: Dict[str, Any] = field(default_factory=dict)
     chunking: Dict[str, Any] = field(default_factory=dict)
@@ -60,6 +64,14 @@ class GLiNERConfig:
         if not isinstance(self.chunking, dict):
             raise ConfigValidationError(
                 f"gliner.chunking must be a mapping, got {type(self.chunking).__name__}"
+            )
+        if self.gliner_max_words <= 0:
+            raise ConfigValidationError(
+                f"gliner.gliner_max_words must be positive, got {self.gliner_max_words}"
+            )
+        if self.tokens_per_word_ratio <= 0:
+            raise ConfigValidationError(
+                f"gliner.tokens_per_word_ratio must be positive, got {self.tokens_per_word_ratio}"
             )
 
 

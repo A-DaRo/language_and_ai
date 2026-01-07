@@ -63,7 +63,7 @@ Example usage:
     parser.add_argument(
         '--input',
         type=Path,
-        required=True,
+        default=Path('artifacts/data/sobr.arrow'),
         help='Path to full SOBR Arrow file'
     )
     

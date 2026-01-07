@@ -9,16 +9,23 @@ Key Features:
 - PySBD-based sentence boundary detection for semantic integrity
 - Fallback hard-slicing for pathological run-on sentences
 - Offset tracking for global coordinate reconstruction
+- GLiNER WordsSplitter injection for 1:1 parity with model preprocessing
 
 Reference: GLiNER_Implementation_Strategy.md, Architectural Proposal for Semantic-Aware Context
 """
 
+from __future__ import annotations
+
 import logging
+import re
 import threading
 from dataclasses import dataclass, field
-from typing import List, Literal, Tuple, Optional, Any
+from typing import TYPE_CHECKING, Callable, List, Literal, Tuple, Optional, Any
 
 import pysbd
+
+if TYPE_CHECKING:
+    from gliner.data_processing.tokenizer import TokenSplitterBase
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +56,8 @@ class BudgetConfig:
     Attributes:
         model_max_length: Absolute maximum sequence length (e.g., 512).
         system_overhead: Reserved tokens for [CLS], [SEP], and safety buffer.
+            Increased to 10 (from 5) to account for special token variations
+            and potential tokenizer instability.
         ent_marker_cost: Token cost per label for GLiNER's internal [ENT] markers.
         hard_split_overlap: Token overlap when falling back to hard-slicing.
         min_budget_floor: Minimum effective budget to prevent degenerate chunking.
@@ -57,10 +66,16 @@ class BudgetConfig:
         legacy_sequential_mode: If True, forces sequential single-chunk inference
             (bypasses batch optimization). Useful for debugging or exact backward
             compatibility. Default False enables batched inference.
+        gliner_max_words: GLiNER processor word limit. The GLiNER library truncates
+            inputs at this many WORDS (via WordsSplitter), not subword tokens.
+            This is independent of model_max_length which counts tokens.
+        tokens_per_word_ratio: Average subword tokens per word. Used to convert
+            the gliner_max_words limit into an equivalent token budget.
+            Conservative estimate: 1.3 for English (handles compound words, etc).
     """
 
     model_max_length: int = 512
-    system_overhead: int = 5
+    system_overhead: int = 10  # Increased from 5 for safety margin
     ent_marker_cost: int = 1
     hard_split_overlap: int = 50
     min_budget_floor: int = 50
@@ -72,6 +87,10 @@ class BudgetConfig:
     # may release the GIL and because we parallelize across documents.
     parallel_chunking_workers: int = 0
     parallel_chunking_min_texts: int = 512
+
+    # Word-aware budget constraints (GLiNER truncates at WORDS, not tokens)
+    gliner_max_words: int = 512
+    tokens_per_word_ratio: float = 1.3
 
 
 class SemanticChunker:
@@ -86,13 +105,21 @@ class SemanticChunker:
     2. Phase B (Accumulate): Fill chunks sentence-by-sentence up to budget.
     3. Phase C (Fallback): Hard-split pathological run-on sentences.
     4. Phase D (Offsets): Track character offsets for coordinate reconstruction.
+    
+    CRITICAL: Uses GLiNER's WordsSplitter for 1:1 parity with model preprocessing.
+    This eliminates mismatches between chunker word counting and GLiNER's internal
+    word counting, which prevented "778 words > 512" truncation warnings.
     """
+
+    # Fallback regex pattern matching GLiNER's WhitespaceTokenSplitter
+    _FALLBACK_WORD_PATTERN = re.compile(r"\w+(?:[-_]\w+)*|\S")
 
     def __init__(
         self,
         tokenizer: Any,
         config: Optional[BudgetConfig] = None,
         language: str = "en",
+        words_splitter: Optional["TokenSplitterBase"] = None,
     ):
         """
         Initialize the semantic chunker.
@@ -101,6 +128,9 @@ class SemanticChunker:
             tokenizer: HuggingFace tokenizer (from GLiNER's data processor).
             config: Budget configuration. Defaults to BudgetConfig().
             language: Language code for PySBD segmenter.
+            words_splitter: GLiNER's WordsSplitter instance for exact word counting.
+                If None, falls back to regex-based splitting matching GLiNER's
+                WhitespaceTokenSplitter pattern.
         """
         self.tokenizer = tokenizer
         self.config = config or BudgetConfig()
@@ -109,9 +139,84 @@ class SemanticChunker:
         # clean=False preserves original whitespace and formatting
         self.segmenter = pysbd.Segmenter(language=language, clean=False)
 
+        # Store GLiNER's words_splitter for exact word counting
+        self._words_splitter = words_splitter
+        if words_splitter is None:
+            logger.warning(
+                "SemanticChunker initialized without GLiNER words_splitter. "
+                "Falling back to regex-based word splitting. Word counts may differ "
+                "from GLiNER's internal preprocessing, potentially causing truncation."
+            )
+
         # Cache for label token costs (computed once per label set)
         self._label_cost_cache: dict[tuple[str, ...], int] = {}
         self._label_cost_lock = threading.Lock()
+
+    def _split_words(self, text: str) -> List[Tuple[str, int, int]]:
+        """
+        Split text into words using GLiNER's WordsSplitter (or fallback regex).
+        
+        Returns list of (word_text, char_start, char_end) tuples.
+        This mirrors GLiNER's internal word splitting exactly.
+        """
+        if self._words_splitter is not None:
+            # Use GLiNER's actual WordsSplitter
+            return list(self._words_splitter(text))
+        else:
+            # Fallback: regex matching GLiNER's WhitespaceTokenSplitter
+            return [
+                (match.group(), match.start(), match.end())
+                for match in self._FALLBACK_WORD_PATTERN.finditer(text)
+            ]
+
+    def _count_words(self, text: str) -> int:
+        """Count words using GLiNER-compatible splitting."""
+        return len(self._split_words(text))
+
+    def calculate_exact_cost(self, text: str) -> Tuple[int, int, List[Tuple[str, int, int]]]:
+        """
+        Calculate exact word and token cost for text using GLiNER's preprocessing.
+        
+        This mirrors GLiNER's ingestion process:
+        1. Run WordsSplitter to get GLiNER-words
+        2. Tokenize with is_split_into_words=True (GLiNER's approach)
+        3. Return both costs for dual-constraint checking
+        
+        Args:
+            text: Input text to analyze.
+            
+        Returns:
+            Tuple of (word_count, token_count, word_spans) where:
+                - word_count: Number of GLiNER-words
+                - token_count: Number of subword tokens
+                - word_spans: List of (word, char_start, char_end) tuples
+        """
+        if not text or not text.strip():
+            return 0, 0, []
+        
+        # Phase 1: Get GLiNER-words with character spans
+        word_spans = self._split_words(text)
+        word_count = len(word_spans)
+        
+        if word_count == 0:
+            return 0, 0, []
+        
+        # Phase 2: Tokenize as GLiNER does (is_split_into_words=True)
+        words = [w[0] for w in word_spans]
+        try:
+            # GLiNER uses is_split_into_words=True for pre-tokenized input
+            encoded = self.tokenizer(
+                words,
+                is_split_into_words=True,
+                add_special_tokens=False,
+                return_attention_mask=False,
+            )
+            token_count = len(encoded["input_ids"])
+        except Exception:
+            # Fallback: tokenize the raw text
+            token_count = len(self.tokenizer.encode(text, add_special_tokens=False))
+        
+        return word_count, token_count, word_spans
 
     def calculate_effective_budget(self, labels: List[str]) -> int:
         """
@@ -121,7 +226,13 @@ class SemanticChunker:
             [ENT] label1 [ENT] label2 ... [SEP] text_tokens
 
         Formula:
-            Effective_Budget = Max_Length - (Label_Tokens + ENT_Markers + System_Overhead)
+            Token_Budget = Max_Length - (Label_Tokens + ENT_Markers + System_Overhead)
+            Word_Budget_Tokens = gliner_max_words * tokens_per_word_ratio
+            Effective_Budget = min(Token_Budget, Word_Budget_Tokens)
+
+        CRITICAL: GLiNER's processor truncates at gliner_max_words WORDS (whitespace-split),
+        not subword tokens. This method ensures the token budget never produces chunks
+        that exceed the word limit after detokenization.
 
         Args:
             labels: List of inference labels (targets + distractors).
@@ -146,9 +257,18 @@ class SemanticChunker:
                 # Avoid overwriting if another thread populated it.
                 total_label_cost = self._label_cost_cache.setdefault(cache_key, computed_cost)
 
-        # Calculate effective budget
+        # Calculate token-based budget (original logic)
         total_overhead = total_label_cost + self.config.system_overhead
-        effective_budget = self.config.model_max_length - total_overhead
+        token_budget = self.config.model_max_length - total_overhead
+
+        # Calculate word-based budget (GLiNER processor limit)
+        # GLiNER truncates at gliner_max_words WORDS, convert to token estimate
+        word_budget_tokens = int(
+            self.config.gliner_max_words * self.config.tokens_per_word_ratio
+        )
+
+        # Effective budget is the stricter of the two constraints
+        effective_budget = min(token_budget, word_budget_tokens)
 
         if effective_budget < self.config.min_budget_floor:
             logger.warning(
@@ -160,6 +280,7 @@ class SemanticChunker:
         logger.debug(
             f"Budget calculation: max={self.config.model_max_length}, "
             f"label_cost={total_label_cost}, overhead={self.config.system_overhead}, "
+            f"token_budget={token_budget}, word_budget_tokens={word_budget_tokens}, "
             f"effective={effective_budget}"
         )
 
@@ -213,8 +334,11 @@ class SemanticChunker:
         """
         Single-sentence mode: emit one chunk per sentence.
 
-        Hard-split only when a single sentence exceeds budget.
+        Hard-split only when a single sentence exceeds budget OR word limit.
         This produces the shortest possible inputs for GLiNER.
+
+        CRITICAL: Uses GLiNER's WordsSplitter for exact word counting.
+        This ensures 1:1 parity with GLiNER's internal preprocessing.
 
         Args:
             sentence_positions: List of (text, char_start, char_end) tuples.
@@ -224,14 +348,27 @@ class SemanticChunker:
             List of ChunkInfo objects (one per sentence, or multiple if hard-split).
         """
         chunks: List[ChunkInfo] = []
+        word_limit = self.config.gliner_max_words
 
         for sent_text, char_start, char_end in sentence_positions:
-            sent_token_count = len(self.tokenizer.encode(sent_text, add_special_tokens=False))
+            # Use calculate_exact_cost for GLiNER-compatible word/token counting
+            sent_word_count, sent_token_count, word_spans = self.calculate_exact_cost(sent_text)
 
-            if sent_token_count > budget:
-                # Pathological: single sentence exceeds budget -> hard-split
+            # Check BOTH constraints: token budget AND word limit
+            exceeds_token_budget = sent_token_count > budget
+            exceeds_word_limit = sent_word_count > word_limit
+
+            if exceeds_token_budget or exceeds_word_limit:
+                # Pathological: sentence exceeds budget or word limit -> hard-split
+                logger.debug(
+                    f"Sentence requires hard-split: {sent_word_count} GLiNER-words, "
+                    f"{sent_token_count} tokens (limits: {word_limit} words, {budget} tokens)"
+                )
+
                 hard_chunks = self._hard_split_sentence(
-                    sent_text, char_start, budget, self.config.hard_split_overlap
+                    sent_text, char_start, budget, self.config.hard_split_overlap,
+                    word_limit=word_limit,
+                    word_spans=word_spans,
                 )
                 chunks.extend(hard_chunks)
             else:
@@ -255,6 +392,9 @@ class SemanticChunker:
         """
         Accumulate mode: fill chunks sentence-by-sentence up to budget.
 
+        CRITICAL: Uses GLiNER's WordsSplitter for exact word counting.
+        This ensures 1:1 parity with GLiNER's internal preprocessing.
+
         Args:
             sentence_positions: List of (text, char_start, char_end) tuples.
             budget: Token budget per chunk.
@@ -265,27 +405,45 @@ class SemanticChunker:
         chunks: List[ChunkInfo] = []
         current_sentences: List[Tuple[str, int, int]] = []
         current_token_count = 0
+        current_word_count = 0
+        word_limit = self.config.gliner_max_words
 
         for sent_text, char_start, char_end in sentence_positions:
-            sent_token_count = len(self.tokenizer.encode(sent_text, add_special_tokens=False))
+            # Use calculate_exact_cost for GLiNER-compatible word/token counting
+            sent_word_count, sent_token_count, word_spans = self.calculate_exact_cost(sent_text)
 
-            # Pathological case - single sentence exceeds budget
-            if sent_token_count > budget:
+            # Check BOTH constraints: token budget AND word limit
+            exceeds_token_budget = sent_token_count > budget
+            exceeds_word_limit = sent_word_count > word_limit
+
+            # Pathological case - single sentence exceeds budget OR word limit
+            if exceeds_token_budget or exceeds_word_limit:
                 # Flush any accumulated sentences first
                 if current_sentences:
                     chunks.append(self._create_chunk(current_sentences, is_hard_split=False))
                     current_sentences = []
                     current_token_count = 0
+                    current_word_count = 0
+
+                logger.debug(
+                    f"Sentence requires hard-split in accumulate mode: "
+                    f"{sent_word_count} GLiNER-words, {sent_token_count} tokens"
+                )
 
                 # Hard-split the oversized sentence
                 hard_chunks = self._hard_split_sentence(
-                    sent_text, char_start, budget, self.config.hard_split_overlap
+                    sent_text, char_start, budget, self.config.hard_split_overlap,
+                    word_limit=word_limit,
+                    word_spans=word_spans,
                 )
                 chunks.extend(hard_chunks)
                 continue
 
-            # Standard accumulation
-            if current_token_count + sent_token_count > budget:
+            # Standard accumulation - check BOTH token and word constraints
+            would_exceed_tokens = current_token_count + sent_token_count > budget
+            would_exceed_words = current_word_count + sent_word_count > word_limit
+
+            if would_exceed_tokens or would_exceed_words:
                 # Budget exceeded - commit current chunk
                 if current_sentences:
                     chunks.append(self._create_chunk(current_sentences, is_hard_split=False))
@@ -293,10 +451,12 @@ class SemanticChunker:
                 # Start new chunk with current sentence
                 current_sentences = [(sent_text, char_start, char_end)]
                 current_token_count = sent_token_count
+                current_word_count = sent_word_count
             else:
                 # Add sentence to current chunk
                 current_sentences.append((sent_text, char_start, char_end))
                 current_token_count += sent_token_count
+                current_word_count += sent_word_count
 
         # Commit final buffer
         if current_sentences:
@@ -385,63 +545,107 @@ class SemanticChunker:
         char_offset: int,
         budget: int,
         overlap: int,
+        word_limit: Optional[int] = None,
+        word_spans: Optional[List[Tuple[str, int, int]]] = None,
     ) -> List[ChunkInfo]:
         """
-        Phase C Fallback: Hard-split an oversized sentence by token count.
+        Phase C Fallback: Hard-split an oversized sentence by GLiNER-words.
 
-        This is invoked when a single sentence exceeds the token budget.
-        Uses overlapping windows to mitigate context loss at boundaries.
+        This is invoked when a single sentence exceeds the token budget OR word limit.
+        Uses overlapping word windows to mitigate context loss at boundaries.
+
+        CRITICAL: Operates on GLiNER-words (from WordsSplitter), not raw characters.
+        This ensures each chunk respects BOTH the token budget AND word limit with
+        1:1 parity to GLiNER's internal preprocessing.
+
+        Algorithm:
+        1. Decompose sentence via WordsSplitter to get atomic word strings + spans.
+        2. Slide a word-window over the list, dynamically checking token count.
+        3. Adjust window size (in words) to maximize content without exceeding budget.
+        4. Reconstruct chunk text and character offsets from word spans.
 
         Args:
             sentence: The oversized sentence text.
             char_offset: Character offset of sentence start in original document.
             budget: Token budget per chunk.
-            overlap: Token overlap between consecutive chunks.
+            overlap: Word overlap between consecutive chunks (in words, not tokens).
+            word_limit: Maximum words per chunk (GLiNER's processor limit).
+            word_spans: Pre-computed word spans from calculate_exact_cost().
+                If None, will be computed here.
 
         Returns:
             List of ChunkInfo objects from hard-slicing.
         """
-        logger.debug(
-            f"Hard-splitting pathological sentence "
-            f"({len(self.tokenizer.encode(sentence, add_special_tokens=False))} tokens)"
-        )
+        if word_limit is None:
+            word_limit = self.config.gliner_max_words
 
-        # Tokenize with offset mapping for precise character boundaries
-        try:
-            encoded = self.tokenizer(
-                sentence,
-                add_special_tokens=False,
-                return_offsets_mapping=True,
-            )
-            token_ids = encoded["input_ids"]
-            offsets = encoded["offset_mapping"]
-        except Exception:
-            # Fallback: simple tokenization without offsets
-            token_ids = self.tokenizer.encode(sentence, add_special_tokens=False)
-            offsets = None
+        # Get word spans (reuse if pre-computed)
+        if word_spans is None:
+            word_spans = self._split_words(sentence)
 
-        if not token_ids:
+        if not word_spans:
             return []
 
+        # Convert overlap from tokens to approximate words
+        word_overlap = max(1, overlap // max(1, int(self.config.tokens_per_word_ratio)))
+
+        total_words = len(word_spans)
+        logger.debug(
+            f"Hard-splitting pathological sentence: {total_words} GLiNER-words "
+            f"(budget={budget} tokens, word_limit={word_limit})"
+        )
+
         chunks = []
-        stride = max(1, budget - overlap)
-        start_tok = 0
+        start_word = 0
 
-        while start_tok < len(token_ids):
-            end_tok = min(start_tok + budget, len(token_ids))
+        while start_word < total_words:
+            # Determine maximum words we can take (respecting word_limit)
+            max_end_word = min(start_word + word_limit, total_words)
 
-            # Decode chunk text
-            chunk_token_ids = token_ids[start_tok:end_tok]
-            chunk_text = self.tokenizer.decode(chunk_token_ids, skip_special_tokens=True)
+            # Binary search for the largest window that fits token budget
+            best_end_word = start_word + 1  # At least one word
+            low, high = start_word + 1, max_end_word
 
-            # Compute character offsets
-            if offsets and start_tok < len(offsets) and end_tok - 1 < len(offsets):
-                local_char_start = offsets[start_tok][0]
-                local_char_end = offsets[end_tok - 1][1]
-            else:
-                # Estimate offsets from token positions
-                local_char_start = 0
-                local_char_end = len(sentence)
+            while low <= high:
+                mid = (low + high) // 2
+                # Get words in this window
+                window_words = [w[0] for w in word_spans[start_word:mid]]
+
+                # Count tokens using GLiNER's approach
+                try:
+                    encoded = self.tokenizer(
+                        window_words,
+                        is_split_into_words=True,
+                        add_special_tokens=False,
+                        return_attention_mask=False,
+                    )
+                    token_count = len(encoded["input_ids"])
+                except Exception:
+                    # Fallback: join and tokenize
+                    window_text = " ".join(window_words)
+                    token_count = len(self.tokenizer.encode(window_text, add_special_tokens=False))
+
+                if token_count <= budget:
+                    best_end_word = mid
+                    low = mid + 1
+                else:
+                    high = mid - 1
+
+            # Build chunk from word window
+            chunk_words = word_spans[start_word:best_end_word]
+            if not chunk_words:
+                # Safety: advance by at least 1 word to avoid infinite loop
+                start_word += 1
+                continue
+
+            # Reconstruct text from word spans (preserves original spacing via offsets)
+            first_span = chunk_words[0]
+            last_span = chunk_words[-1]
+            local_char_start = first_span[1]
+            local_char_end = last_span[2]
+
+            # Extract text from original sentence using precise offsets
+            chunk_text = sentence[local_char_start:local_char_end]
 
             global_char_start = char_offset + local_char_start
             global_char_end = char_offset + local_char_end
@@ -455,10 +659,11 @@ class SemanticChunker:
                 )
             )
 
-            if end_tok >= len(token_ids):
+            if best_end_word >= total_words:
                 break
 
-            start_tok += stride
+            # Advance with word overlap
+            start_word = max(start_word + 1, best_end_word - word_overlap)
 
         return chunks
 

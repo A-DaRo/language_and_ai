@@ -69,6 +69,16 @@ gliner:
   device: "auto"
   
   # ---------------------------------------------------------------------------
+  # Bi-Encoder & Word-Limit (Laptop Overrides)
+  # ---------------------------------------------------------------------------
+  # Laptop mode: bi-encoder NOT required by default (allows uni-encoder models).
+  # Word limit same as base (512 words is GLiNER's default processor limit).
+  # ---------------------------------------------------------------------------
+  require_bi_encoder: true   # Enforce bi-encoder usage on laptop
+  # gliner_max_words: inherited from base (512)
+  # tokens_per_word_ratio: inherited from base (1.3)
+  
+  # ---------------------------------------------------------------------------
   # Laptop-optimized Batch Inference Settings
   # ---------------------------------------------------------------------------
   # Conservative settings for limited VRAM environments.

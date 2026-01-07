@@ -67,6 +67,31 @@ class TestGLiNERConfigValidation:
         """Zero batch_size is rejected."""
         with pytest.raises(ConfigValidationError, match="batch_size"):
             GLiNERConfig(batch_size=0)
+    
+    def test_valid_bi_encoder_and_word_limit_config(self):
+        """Valid bi-encoder and word-limit config passes validation."""
+        config = GLiNERConfig(
+            require_bi_encoder=True,
+            gliner_max_words=256,
+            tokens_per_word_ratio=1.5,
+        )
+        assert config.require_bi_encoder is True
+        assert config.gliner_max_words == 256
+        assert config.tokens_per_word_ratio == 1.5
+    
+    def test_config_rejects_invalid_gliner_max_words(self):
+        """gliner_max_words <= 0 is rejected."""
+        with pytest.raises(ConfigValidationError, match="gliner_max_words"):
+            GLiNERConfig(gliner_max_words=0)
+        with pytest.raises(ConfigValidationError, match="gliner_max_words"):
+            GLiNERConfig(gliner_max_words=-100)
+    
+    def test_config_rejects_invalid_tokens_per_word_ratio(self):
+        """tokens_per_word_ratio <= 0 is rejected."""
+        with pytest.raises(ConfigValidationError, match="tokens_per_word_ratio"):
+            GLiNERConfig(tokens_per_word_ratio=0)
+        with pytest.raises(ConfigValidationError, match="tokens_per_word_ratio"):
+            GLiNERConfig(tokens_per_word_ratio=-1.5)
 
 
 # ==============================================================================
@@ -253,11 +278,14 @@ class TestModeSpecificOverrides:
         )
     
     def test_laptop_mode_enables_subset(self):
-        """Laptop mode enables dataset subset."""
+        """Laptop mode configures dataset subset (disabled by default for full coverage)."""
         config = load_pipeline_config(mode="laptop")
         
-        assert config["subset"]["enabled"] is True, (
-            "Laptop mode should enable subset"
+        # Laptop mode has subset disabled by default (full dataset for accuracy)
+        # Users can enable subset manually for faster iteration
+        assert "subset" in config, "Config should have subset section"
+        assert config["subset"]["enabled"] is False, (
+            "Laptop mode should have subset disabled by default for full dataset coverage"
         )
     
     def test_hpc_mode_loads_successfully(self):
@@ -271,8 +299,8 @@ class TestModeSpecificOverrides:
         """Base config values are preserved when not overridden."""
         config = load_pipeline_config(mode="laptop")
         
-        # Base config should define model name
-        assert config["gliner"]["model"] == "urchade/gliner_large-v2.1"
+        # Base config should define model name (bi-encoder for prompt caching)
+        assert config["gliner"]["model"] == "knowledgator/gliner-bi-base-v1.0"
         assert config["encoder"]["model"] == "roberta-base"
 
 

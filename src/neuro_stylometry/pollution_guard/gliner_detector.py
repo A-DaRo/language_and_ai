@@ -411,6 +411,49 @@ class GLiNERDetector:
     # Class-level model cache to avoid reloading
     _MODEL_CACHE: Dict[tuple, GLiNER] = {}
 
+    @staticmethod
+    def is_bi_encoder_model(model_name: str) -> bool:
+        """
+        Check if a GLiNER model is bi-encoder without fully loading it.
+        
+        Bi-encoder models have `labels_encoder` in their config. This method
+        loads only the config to check architecture type before full model load.
+        
+        Args:
+            model_name: HuggingFace model identifier (e.g., "urchade/gliner_large-v2.1").
+            
+        Returns:
+            True if model is bi-encoder (has labels_encoder config), False otherwise.
+            
+        Note:
+            This downloads config.json but not model weights, so it's lightweight.
+            For local models, this is nearly instant.
+        """
+        try:
+            from huggingface_hub import hf_hub_download
+            import json
+            
+            # Try to download just the config file
+            config_path = hf_hub_download(
+                repo_id=model_name,
+                filename="gliner_config.json",
+                local_files_only=False,
+            )
+            
+            with open(config_path, "r") as f:
+                config = json.load(f)
+            
+            # Bi-encoder models have labels_encoder defined
+            labels_encoder = config.get("labels_encoder")
+            return labels_encoder is not None
+            
+        except Exception as e:
+            logger.warning(
+                f"Could not pre-check bi-encoder status for '{model_name}': {e}. "
+                f"Will check after model load."
+            )
+            return False
+
     def __init__(
         self,
         model_name: str = "urchade/gliner_large-v2.1",
@@ -423,6 +466,7 @@ class GLiNERDetector:
         constraints_config: Optional[Dict[str, Any]] = None,
         budget_config: Optional[BudgetConfig] = None,
         batch_inference_config: Optional[BatchInferenceConfig] = None,
+        require_bi_encoder: bool = False,
         # Legacy parameters (ignored but accepted for backward compatibility)
         center_window_keep: int = 100,
     ):
@@ -440,12 +484,15 @@ class GLiNERDetector:
             constraints_config: Dict to construct constraints from config.
             budget_config: Configuration for dynamic budgeting.
             batch_inference_config: Configuration for batched inference optimization.
+            require_bi_encoder: If True, raise error if loaded model is not bi-encoder.
+                Bi-encoder models support encode_labels() for prompt caching.
             center_window_keep: DEPRECATED - Ignored. Semantic chunking handles this.
         """
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
         self.max_length = max_length
         self.confidence_threshold = confidence_threshold
         self.model_name = model_name
+        self.require_bi_encoder = require_bi_encoder
 
         # Initialize taxonomy and constraints
         if taxonomy is None and taxonomy_config is not None:
@@ -472,14 +519,21 @@ class GLiNERDetector:
 
         # Load GLiNER model
         self.model = self._load_model(model_name)
+        
+        # Sync GLiNER processor max_len with our configured max_length
+        self._sync_processor_max_len()
 
         # Register typed mask tokens as special tokens
         self._register_mask_tokens()
 
-        # Initialize semantic chunker
+        # Extract GLiNER's words_splitter for exact word counting (1:1 parity)
+        words_splitter = self._get_words_splitter()
+
+        # Initialize semantic chunker with injected words_splitter
         self.chunker = SemanticChunker(
             tokenizer=self.tokenizer,
             config=self.budget_config,
+            words_splitter=words_splitter,
         )
         
         # Bi-encoder prompt embedding cache
@@ -487,12 +541,24 @@ class GLiNERDetector:
         self._prompt_embedding_cache: Dict[Tuple[str, ...], torch.Tensor] = {}
         self._is_bi_encoder = self._check_bi_encoder_support()
         
+        # Enforce bi-encoder requirement if configured
+        if self.require_bi_encoder and not self._is_bi_encoder:
+            raise ValueError(
+                f"require_bi_encoder=True but model '{model_name}' is a uni-encoder. "
+                f"Uni-encoder models do not support label embedding caching (encode_labels API). "
+                f"Use a bi-encoder model (e.g., one with labels_encoder in config) or set "
+                f"require_bi_encoder=False in pipeline.yaml."
+            )
+        
         if self._is_bi_encoder and self.batch_config.enable_prompt_caching:
             logger.info("Bi-encoder model detected - prompt embedding caching enabled")
+        elif self.require_bi_encoder:
+            logger.info("Bi-encoder model enforced via require_bi_encoder=True")
 
         logger.info(f"GLiNERDetector initialized on {self.device}")
         logger.info(f"Batch inference: {'enabled' if self.batch_config.enable_batching else 'disabled'} "
                    f"(batch_size={self.batch_config.batch_size}, buckets={self.batch_config.num_buckets})")
+        logger.info(f"Words splitter: {type(words_splitter).__name__ if words_splitter else 'fallback regex'}")
 
     def _check_bi_encoder_support(self) -> bool:
         """
@@ -507,6 +573,37 @@ class GLiNERDetector:
         has_encode = hasattr(core_model, "encode_labels") or hasattr(self.model, "encode_labels")
         has_batch_predict = hasattr(core_model, "batch_predict_with_embeds") or hasattr(self.model, "batch_predict_with_embeds")
         return has_encode and has_batch_predict
+
+    def _get_words_splitter(self) -> Optional[Any]:
+        """
+        Extract GLiNER's WordsSplitter for 1:1 chunking parity.
+        
+        GLiNER uses a words_splitter (e.g., WhitespaceTokenSplitter) to convert
+        text into atomic word units. This method extracts the exact splitter used
+        by the loaded model so the SemanticChunker can count words identically.
+        
+        Returns:
+            The GLiNER words_splitter instance, or None if not accessible.
+            When None, SemanticChunker falls back to regex-based splitting.
+        """
+        data_processor = getattr(self.model, "data_processor", None)
+        if data_processor is None:
+            logger.warning(
+                "GLiNER model has no data_processor - cannot extract words_splitter. "
+                "Chunker will use fallback regex-based word splitting."
+            )
+            return None
+        
+        words_splitter = getattr(data_processor, "words_splitter", None)
+        if words_splitter is None:
+            logger.warning(
+                "GLiNER data_processor has no words_splitter attribute. "
+                "Chunker will use fallback regex-based word splitting."
+            )
+            return None
+        
+        logger.debug(f"Extracted GLiNER words_splitter: {type(words_splitter).__name__}")
+        return words_splitter
     
     def _get_cached_prompt_embeddings(self, labels: List[str]) -> Optional[torch.Tensor]:
         """
@@ -593,6 +690,64 @@ class GLiNERDetector:
         GLiNERDetector._MODEL_CACHE[cache_key] = model
 
         return model
+
+    def _sync_processor_max_len(self) -> None:
+        """
+        Synchronize GLiNER's internal processor config with our BudgetConfig.
+        
+        CRITICAL: GLiNER's data processor truncates at max_len WORDS (not tokens).
+        The processor.preprocess_example() emits warnings like:
+            "Sentence of length 778 has been truncated to 512"
+        These are WORD counts, not subword tokens.
+        
+        This method:
+        1. Reads max_len from GLiNER processor (the actual WORD limit)
+        2. Updates our BudgetConfig.gliner_max_words to match if stricter
+        3. Syncs the processor max_len to our configured value
+        
+        This ensures the SemanticChunker uses the same word limits as GLiNER.
+        """
+        data_processor = getattr(self.model, "data_processor", None)
+        if data_processor is None:
+            logger.warning("GLiNER model has no data_processor - cannot sync max_len")
+            return
+        
+        # Get current processor max_len (this is the WORD limit)
+        processor_max_len = getattr(data_processor, "max_len", None)
+        
+        if processor_max_len is not None:
+            # Update BudgetConfig if processor has a stricter word limit
+            if processor_max_len < self.budget_config.gliner_max_words:
+                logger.info(
+                    f"GLiNER processor max_len ({processor_max_len} words) is stricter than "
+                    f"configured gliner_max_words ({self.budget_config.gliner_max_words}). "
+                    f"Using processor limit for safety."
+                )
+                self.budget_config.gliner_max_words = processor_max_len
+            
+            if processor_max_len != self.max_length:
+                logger.warning(
+                    f"GLiNER processor max_len ({processor_max_len}) differs from "
+                    f"configured max_length ({self.max_length}). "
+                    f"Note: processor max_len is in WORDS, not tokens. "
+                    f"Syncing processor to {self.max_length}."
+                )
+            # Set processor max_len to our configured value
+            data_processor.max_len = self.max_length
+            logger.debug(f"Synced GLiNER processor max_len to {self.max_length}")
+        else:
+            logger.debug("GLiNER processor has no max_len attribute")
+        
+        # Also sync tokenizer model_max_length with BudgetConfig
+        tokenizer = self.tokenizer
+        tokenizer_max_len = getattr(tokenizer, "model_max_length", None)
+        if tokenizer_max_len is not None and tokenizer_max_len < self.budget_config.model_max_length:
+            logger.info(
+                f"Tokenizer model_max_length ({tokenizer_max_len}) is stricter than "
+                f"configured model_max_length ({self.budget_config.model_max_length}). "
+                f"Using tokenizer limit for safety."
+            )
+            self.budget_config.model_max_length = tokenizer_max_len
 
     def _register_mask_tokens(self) -> None:
         """

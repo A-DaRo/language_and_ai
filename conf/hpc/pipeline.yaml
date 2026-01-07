@@ -65,9 +65,10 @@ precision:
   use_grad_scaler: false
 
 gliner:
+  model: "knowledgator/gliner-bi-llama-v1.0"
   batch_size: 128
   device: "cuda"
-  
+  require_bi_encoder: true   # Enforce bi-encoder usage
   # ---------------------------------------------------------------------------
   # HPC-optimized Batch Inference Settings
   # ---------------------------------------------------------------------------

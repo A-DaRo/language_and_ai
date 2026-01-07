@@ -48,6 +48,8 @@ artifacts/models/**/*.bin
 artifacts/reports/*.json
 artifacts/reports/*.md
 artifacts/reports/*.html
+artifacts/phase_a_notebook/*.pt
+artifacts/phase_a_notebook/*.json
 
 # Logs
 logs/

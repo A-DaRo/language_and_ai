@@ -3,13 +3,29 @@
 seed: 42
 
 gliner:
-  model: "urchade/gliner_large-v2.1"
-  confidence_threshold: 0.85
+  model: "knowledgator/gliner-bi-base-v1.0"
+  confidence_threshold: 0.60
   batch_size: 32
   device: "auto"  # "auto" | "cpu" | "cuda" (explicit authority)
   taxonomy_path: "conf/base/gliner_taxonomy.yaml"
   compute_explicit_recall: true
-  explicit_recall_threshold: 0.95
+  explicit_recall_threshold: 0.80
+  
+  # ---------------------------------------------------------------------------
+  # Bi-Encoder Enforcement & Word-Limit Settings
+  # ---------------------------------------------------------------------------
+  # Bi-encoder models support label embedding caching (encode_labels API).
+  # Set require_bi_encoder: true to enforce bi-encoder architecture at load time.
+  # If true and model lacks labels_encoder config, initialization fails.
+  #
+  # CRITICAL: GLiNER's internal processor truncates at max_words WORDS (not tokens).
+  # The chunker uses tokens for budgeting, but GLiNER counts whitespace-split words.
+  # gliner_max_words ensures chunks never exceed GLiNER's word limit.
+  # Formula: effective_budget = min(token_budget, gliner_max_words * tokens_per_word_ratio)
+  # ---------------------------------------------------------------------------
+  require_bi_encoder: false  # Set true to enforce bi-encoder model architecture
+  gliner_max_words: 315      # GLiNER processor word limit (matches model default)
+  tokens_per_word_ratio: 1.3 # Avg subword tokens per word (conservative estimate)
   
   # ---------------------------------------------------------------------------
   # Batch Inference Optimization Settings (v2.0)

@@ -173,15 +173,22 @@ class PhaseAPipeline:
             enable_prompt_caching=batch_inference_cfg.get("enable_prompt_caching", True),
         )
         
-        # Build chunking/budget config from YAML
-        chunking_cfg = self.config.get("gliner", {}).get("chunking", {})
+        # Build chunking/budget config from YAML (includes word-aware budgeting)
+        gliner_cfg = self.config.get("gliner", {})
+        chunking_cfg = gliner_cfg.get("chunking", {})
         budget_config = BudgetConfig(
             model_max_length=int(self._cfg_get("encoder.max_length")),
             mode=chunking_cfg.get("mode", "single_sentence"),
             legacy_sequential_mode=chunking_cfg.get("legacy_sequential_mode", False),
             parallel_chunking_workers=int(chunking_cfg.get("parallel_chunking_workers", 0)),
             parallel_chunking_min_texts=int(chunking_cfg.get("parallel_chunking_min_texts", 512)),
+            # Word-aware budget constraints (GLiNER truncates at WORDS, not tokens)
+            gliner_max_words=int(gliner_cfg.get("gliner_max_words", 512)),
+            tokens_per_word_ratio=float(gliner_cfg.get("tokens_per_word_ratio", 1.3)),
         )
+        
+        # Bi-encoder enforcement flag
+        require_bi_encoder = bool(gliner_cfg.get("require_bi_encoder", False))
 
         self._detector = GLiNERDetector(
             model_name=self._cfg_get("gliner.model"),
@@ -192,6 +199,7 @@ class PhaseAPipeline:
             constraints=constraints,
             budget_config=budget_config,
             batch_inference_config=batch_config,
+            require_bi_encoder=require_bi_encoder,
         )
         return self._detector
 
