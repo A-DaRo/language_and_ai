@@ -484,7 +484,7 @@ class TestWorkerScaling:
             }
         
         print(f"\n{'='*60}")
-        print(f"WORKER SCALING ANALYSIS ({len(sample_texts_medium)} documents)")
+        print(f"WORKER SCALING ANALYSIS ({len(sample_texts_large)} documents)")
         print(f"Environment: {get_environment_label()}")
         print(f"{'='*60}")
         for num_workers, data in results.items():
