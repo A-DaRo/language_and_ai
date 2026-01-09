@@ -17,9 +17,11 @@ Reference: GLiNER_Implementation_Strategy.md, Architectural Proposal for Semanti
 from __future__ import annotations
 
 import logging
+import multiprocessing as mp
+import os
 import re
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Callable, List, Literal, Tuple, Optional, Any
 
 import pysbd
@@ -28,6 +30,8 @@ if TYPE_CHECKING:
     from gliner.data_processing.tokenizer import TokenSplitterBase
 
 logger = logging.getLogger(__name__)
+
+_PARALLEL_CHUNKER: Optional["SemanticChunker"] = None
 
 
 @dataclass
@@ -134,6 +138,7 @@ class SemanticChunker:
         """
         self.tokenizer = tokenizer
         self.config = config or BudgetConfig()
+        self._language = language
 
         # Initialize PySBD (Rule-based sentence segmenter)
         # clean=False preserves original whitespace and formatting
@@ -151,6 +156,120 @@ class SemanticChunker:
         # Cache for label token costs (computed once per label set)
         self._label_cost_cache: dict[tuple[str, ...], int] = {}
         self._label_cost_lock = threading.Lock()
+
+    def chunk_texts(
+        self,
+        texts: List[str],
+        labels_list: List[Optional[List[str]]],
+        progress_callback: Optional[Callable[[], None]] = None,
+    ) -> List[List[ChunkInfo]]:
+        """
+        Chunk multiple texts, optionally using multiprocessing for HPC.
+
+        Args:
+            texts: List of documents to chunk.
+            labels_list: Per-document labels (None or empty means skip).
+            progress_callback: Optional callable invoked per document processed.
+
+        Returns:
+            List of ChunkInfo lists aligned with input order.
+        """
+        if len(texts) != len(labels_list):
+            raise ValueError(
+                "texts and labels_list must have the same length "
+                f"(got {len(texts)} vs {len(labels_list)})"
+            )
+
+        workers = int(self.config.parallel_chunking_workers or 0)
+        min_texts = int(self.config.parallel_chunking_min_texts or 0)
+
+        if workers <= 1 or len(texts) < min_texts:
+            results: List[List[ChunkInfo]] = []
+            for text, labels in zip(texts, labels_list):
+                if progress_callback:
+                    progress_callback()
+                if not text or not text.strip() or not labels:
+                    results.append([])
+                    continue
+                results.append(self.chunk_text(text, labels))
+            return results
+
+        tokenizer_name = getattr(self.tokenizer, "name_or_path", None)
+        if not tokenizer_name:
+            logger.warning(
+                "Tokenizer name_or_path not available; falling back to sequential chunking."
+            )
+            results = []
+            for text, labels in zip(texts, labels_list):
+                if progress_callback:
+                    progress_callback()
+                if not text or not text.strip() or not labels:
+                    results.append([])
+                    continue
+                results.append(self.chunk_text(text, labels))
+            return results
+
+        return self._chunk_texts_parallel(
+            texts=texts,
+            labels_list=labels_list,
+            tokenizer_name=tokenizer_name,
+            progress_callback=progress_callback,
+        )
+
+    def _chunk_texts_parallel(
+        self,
+        texts: List[str],
+        labels_list: List[Optional[List[str]]],
+        tokenizer_name: str,
+        progress_callback: Optional[Callable[[], None]],
+    ) -> List[List[ChunkInfo]]:
+        """Parallel chunking using multiprocessing spawn and per-worker initialization."""
+        workers = int(self.config.parallel_chunking_workers or 0)
+        max_workers = min(workers, (os.cpu_count() or workers))
+        if max_workers <= 1:
+            return self.chunk_texts(texts, labels_list, progress_callback=progress_callback)
+
+        if self._words_splitter is not None:
+            logger.info(
+                "Parallel chunking initializes per-worker tokenizers; "
+                "words_splitter is not shared and falls back to regex splitting."
+            )
+
+        # Prevent nested parallelism in workers and keep config immutable.
+        worker_config = replace(
+            self.config,
+            parallel_chunking_workers=0,
+            parallel_chunking_min_texts=0,
+        )
+
+        tasks = [(idx, texts[idx], labels_list[idx]) for idx in range(len(texts))]
+        results: List[List[ChunkInfo]] = [[] for _ in texts]
+
+        ctx = mp.get_context("spawn")
+        try:
+            with ctx.Pool(
+                processes=max_workers,
+                initializer=_parallel_chunker_init,
+                initargs=(tokenizer_name, worker_config, self._language),
+            ) as pool:
+                for idx, chunks in pool.imap_unordered(_parallel_chunk_task, tasks, chunksize=1):
+                    results[idx] = chunks
+                    if progress_callback:
+                        progress_callback()
+        except Exception as exc:
+            logger.warning(
+                "Parallel chunking failed; falling back to sequential chunking: %s", exc
+            )
+            results = []
+            for text, labels in zip(texts, labels_list):
+                if progress_callback:
+                    progress_callback()
+                if not text or not text.strip() or not labels:
+                    results.append([])
+                    continue
+                results.append(self.chunk_text(text, labels))
+
+        return results
 
     def _split_words(self, text: str) -> List[Tuple[str, int, int]]:
         """
@@ -666,6 +785,46 @@ class SemanticChunker:
             start_word = max(start_word + 1, best_end_word - word_overlap)
 
         return chunks
+
+
+def _parallel_chunker_init(
+    tokenizer_name: str,
+    config: BudgetConfig,
+    language: str,
+) -> None:
+    """Initializer for multiprocessing chunk workers."""
+    global _PARALLEL_CHUNKER
+    from transformers import AutoTokenizer
+
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(
+            tokenizer_name,
+            use_fast=True,
+            local_files_only=True,
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            f"Failed to load tokenizer '{tokenizer_name}' in worker process. "
+            "Ensure the tokenizer is cached locally."
+        ) from exc
+    _PARALLEL_CHUNKER = SemanticChunker(
+        tokenizer=tokenizer,
+        config=config,
+        language=language,
+        words_splitter=None,
+    )
+
+
+def _parallel_chunk_task(
+    args: Tuple[int, str, Optional[List[str]]],
+) -> Tuple[int, List[ChunkInfo]]:
+    """Chunk a single document in a worker process."""
+    idx, text, labels = args
+    if not text or not text.strip() or not labels:
+        return idx, []
+    if _PARALLEL_CHUNKER is None:
+        raise RuntimeError("Parallel chunker not initialized in worker process")
+    return idx, _PARALLEL_CHUNKER.chunk_text(text, labels)
 
 
 def project_entity_offsets(

@@ -66,7 +66,7 @@ precision:
 
 gliner:
   model: "knowledgator/gliner-bi-llama-v1.0"
-  batch_size: 128
+  batch_size: 32
   device: "cuda"
   require_bi_encoder: true   # Enforce bi-encoder usage
   # ---------------------------------------------------------------------------
@@ -78,15 +78,16 @@ gliner:
   # ---------------------------------------------------------------------------
   batch_inference:
     enable_batching: true
-    # 16 buckets for fine-grained length bucketing on high-VRAM GPUs
-    # Auto-compute would give 12-16, explicit 16 for maximum efficiency
-    num_buckets: 16
+    # 8 buckets for balanced bucketing on mid-VRAM GPUs (e.g., L4)
+    num_buckets: 8
     min_bucket_size: 8  # Larger min size since we have more samples
     enable_prompt_caching: true
   
   chunking:
     mode: "single_sentence"
     legacy_sequential_mode: false
+    parallel_chunking_workers: 16
+    parallel_chunking_min_texts: 256
 
 subset:
   enabled: false

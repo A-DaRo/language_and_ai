@@ -23,12 +23,9 @@ from __future__ import annotations
 
 import inspect
 import logging
-import os
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set, Tuple
-
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import torch
@@ -1025,13 +1022,12 @@ class GLiNERDetector:
                 leave=False,
             )
 
-        workers = int(getattr(self.budget_config, "parallel_chunking_workers", 0) or 0)
-        min_texts = int(getattr(self.budget_config, "parallel_chunking_min_texts", 512) or 512)
-
-        def _chunk_one(doc_idx: int) -> Tuple[int, Optional[List[str]], List[ChunkInfo], bool]:
+        doc_labels: List[Optional[List[str]]] = []
+        for doc_idx in range(len(texts)):
             text = texts[doc_idx]
             if not text or not text.strip():
-                return doc_idx, None, [], True
+                doc_labels.append(None)
+                continue
 
             row_columns: Optional[List[str]] = None
             if active_columns is not None and doc_idx < len(active_columns):
@@ -1042,43 +1038,26 @@ class GLiNERDetector:
             else:
                 labels = self.taxonomy.get_inference_labels()
 
-            if not labels:
-                return doc_idx, None, [], True
+            doc_labels.append(labels if labels else None)
 
-            chunks = self.chunker.chunk_text(text, labels)
-            if not chunks:
-                return doc_idx, None, [], True
-
-            return doc_idx, labels, chunks, False
+        def _tick_progress() -> None:
+            if chunk_pbar:
+                chunk_pbar.update(1)
 
         try:
-            if workers > 1 and len(texts) >= min_texts:
-                max_workers = min(workers, (os.cpu_count() or workers))
-                with ThreadPoolExecutor(max_workers=max_workers) as ex:
-                    futures = [ex.submit(_chunk_one, i) for i in range(len(texts))]
-                    for fut in as_completed(futures):
-                        doc_idx, labels, chunks, is_empty = fut.result()
-                        if chunk_pbar:
-                            chunk_pbar.update(1)
+            chunk_lists = self.chunker.chunk_texts(
+                texts=texts,
+                labels_list=doc_labels,
+                progress_callback=_tick_progress if show_progress else None,
+            )
 
-                        if is_empty or labels is None:
-                            empty_docs.add(doc_idx)
-                            continue
-
-                        for chunk_info in chunks:
-                            all_chunks.append((doc_idx, chunk_info, labels))
-            else:
-                for idx in range(len(texts)):
-                    if chunk_pbar:
-                        chunk_pbar.update(1)
-
-                    doc_idx, labels, chunks, is_empty = _chunk_one(idx)
-                    if is_empty or labels is None:
-                        empty_docs.add(doc_idx)
-                        continue
-
-                    for chunk_info in chunks:
-                        all_chunks.append((doc_idx, chunk_info, labels))
+            for doc_idx, chunks in enumerate(chunk_lists):
+                labels = doc_labels[doc_idx]
+                if not labels or not chunks:
+                    empty_docs.add(doc_idx)
+                    continue
+                for chunk_info in chunks:
+                    all_chunks.append((doc_idx, chunk_info, labels))
         finally:
             if chunk_pbar:
                 chunk_pbar.close()
