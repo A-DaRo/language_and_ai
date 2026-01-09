@@ -6,10 +6,10 @@
 #SBATCH --partition=tue.gpu2.q
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=32
+#SBATCH --cpus-per-task=16
 #SBATCH --gpus-per-node=1
-#SBATCH --mem=256G
-#SBATCH --time=02:00:00
+#SBATCH --mem=220G
+#SBATCH --time=00:30:00
 #SBATCH --output=logs/phase_a_full_%j.out
 #SBATCH --error=logs/phase_a_full_%j.err
 
