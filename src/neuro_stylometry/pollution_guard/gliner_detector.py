@@ -1082,7 +1082,8 @@ class GLiNERDetector:
                 desc="GLiNER chunking",
                 unit="text",
                 dynamic_ncols=True,
-                leave=False,
+                position=0,
+                leave=True,
             )
 
         doc_labels: List[Optional[List[str]]] = []
