@@ -432,8 +432,8 @@ class TestWorkerScaling:
     """
     
     def test_worker_scaling(self, tokenizer, sample_texts_large, sample_labels):
-        """Measure throughput for 1, 2, 4, 8 workers."""
-        worker_counts = [16, 20, 24, 28, 32] if is_hpc_environment() else [1, 2, 4, 8]
+        """Measure throughput for 4, 8, 12, 16, 20, 24, 28, 32 workers."""
+        worker_counts = [4, 8, 12, 16, 20, 24, 28, 32] if is_hpc_environment() else [1, 2, 4, 8]
         results = {}
 
         # Baseline run with 1 worker to compute speedups and provide a stable baseline
@@ -504,6 +504,10 @@ class TestWorkerScaling:
         best_throughput = results[best_workers]["throughput"]
         print(f"NOTE: Best configuration on {get_environment_label()} is {best_workers} workers "
                 f"with {best_throughput:.1f} docs/s throughput")
+        # estimated chunking running time for 291,521 documents with best worker count
+        print(f"Estimated chunking time for 291,521 documents (SOBR dataset) with best worker count:")
+        estimated_time = 291521 / best_throughput
+        print(f"  {best_workers} workers: {estimated_time:.2f}s (~{estimated_time/60:.1f} minutes)")
 
 
 
