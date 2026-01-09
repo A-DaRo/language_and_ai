@@ -435,8 +435,32 @@ class TestWorkerScaling:
         """Measure throughput for 1, 2, 4, 8 workers."""
         worker_counts = [16, 20, 24, 28, 32] if is_hpc_environment() else [1, 2, 4, 8]
         results = {}
+
+        # Baseline run with 1 worker to compute speedups and provide a stable baseline
+        baseline_config = BudgetConfig(
+            parallel_chunking_workers=1,
+            parallel_chunking_min_texts=512,
+            parallel_chunking_min_cores=1,
+        )
+        baseline_chunker = SemanticChunker(
+            tokenizer=tokenizer,
+            config=baseline_config,
+            words_splitter_type="whitespace",
+        )
+        base_elapsed, base_chunks = chunk_with_timing(
+            baseline_chunker, sample_texts_medium, sample_labels, use_parallel=True
+        )
+        results[1] = {
+            "time": base_elapsed,
+            "throughput": len(sample_texts_medium) / base_elapsed,
+            "chunks": base_chunks,
+        }
         
         for num_workers in worker_counts:
+            if num_workers == 1:
+                # already measured baseline
+                continue
+
             config = BudgetConfig(
                 parallel_chunking_workers=num_workers,
                 parallel_chunking_min_texts=512,
@@ -476,9 +500,10 @@ class TestWorkerScaling:
         
         # Hardware-aware throughput check
         if is_hpc_environment():
-            # On HPC, more workers should help
-            assert results[8]["throughput"] > results[1]["throughput"], \
-                "8 workers should have higher throughput than 1 worker on HPC"
+            # On HPC, more workers should help: compare the smallest measured worker count > 1
+            min_worker = min(k for k in results.keys() if k > 1)
+            assert results[min_worker]["throughput"] > results[1]["throughput"], \
+                f"{min_worker} workers should have higher throughput than 1 worker on HPC"
         else:
             # On laptop, scaling may be limited or negative due to overhead
             # Just verify correctness, don't assert speedup
