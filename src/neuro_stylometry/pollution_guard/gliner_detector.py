@@ -24,7 +24,7 @@ Semantic Chunker Optimizations (v2.1):
   of individual documents, reducing IPC overhead (2-4x speedup on multi-core)
   Configure via BudgetConfig.parallel_chunking_workers, batch_size_per_worker
 
-Reference: GLiNER_Implementation_Strategy.md Sections 2.1-2.4
+Reference: GLiNER_ImpNementation_Strategy.md Sections 2.1-2.4
 Implements: FR-05 (GLiNER Integration), FR-06 (Chunking), FR-07 (Precision Filters)
 """
 
@@ -534,11 +534,16 @@ class GLiNERDetector:
         # Extract GLiNER's words_splitter for exact word counting (1:1 parity)
         words_splitter = self._get_words_splitter()
 
+        # Extract GLiNER words_splitter_type so multiprocessing workers can rebuild
+        # the same splitter without sharing the non-picklable instance.
+        words_splitter_type = self._get_words_splitter_type()
+
         # Initialize semantic chunker with injected words_splitter
         self.chunker = SemanticChunker(
             tokenizer=self.tokenizer,
             config=self.budget_config,
             words_splitter=words_splitter,
+            words_splitter_type=words_splitter_type,
         )
         
         # Bi-encoder prompt embedding cache
@@ -609,6 +614,23 @@ class GLiNERDetector:
         
         logger.debug(f"Extracted GLiNER words_splitter: {type(words_splitter).__name__}")
         return words_splitter
+
+    def _get_words_splitter_type(self) -> Optional[str]:
+        """Extract GLiNER's configured words_splitter_type (e.g., 'whitespace').
+
+        This is preferred over attempting to pickle/share the words_splitter instance
+        when using multiprocessing.
+        """
+        data_processor = getattr(self.model, "data_processor", None)
+        if data_processor is None:
+            return None
+
+        cfg = getattr(data_processor, "config", None)
+        if cfg is None:
+            return None
+
+        splitter_type = getattr(cfg, "words_splitter_type", None)
+        return str(splitter_type) if splitter_type is not None else None
 
     def _order_labels_by_taxonomy(self, labels: List[str]) -> List[str]:
         label_set = set(labels)

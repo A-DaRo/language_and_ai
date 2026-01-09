@@ -145,6 +145,7 @@ class SemanticChunker:
         config: Optional[BudgetConfig] = None,
         language: str = "en",
         words_splitter: Optional["TokenSplitterBase"] = None,
+        words_splitter_type: Optional[str] = None,
     ):
         """
         Initialize the semantic chunker.
@@ -165,9 +166,26 @@ class SemanticChunker:
         # clean=False preserves original whitespace and formatting
         self.segmenter = pysbd.Segmenter(language=language, clean=False)
 
-        # Store GLiNER's words_splitter for exact word counting
+        # Store (or reconstruct) GLiNER's words_splitter for exact word counting.
+        # IMPORTANT: In multiprocessing mode we cannot share the instance, so we pass the
+        # splitter TYPE (a small string) and reconstruct it per worker.
+        self._words_splitter_type = words_splitter_type
         self._words_splitter = words_splitter
-        if words_splitter is None:
+        if self._words_splitter is None and self._words_splitter_type:
+            try:
+                from gliner.data_processing.tokenizer import WordsSplitter
+
+                self._words_splitter = WordsSplitter(splitter_type=self._words_splitter_type)
+            except Exception as exc:
+                logger.warning(
+                    "Failed to initialize GLiNER WordsSplitter(splitter_type=%r); "
+                    "falling back to regex-based splitting: %s",
+                    self._words_splitter_type,
+                    exc,
+                )
+                self._words_splitter = None
+
+        if self._words_splitter is None:
             logger.warning(
                 "SemanticChunker initialized without GLiNER words_splitter. "
                 "Falling back to regex-based word splitting. Word counts may differ "
@@ -226,6 +244,7 @@ class SemanticChunker:
             texts=texts,
             labels_list=labels_list,
             tokenizer_name=tokenizer_name,
+            words_splitter_type=self._words_splitter_type,
             progress_callback=progress_callback,
         )
 
@@ -251,6 +270,7 @@ class SemanticChunker:
         texts: List[str],
         labels_list: List[Optional[List[str]]],
         tokenizer_name: str,
+        words_splitter_type: Optional[str],
         progress_callback: Optional[Callable[[], None]],
     ) -> List[List[ChunkInfo]]:
         """
@@ -273,10 +293,16 @@ class SemanticChunker:
         if max_workers <= 1:
             return self.chunk_texts(texts, labels_list, progress_callback=progress_callback)
 
-        if self._words_splitter is not None:
+        if self._words_splitter is not None and words_splitter_type:
+            logger.info(
+                "Parallel chunking initializes per-worker tokenizers and rebuilds "
+                "words_splitter from type=%r.",
+                words_splitter_type,
+            )
+        elif self._words_splitter is not None:
             logger.info(
                 "Parallel chunking initializes per-worker tokenizers; "
-                "words_splitter is not shared and falls back to regex splitting."
+                "words_splitter type is unknown, so workers fall back to regex splitting."
             )
 
         # Prevent nested parallelism in workers and keep config immutable.
@@ -312,7 +338,7 @@ class SemanticChunker:
             with ctx.Pool(
                 processes=max_workers,
                 initializer=_parallel_chunker_init,
-                initargs=(tokenizer_name, worker_config, self._language),
+                initargs=(tokenizer_name, worker_config, self._language, words_splitter_type),
             ) as pool:
                 # Process batches (not individual documents)
                 for batch_indices, batch_results in pool.imap_unordered(
@@ -962,10 +988,15 @@ def _parallel_chunker_init(
     tokenizer_name: str,
     config: BudgetConfig,
     language: str,
+    words_splitter_type: Optional[str],
 ) -> None:
     """Initializer for multiprocessing chunk workers."""
     global _PARALLEL_CHUNKER
     from transformers import AutoTokenizer
+
+    # Prevent nested internal tokenizer parallelism inside multiple processes.
+    # This avoids CPU oversubscription and makes timings more stable.
+    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
     try:
         tokenizer = AutoTokenizer.from_pretrained(
@@ -983,6 +1014,7 @@ def _parallel_chunker_init(
         config=config,
         language=language,
         words_splitter=None,
+        words_splitter_type=words_splitter_type,
     )
 
 
