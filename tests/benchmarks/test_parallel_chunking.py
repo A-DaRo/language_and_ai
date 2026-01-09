@@ -433,7 +433,7 @@ class TestWorkerScaling:
     
     def test_worker_scaling(self, tokenizer, sample_texts_medium, sample_labels):
         """Measure throughput for 1, 2, 4, 8 workers."""
-        worker_counts = [1, 2, 4, 8]
+        worker_counts = [16, 20, 24, 28, 32] if is_hpc_environment() else [1, 2, 4, 8]
         results = {}
         
         for num_workers in worker_counts:
