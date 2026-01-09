@@ -11,11 +11,14 @@ Key Features:
 - Offset tracking for global coordinate reconstruction
 - GLiNER WordsSplitter injection for 1:1 parity with model preprocessing
 
-Performance Optimizations (v2.0):
+Performance Optimizations (v2.1):
+- **Bisect Token Counting (Strategy C):** Replaces O(N) linear scan with O(log N)
+  binary search for token counting. Critical for performance parity with Rust tokenizers.
+  Expected speedup: 50-100x on token counting operations.
+
 - **"Tokenize Once" Optimization (Strategy B):** Document is tokenized once with
   offset_mapping, then sentence token counts are computed via offset lookups.
   Eliminates redundant tokenization (O(N sentences) → O(1) per document).
-  Expected speedup: 5-10x on single-threaded processing.
 
 - **Batched Parallel Processing (Strategy A):** Workers receive large batches of
   documents instead of individual documents, amortizing tokenizer initialization
@@ -27,6 +30,7 @@ Reference: GLiNER_Implementation_Strategy.md, Architectural Proposal for Semanti
 
 from __future__ import annotations
 
+import bisect
 import logging
 import multiprocessing as mp
 import os
@@ -201,15 +205,7 @@ class SemanticChunker:
         min_texts = int(self.config.parallel_chunking_min_texts or 0)
 
         if workers <= 1 or len(texts) < min_texts:
-            results: List[List[ChunkInfo]] = []
-            for text, labels in zip(texts, labels_list):
-                if progress_callback:
-                    progress_callback()
-                if not text or not text.strip() or not labels:
-                    results.append([])
-                    continue
-                results.append(self.chunk_text(text, labels))
-            return results
+            return self._chunk_texts_sequential(texts, labels_list, progress_callback)
 
         tokenizer_name = getattr(self.tokenizer, "name_or_path", None)
         if not tokenizer_name:
@@ -232,6 +228,23 @@ class SemanticChunker:
             tokenizer_name=tokenizer_name,
             progress_callback=progress_callback,
         )
+
+    def _chunk_texts_sequential(
+        self,
+        texts: List[str],
+        labels_list: List[Optional[List[str]]],
+        progress_callback: Optional[Callable[[], None]] = None,
+    ) -> List[List[ChunkInfo]]:
+        """Sequential chunking fallback for small datasets or when parallelism unavailable."""
+        results: List[List[ChunkInfo]] = []
+        for text, labels in zip(texts, labels_list):
+            if progress_callback:
+                progress_callback()
+            if not text or not text.strip() or not labels:
+                results.append([])
+                continue
+            results.append(self.chunk_text(text, labels))
+        return results
 
     def _chunk_texts_parallel(
         self,
@@ -314,14 +327,7 @@ class SemanticChunker:
             logger.warning(
                 "Parallel chunking failed; falling back to sequential chunking: %s", exc
             )
-            results = []
-            for text, labels in zip(texts, labels_list):
-                if progress_callback:
-                    progress_callback()
-                if not text or not text.strip() or not labels:
-                    results.append([])
-                    continue
-                results.append(self.chunk_text(text, labels))
+            return self._chunk_texts_sequential(texts, labels_list, progress_callback)
 
         return results
 
@@ -346,20 +352,25 @@ class SemanticChunker:
         """Count words using GLiNER-compatible splitting."""
         return len(self._split_words(text))
 
-    def _tokenize_with_offsets(self, text: str) -> Tuple[List[int], List[Tuple[int, int]]]:
+    def _tokenize_with_offsets(self, text: str) -> Tuple[List[int], List[int], List[int]]:
         """
-        Tokenize text once and return token IDs with character offset mapping.
+        Tokenize text once and return token lists optimized for binary search.
         
-        This enables efficient token counting for arbitrary text spans without
-        re-tokenization. Used by the "tokenize once" optimization.
+        Returns separate start/end lists instead of tuple pairs to enable O(log N)
+        binary search via bisect module. This is Strategy C optimization.
+        
+        NOTE: This intentionally tokenizes the full document (which may exceed
+        model max_length). We only use offsets for chunk boundary calculation;
+        the actual model input chunks are guaranteed to fit within budget.
         
         Args:
             text: Input text to tokenize.
             
         Returns:
-            Tuple of (token_ids, offset_mapping) where:
+            Tuple of (token_ids, token_starts, token_ends) where:
                 - token_ids: List of token IDs
-                - offset_mapping: List of (char_start, char_end) tuples aligned with tokens
+                - token_starts: List of character start positions (sorted, for bisect)
+                - token_ends: List of character end positions (sorted, for bisect)
         """
         try:
             encoding = self.tokenizer(
@@ -367,39 +378,66 @@ class SemanticChunker:
                 add_special_tokens=False,
                 return_offsets_mapping=True,
                 return_attention_mask=False,
+                truncation=False,  # Explicitly disable truncation - we want full document offsets
+                max_length=None,   # No length limit for offset mapping
             )
             token_ids = encoding["input_ids"]
             offset_mapping = encoding["offset_mapping"]
-            return token_ids, offset_mapping
+            
+            # Unzip offsets into separate lists for efficient bisect operations
+            if not offset_mapping:
+                return [], [], []
+            
+            token_starts = [offset[0] for offset in offset_mapping]
+            token_ends = [offset[1] for offset in offset_mapping]
+            return token_ids, token_starts, token_ends
+            
         except Exception as e:
             logger.warning(f"Failed to get offset mapping: {e}. Falling back to standard tokenization.")
             # Fallback: tokenize without offsets
-            token_ids = self.tokenizer.encode(text, add_special_tokens=False)
+            token_ids = self.tokenizer.encode(text, add_special_tokens=False, truncation=False)
             # Create dummy offsets (won't be accurate but allows code to continue)
-            dummy_offsets = [(0, 0) for _ in token_ids]
-            return token_ids, dummy_offsets
+            dummy_starts = [0] * len(token_ids)
+            dummy_ends = [0] * len(token_ids)
+            return token_ids, dummy_starts, dummy_ends
 
-    def _count_tokens_in_span(self, char_start: int, char_end: int, offset_mapping: List[Tuple[int, int]]) -> int:
+    def _count_tokens_in_span(
+        self,
+        char_start: int,
+        char_end: int,
+        token_starts: List[int],
+        token_ends: List[int],
+    ) -> int:
         """
-        Count how many tokens fall within a character span using binary search.
+        OPTIMIZED: Count tokens in span using O(log N) binary search (Strategy C).
         
-        This is the core of the "tokenize once" optimization: instead of re-tokenizing
-        every sentence, we tokenize the document once and query the offset mapping.
+        This replaces the O(N) linear scan that was causing performance regression.
+        Uses bisect module to find token boundaries in logarithmic time.
+        
+        A token overlaps with the span if:
+            token_start < char_end AND token_end > char_start
         
         Args:
             char_start: Start character position of the span.
             char_end: End character position of the span.
-            offset_mapping: List of (token_char_start, token_char_end) from tokenizer.
+            token_starts: Sorted list of token start positions.
+            token_ends: Sorted list of token end positions.
             
         Returns:
             Number of tokens that overlap with the character span.
         """
-        count = 0
-        for token_start, token_end in offset_mapping:
-            # Token overlaps with span if it has any character within [char_start, char_end)
-            if token_start < char_end and token_end > char_start:
-                count += 1
-        return count
+        if not token_starts:
+            return 0
+        
+        # Find first token that ends AFTER the span starts (token_end > char_start)
+        # bisect_right returns insertion point; elements to left are <= char_start
+        start_idx = bisect.bisect_right(token_ends, char_start)
+        
+        # Find first token that starts AT or AFTER the span ends (token_start >= char_end)
+        # bisect_left returns insertion point; elements to left are < char_end
+        end_idx = bisect.bisect_left(token_starts, char_end)
+        
+        return max(0, end_idx - start_idx)
 
     def calculate_exact_cost(self, text: str) -> Tuple[int, int, List[Tuple[str, int, int]]]:
         """
@@ -543,8 +581,8 @@ class SemanticChunker:
 
         budget = self.calculate_effective_budget(labels)
 
-        # Phase 1: Tokenize document ONCE with offset mapping
-        token_ids, offset_mapping = self._tokenize_with_offsets(text)
+        # Phase 1: Tokenize document ONCE with offset mapping (optimized for bisect)
+        token_ids, token_starts, token_ends = self._tokenize_with_offsets(text)
 
         # Phase 2: Semantic segmentation via PySBD
         sentences = self.segmenter.segment(text)
@@ -557,27 +595,28 @@ class SemanticChunker:
 
         # Phase 4: Dispatch to mode-specific chunking with pre-computed offsets
         if self.config.mode == "single_sentence":
-            return self._chunk_single_sentence_optimized(sentence_positions, budget, offset_mapping)
+            return self._chunk_single_sentence_optimized(sentence_positions, budget, token_starts, token_ends)
         else:
-            return self._chunk_accumulate_optimized(sentence_positions, budget, offset_mapping)
+            return self._chunk_accumulate_optimized(sentence_positions, budget, token_starts, token_ends)
 
     def _chunk_single_sentence_optimized(
         self,
         sentence_positions: List[Tuple[str, int, int]],
         budget: int,
-        offset_mapping: List[Tuple[int, int]],
+        token_starts: List[int],
+        token_ends: List[int],
     ) -> List[ChunkInfo]:
         """
-        OPTIMIZED single-sentence mode using pre-computed offset mapping.
+        OPTIMIZED single-sentence mode using binary search token counting.
         
-        Eliminates redundant tokenization by using the document-level offset mapping
-        to count tokens in each sentence span. This is 5-10x faster than the legacy
-        method that re-tokenizes every sentence.
+        Eliminates redundant tokenization by using O(log N) bisect operations
+        instead of O(N) linear scans or repeated tokenizer calls.
 
         Args:
             sentence_positions: List of (text, char_start, char_end) tuples.
             budget: Token budget per chunk.
-            offset_mapping: Pre-computed token offset mapping from document tokenization.
+            token_starts: Sorted list of token start positions for bisect.
+            token_ends: Sorted list of token end positions for bisect.
 
         Returns:
             List of ChunkInfo objects (one per sentence, or multiple if hard-split).
@@ -586,8 +625,8 @@ class SemanticChunker:
         word_limit = self.config.gliner_max_words
 
         for sent_text, char_start, char_end in sentence_positions:
-            # Count tokens using offset mapping (no re-tokenization!)
-            sent_token_count = self._count_tokens_in_span(char_start, char_end, offset_mapping)
+            # Count tokens using O(log N) bisect (Strategy C optimization)
+            sent_token_count = self._count_tokens_in_span(char_start, char_end, token_starts, token_ends)
             
             # Count words using GLiNER's splitter
             sent_word_count = self._count_words(sent_text)
@@ -629,19 +668,20 @@ class SemanticChunker:
         self,
         sentence_positions: List[Tuple[str, int, int]],
         budget: int,
-        offset_mapping: List[Tuple[int, int]],
+        token_starts: List[int],
+        token_ends: List[int],
     ) -> List[ChunkInfo]:
         """
-        OPTIMIZED accumulate mode using pre-computed offset mapping.
+        OPTIMIZED accumulate mode using binary search token counting.
         
-        Eliminates redundant tokenization by using the document-level offset mapping
-        to count tokens in each sentence span. This is 5-10x faster than the legacy
-        method that re-tokenizes every sentence.
+        Eliminates redundant tokenization by using O(log N) bisect operations
+        instead of O(N) linear scans or repeated tokenizer calls.
 
         Args:
             sentence_positions: List of (text, char_start, char_end) tuples.
             budget: Token budget per chunk.
-            offset_mapping: Pre-computed token offset mapping from document tokenization.
+            token_starts: Sorted list of token start positions for bisect.
+            token_ends: Sorted list of token end positions for bisect.
 
         Returns:
             List of ChunkInfo objects.
@@ -653,8 +693,8 @@ class SemanticChunker:
         word_limit = self.config.gliner_max_words
 
         for sent_text, char_start, char_end in sentence_positions:
-            # Count tokens using offset mapping (no re-tokenization!)
-            sent_token_count = self._count_tokens_in_span(char_start, char_end, offset_mapping)
+            # Count tokens using O(log N) bisect (Strategy C optimization)
+            sent_token_count = self._count_tokens_in_span(char_start, char_end, token_starts, token_ends)
             
             # Count words using GLiNER's splitter
             sent_word_count = self._count_words(sent_text)
