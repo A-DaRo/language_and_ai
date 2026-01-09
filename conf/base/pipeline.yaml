@@ -58,10 +58,13 @@ gliner:
     mode: "single_sentence"  # "single_sentence" | "accumulate"
     # legacy_sequential_mode bypasses all batch optimizations (debug only)
     legacy_sequential_mode: false
-    # Parallelize CPU-side chunking across documents (threads).
+    # Parallelize CPU-side chunking across documents (multiprocessing).
     # Default off; enable on large workloads to reduce wall-clock time.
     parallel_chunking_workers: 0
     parallel_chunking_min_texts: 512
+    # batch_size_per_worker: Documents per worker batch (0 = auto)
+    # Higher values reduce IPC overhead but increase per-worker memory
+    batch_size_per_worker: 0
 
 encoder:
   model: "roberta-base"
