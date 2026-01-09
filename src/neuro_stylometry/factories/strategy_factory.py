@@ -28,7 +28,7 @@ class StrategyFactory:
     
     @staticmethod
     def create_filter_strategy(
-        profile_type: Optional[ProfileType] = None,
+        profile_type: Optional[ProfileType | str] = None,
     ) -> PollutionFilterStrategy:
         """
         Create pollution filter strategy based on hardware profile.
@@ -43,6 +43,13 @@ class StrategyFactory:
             # Auto-detect hardware profile
             profile = HardwareDetector.detect()
             profile_type = profile.profile_type
+        elif isinstance(profile_type, str):
+            normalized = profile_type.lower()
+            if normalized not in {"hpc", "laptop"}:
+                raise ValueError(
+                    f"Unsupported profile_type '{profile_type}' (expected 'hpc'|'laptop')"
+                )
+            profile_type = ProfileType.HPC if normalized == "hpc" else ProfileType.LAPTOP
         
         logger.info(f"Creating filter strategy for profile: {profile_type.value}")
         

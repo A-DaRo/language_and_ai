@@ -9,7 +9,6 @@ All commands use the PhaseAPipeline facade with strict YAML configuration author
 import click
 from pathlib import Path
 import logging
-import sys
 
 # Configure logging
 logging.basicConfig(
@@ -74,7 +73,8 @@ def run_phase_a(dataset: Path, output_dir: Path, mode: str, config_path: Path | 
             logger.info(f"Auto-detected hardware mode: {mode}")
         
         # Create strategy based on mode
-        strategy = StrategyFactory.create_filter_strategy(mode)
+        profile_type = ProfileType.HPC if mode == "hpc" else ProfileType.LAPTOP
+        strategy = StrategyFactory.create_filter_strategy(profile_type)
         
         # Load configuration from YAML (strict authority)
         config = load_pipeline_config(
