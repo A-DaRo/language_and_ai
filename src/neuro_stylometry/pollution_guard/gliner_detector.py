@@ -615,22 +615,26 @@ class GLiNERDetector:
         logger.debug(f"Extracted GLiNER words_splitter: {type(words_splitter).__name__}")
         return words_splitter
 
-    def _get_words_splitter_type(self) -> Optional[str]:
+    def _get_words_splitter_type(self) -> str:
         """Extract GLiNER's configured words_splitter_type (e.g., 'whitespace').
 
         This is preferred over attempting to pickle/share the words_splitter instance
         when using multiprocessing.
+        
+        Returns:
+            The splitter type string, defaulting to 'whitespace' if not found.
+            Most GLiNER models use whitespace splitting, so this is a safe default.
         """
         data_processor = getattr(self.model, "data_processor", None)
         if data_processor is None:
-            return None
+            return "whitespace"
 
         cfg = getattr(data_processor, "config", None)
         if cfg is None:
-            return None
+            return "whitespace"
 
         splitter_type = getattr(cfg, "words_splitter_type", None)
-        return str(splitter_type) if splitter_type is not None else None
+        return str(splitter_type) if splitter_type is not None else "whitespace"
 
     def _order_labels_by_taxonomy(self, labels: List[str]) -> List[str]:
         label_set = set(labels)

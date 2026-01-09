@@ -61,7 +61,9 @@ gliner:
     # Parallelize CPU-side chunking across documents (multiprocessing).
     # Default off; enable on large workloads to reduce wall-clock time.
     parallel_chunking_workers: 0
-    parallel_chunking_min_texts: 512
+    parallel_chunking_min_texts: 5000
+    # minimum cores to enable parallel chunking
+    parallel_chunking_min_cores: 16
     # batch_size_per_worker: Documents per worker batch (0 = auto)
     # Higher values reduce IPC overhead but increase per-worker memory
     batch_size_per_worker: 0

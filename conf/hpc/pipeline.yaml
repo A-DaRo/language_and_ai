@@ -87,7 +87,6 @@ gliner:
     mode: "single_sentence"
     legacy_sequential_mode: false
     parallel_chunking_workers: 16
-    parallel_chunking_min_texts: 256
     # Batched parallel processing: send large batches per worker
     # 0 = auto-compute (total_docs // num_workers)
     batch_size_per_worker: 0

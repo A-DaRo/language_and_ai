@@ -181,7 +181,7 @@ class PhaseAPipeline:
             mode=chunking_cfg.get("mode", "single_sentence"),
             legacy_sequential_mode=chunking_cfg.get("legacy_sequential_mode", False),
             parallel_chunking_workers=int(chunking_cfg.get("parallel_chunking_workers", 0)),
-            parallel_chunking_min_texts=int(chunking_cfg.get("parallel_chunking_min_texts", 512)),
+            parallel_chunking_min_texts=int(chunking_cfg.get("parallel_chunking_min_texts", 5000)),
             batch_size_per_worker=int(chunking_cfg.get("batch_size_per_worker", 0)),
             # Word-aware budget constraints (GLiNER truncates at WORDS, not tokens)
             gliner_max_words=int(gliner_cfg.get("gliner_max_words", 512)),

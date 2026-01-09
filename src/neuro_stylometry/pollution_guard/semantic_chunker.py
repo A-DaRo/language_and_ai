@@ -102,10 +102,17 @@ class BudgetConfig:
     legacy_sequential_mode: bool = False
 
     # Optional parallelism for document-level chunking (GLiNERDetector drives this).
-    # Note: chunking is CPU-bound; threads can still help because fast tokenizers
-    # may release the GIL and because we parallelize across documents.
+    # Note: Parallelism is DISABLED by default (workers=0) because the optimized
+    # sequential chunking (bisect + tokenize-once) is so fast that multiprocessing
+    # startup overhead outweighs benefits for datasets < 5000 documents or
+    # machines with < 16 cores. Enable only for HPC environments.
     parallel_chunking_workers: int = 0
-    parallel_chunking_min_texts: int = 512
+    parallel_chunking_min_texts: int = 5000  # Raised from 512 to avoid overhead penalty
+    
+    # Minimum CPU cores required for parallel chunking to be beneficial.
+    # On machines with fewer cores, the startup overhead and context switching
+    # negate any speedup gains from parallelism.
+    parallel_chunking_min_cores: int = 16
     
     # Batched parallel processing parameters (Optimization Strategy A)
     # batch_size_per_worker: Number of documents to send per worker in one batch.
@@ -221,8 +228,34 @@ class SemanticChunker:
 
         workers = int(self.config.parallel_chunking_workers or 0)
         min_texts = int(self.config.parallel_chunking_min_texts or 0)
+        min_cores = int(self.config.parallel_chunking_min_cores or 16)
 
-        if workers <= 1 or len(texts) < min_texts:
+        # === HARDWARE & VOLUME GATE ===
+        # Parallel chunking is only beneficial when:
+        # 1. Parallelism is explicitly requested (workers > 1)
+        # 2. Dataset is large enough (>= min_texts) to amortize startup overhead
+        # 3. System has enough cores (>= min_cores) to benefit from parallelism
+        #
+        # On small datasets or low-core machines, the optimized sequential chunking
+        # (bisect + tokenize-once) outperforms parallel due to spawn/IPC overhead.
+        available_cores = os.cpu_count() or 1
+        
+        if workers <= 1:
+            return self._chunk_texts_sequential(texts, labels_list, progress_callback)
+        
+        if len(texts) < min_texts:
+            logger.info(
+                f"Dataset size ({len(texts)}) below parallel threshold ({min_texts}); "
+                "using optimized sequential mode."
+            )
+            return self._chunk_texts_sequential(texts, labels_list, progress_callback)
+        
+        if available_cores < min_cores:
+            logger.info(
+                f"Available cores ({available_cores}) below HPC threshold ({min_cores}); "
+                "using optimized sequential mode. Parallel chunking is reserved for "
+                "HPC environments with >= 16 cores."
+            )
             return self._chunk_texts_sequential(texts, labels_list, progress_callback)
 
         tokenizer_name = getattr(self.tokenizer, "name_or_path", None)
