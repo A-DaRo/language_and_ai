@@ -341,9 +341,24 @@ class SemanticChunker:
                 initargs=(tokenizer_name, worker_config, self._language, words_splitter_type),
             ) as pool:
                 # Process batches (not individual documents)
-                for batch_indices, batch_results in pool.imap_unordered(
-                    _parallel_chunk_batch_task, batches
-                ):
+                batch_iter = pool.imap_unordered(_parallel_chunk_batch_task, batches)
+                
+                # Add progress bar tracking batch completion (not individual documents)
+                if progress_callback:
+                    # Use tqdm to track batches being processed by workers
+                    from tqdm.auto import tqdm
+                    batch_desc = f"Chunking batches ({max_workers} workers)"
+                    batch_iter = tqdm(
+                        batch_iter,
+                        total=len(batches),
+                        desc=batch_desc,
+                        unit="batch",
+                        dynamic_ncols=True,
+                        position=0,
+                        leave=True,
+                    )
+                
+                for batch_indices, batch_results in batch_iter:
                     # Flatten batch results back into original document order
                     for idx, chunks in zip(batch_indices, batch_results):
                         results[idx] = chunks
@@ -1003,6 +1018,7 @@ def _parallel_chunker_init(
             tokenizer_name,
             use_fast=True,
             local_files_only=True,
+            legacy=True,
         )
     except Exception as exc:
         raise RuntimeError(

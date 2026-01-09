@@ -85,7 +85,7 @@ class FrozenEmbedder(nn.Module):
         
         # Load tokenizer and model
         logger.info(f"Loading frozen embedder: {model_name}")
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name, legacy=True)
         self.model = AutoModel.from_pretrained(model_name)
         
         # Register special tokens if provided (Section 5.1 requirement)
