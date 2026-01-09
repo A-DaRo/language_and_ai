@@ -21,8 +21,9 @@ import json
 import pandas as pd
 
 from .base import PollutionFilterStrategy
-from ..gliner_detector import GLiNERDetector
+from ..gliner_detector import GLiNERDetector, BatchInferenceConfig
 from ..masker import SpanMasker
+from ..semantic_chunker import BudgetConfig
 from ..explicit_recall import compute_explicit_recall
 from ..embedder import FrozenEmbedder
 from ..leace import LEACEComputer
@@ -134,6 +135,26 @@ class LaptopFilterStrategy(PollutionFilterStrategy):
         # Step 2: GLiNER detection + masking
         logger.info("Step 1/3: Pollution Detection & Masking")
         taxonomy_config, constraints_config = self._load_taxonomy_config(config)
+        gliner_cfg = config.get("gliner", {})
+        batch_inference_cfg = gliner_cfg.get("batch_inference", {})
+        batch_config = BatchInferenceConfig(
+            enable_batching=batch_inference_cfg.get("enable_batching", True),
+            batch_size=int(self._cfg_get(config, "gliner.batch_size")),
+            num_buckets=batch_inference_cfg.get("num_buckets"),
+            min_bucket_size=batch_inference_cfg.get("min_bucket_size", 4),
+            enable_prompt_caching=batch_inference_cfg.get("enable_prompt_caching", True),
+        )
+        chunking_cfg = gliner_cfg.get("chunking", {})
+        budget_config = BudgetConfig(
+            model_max_length=int(self._cfg_get(config, "encoder.max_length")),
+            mode=chunking_cfg.get("mode", "single_sentence"),
+            legacy_sequential_mode=chunking_cfg.get("legacy_sequential_mode", False),
+            parallel_chunking_workers=int(chunking_cfg.get("parallel_chunking_workers", 0)),
+            parallel_chunking_min_texts=int(chunking_cfg.get("parallel_chunking_min_texts", 512)),
+            gliner_max_words=int(gliner_cfg.get("gliner_max_words", 512)),
+            tokens_per_word_ratio=float(gliner_cfg.get("tokens_per_word_ratio", 1.3)),
+        )
+        require_bi_encoder = bool(gliner_cfg.get("require_bi_encoder", False))
         gliner = GLiNERDetector(
             model_name=str(self._cfg_get(config, "gliner.model")),
             device=device,
@@ -141,6 +162,9 @@ class LaptopFilterStrategy(PollutionFilterStrategy):
             confidence_threshold=float(self._cfg_get(config, "gliner.confidence_threshold")),
             taxonomy_config=taxonomy_config,
             constraints_config=constraints_config,
+            budget_config=budget_config,
+            batch_inference_config=batch_config,
+            require_bi_encoder=require_bi_encoder,
         )
         
         # Detect spans

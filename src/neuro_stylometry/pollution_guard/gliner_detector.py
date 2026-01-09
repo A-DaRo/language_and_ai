@@ -508,23 +508,22 @@ class GLiNERDetector:
 
         self.taxonomy = taxonomy or SOBRTaxonomy()
         self.constraints = constraints or EntityWidthConstraints()
+        self._taxonomy_label_order = self.taxonomy.get_inference_labels()
+        self._taxonomy_label_set = set(self._taxonomy_label_order)
 
         # Budget configuration for semantic chunker
         self.budget_config = budget_config or BudgetConfig(model_max_length=max_length)
         
         # Batch inference configuration
         self.batch_config = batch_inference_config or BatchInferenceConfig()
-        
-        # Auto-compute bucket count if not specified
-        if self.batch_config.num_buckets is None:
-            gpu_vram = None
-            if torch.cuda.is_available():
-                gpu_vram = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
-            self.batch_config.num_buckets = auto_compute_bucket_count(gpu_vram)
-            logger.info(f"Auto-computed bucket count: {self.batch_config.num_buckets} (VRAM: {gpu_vram:.1f}GB)" if gpu_vram else f"Auto-computed bucket count: {self.batch_config.num_buckets} (CPU mode)")
+        auto_bucket_count = self.batch_config.num_buckets is None
 
         # Load GLiNER model
         self.model = self._load_model(model_name)
+
+        # Auto-compute bucket count if not specified (after device fallback is resolved)
+        if auto_bucket_count:
+            self._configure_auto_bucket_count()
         
         # Sync GLiNER processor max_len with our configured max_length
         self._sync_processor_max_len()
@@ -543,7 +542,7 @@ class GLiNERDetector:
         )
         
         # Bi-encoder prompt embedding cache
-        # Key: tuple(sorted(labels)), Value: precomputed embeddings tensor
+        # Key: tuple(labels), Value: precomputed embeddings tensor
         self._prompt_embedding_cache: Dict[Tuple[str, ...], torch.Tensor] = {}
         self._is_bi_encoder = self._check_bi_encoder_support()
         
@@ -610,6 +609,39 @@ class GLiNERDetector:
         
         logger.debug(f"Extracted GLiNER words_splitter: {type(words_splitter).__name__}")
         return words_splitter
+
+    def _order_labels_by_taxonomy(self, labels: List[str]) -> List[str]:
+        label_set = set(labels)
+        ordered = [label for label in self._taxonomy_label_order if label in label_set]
+        ordered.extend([label for label in labels if label not in self._taxonomy_label_set])
+        return ordered
+
+    def _get_device_vram_gb(self) -> float:
+        """Get VRAM in GB for the active device (0.0 for CPU)."""
+        if self.device.type != "cuda":
+            return 0.0
+        if not torch.cuda.is_available():
+            return 0.0
+        try:
+            device_index = self.device.index if self.device.index is not None else 0
+            vram_bytes = torch.cuda.get_device_properties(device_index).total_memory
+            return vram_bytes / (1024 ** 3)
+        except Exception as e:
+            logger.debug(f"Failed to read CUDA device properties: {e}")
+            return 0.0
+
+    def _configure_auto_bucket_count(self) -> None:
+        vram_gb = self._get_device_vram_gb()
+        self.batch_config.num_buckets = auto_compute_bucket_count(vram_gb)
+        if vram_gb:
+            logger.info(
+                f"Auto-computed bucket count: {self.batch_config.num_buckets} "
+                f"(VRAM: {vram_gb:.1f}GB)"
+            )
+        else:
+            logger.info(
+                f"Auto-computed bucket count: {self.batch_config.num_buckets} (CPU mode)"
+            )
     
     def _get_cached_prompt_embeddings(self, labels: List[str]) -> Optional[torch.Tensor]:
         """
@@ -624,7 +656,7 @@ class GLiNERDetector:
         if not self._is_bi_encoder or not self.batch_config.enable_prompt_caching:
             return None
             
-        cache_key = tuple(sorted(labels))
+        cache_key = tuple(labels)
         
         if cache_key in self._prompt_embedding_cache:
             return self._prompt_embedding_cache[cache_key]
@@ -914,8 +946,8 @@ class GLiNERDetector:
                 - start: Character start offset
                 - end: Character end offset
         """
-        # Use legacy sequential mode if configured
-        if self.budget_config.legacy_sequential_mode:
+        # Use legacy sequential mode if configured or batching is disabled
+        if self.budget_config.legacy_sequential_mode or not self.batch_config.enable_batching:
             return self._detect_spans_sequential(
                 texts, active_columns, batch_size, show_progress
             )
@@ -1075,20 +1107,33 @@ class GLiNERDetector:
             return [[] for _ in texts]
         
         # Step 2: Group chunks by label set (for batch inference with same labels)
-        label_groups: Dict[Tuple[str, ...], List[Tuple[int, int, ChunkInfo]]] = {}
+        label_groups: Dict[
+            Tuple[str, ...],
+            Dict[str, Any],
+        ] = {}
         for chunk_idx, (doc_idx, chunk_info, labels) in enumerate(all_chunks):
-            label_key = tuple(sorted(labels))
-            if label_key not in label_groups:
-                label_groups[label_key] = []
-            label_groups[label_key].append((chunk_idx, doc_idx, chunk_info))
+            ordered_labels = self._order_labels_by_taxonomy(labels)
+            label_key = tuple(sorted(ordered_labels))
+            group = label_groups.get(label_key)
+            if group is None:
+                label_groups[label_key] = {
+                    "labels": ordered_labels,
+                    "chunks": [],
+                }
+                group = label_groups[label_key]
+            elif group["labels"] != ordered_labels:
+                logger.debug(
+                    "Label order mismatch within label group; using taxonomy order"
+                )
+            group["chunks"].append((chunk_idx, doc_idx, chunk_info))
         
         # Step 3: Process each label group with length bucketing
         # Results indexed by chunk_idx
         chunk_results: Dict[int, List[Dict[str, Any]]] = {}
         
         total_batches = sum(
-            (len(chunks) + effective_batch_size - 1) // effective_batch_size
-            for chunks in label_groups.values()
+            (len(group["chunks"]) + effective_batch_size - 1) // effective_batch_size
+            for group in label_groups.values()
         )
 
         total_chunks = len(all_chunks)
@@ -1113,11 +1158,12 @@ class GLiNERDetector:
             )
         
         try:
-            for label_key, group_chunks in label_groups.items():
-                labels = list(label_key)
+            for group in label_groups.values():
+                labels = list(group["labels"])
+                group_chunks = group["chunks"]
                 
                 # Get cached prompt embeddings if available (bi-encoder only)
-                cache_key = tuple(sorted(labels))
+                cache_key = tuple(labels)
                 cache_hit_before = cache_key in self._prompt_embedding_cache
                 prompt_embeddings = self._get_cached_prompt_embeddings(labels)
                 cache_hit = bool(cache_hit_before and prompt_embeddings is not None)
@@ -1127,13 +1173,24 @@ class GLiNERDetector:
                 chunk_lengths = self._batched_token_lengths(chunk_texts)
                 
                 # Create length buckets
-                num_buckets = min(self.batch_config.num_buckets, len(group_chunks))
+                min_bucket_size = max(1, int(self.batch_config.min_bucket_size))
+                num_buckets_config = self.batch_config.num_buckets or 1
+                max_buckets_by_size = max(1, len(group_chunks) // min_bucket_size)
+                num_buckets = min(
+                    num_buckets_config,
+                    len(group_chunks),
+                    max_buckets_by_size,
+                )
                 if num_buckets < 2:
                     # Too few chunks for bucketing, process directly
                     bucket_to_indices = {0: list(range(len(group_chunks)))}
                 else:
                     _, bucket_to_indices = compute_chunk_length_buckets(
                         chunk_lengths, num_buckets
+                    )
+                    bucket_to_indices = self._merge_small_buckets(
+                        bucket_to_indices,
+                        min_bucket_size,
                     )
                 
                 # Process each bucket
@@ -1239,6 +1296,7 @@ class GLiNERDetector:
             inference_kwargs["labels_embeddings"] = prompt_embeddings
         
         # Run batched inference via GLiNER.inference()
+        inference_kwargs = self._filter_inference_kwargs(inference_kwargs)
         try:
             all_entities = self.model.inference(
                 texts,
@@ -1246,14 +1304,19 @@ class GLiNERDetector:
                 **inference_kwargs,
             )
         except TypeError as e:
-            # Fallback if inference() doesn't accept certain kwargs
-            logger.debug(f"Batch inference kwargs rejected, using minimal args: {e}")
-            all_entities = self.model.inference(
-                texts,
-                labels,
-                flat_ner=True,
-                threshold=self.confidence_threshold,
-            )
+            if self._is_kwarg_typeerror(e):
+                # Fallback if inference() doesn't accept certain kwargs
+                logger.debug(
+                    f"Batch inference kwargs rejected, using minimal args: {e}"
+                )
+                all_entities = self.model.inference(
+                    texts,
+                    labels,
+                    flat_ner=True,
+                    threshold=self.confidence_threshold,
+                )
+            else:
+                raise
         
         # Post-process: filter distractors and apply width constraints
         processed_results: List[List[Dict[str, Any]]] = []
@@ -1355,6 +1418,37 @@ class GLiNERDetector:
             show_progress=show_progress,
         )
 
+    def _merge_small_buckets(
+        self,
+        bucket_to_indices: Dict[int, List[int]],
+        min_bucket_size: int,
+    ) -> Dict[int, List[int]]:
+        if min_bucket_size <= 1 or len(bucket_to_indices) <= 1:
+            return bucket_to_indices
+
+        merged: List[List[int]] = []
+        pending: List[int] = []
+
+        for bucket_id in sorted(bucket_to_indices.keys()):
+            indices = bucket_to_indices[bucket_id]
+            if not indices:
+                continue
+            if pending:
+                indices = pending + indices
+                pending = []
+            if len(indices) < min_bucket_size:
+                pending = indices
+                continue
+            merged.append(indices)
+
+        if pending:
+            if merged:
+                merged[-1].extend(pending)
+            else:
+                merged.append(pending)
+
+        return {idx: items for idx, items in enumerate(merged)}
+
     def get_effective_budget(self) -> int:
         """
         Get the current effective text budget.
@@ -1396,13 +1490,31 @@ class GLiNERDetector:
         self.batch_config = config
         # Re-compute bucket count if set to auto
         if config.num_buckets is None:
-            gpu_vram = None
-            if torch.cuda.is_available():
-                gpu_vram = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
-            self.batch_config.num_buckets = auto_compute_bucket_count(gpu_vram)
+            self._configure_auto_bucket_count()
         logger.info(f"Updated batch config: batch_size={config.batch_size}, "
                    f"buckets={self.batch_config.num_buckets}, "
                    f"batching={'enabled' if config.enable_batching else 'disabled'}")
+
+    def _filter_inference_kwargs(self, inference_kwargs: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            sig = inspect.signature(self.model.inference)
+        except (TypeError, ValueError):
+            return inference_kwargs
+
+        for param in sig.parameters.values():
+            if param.kind == param.VAR_KEYWORD:
+                return inference_kwargs
+
+        allowed = set(sig.parameters.keys())
+        return {k: v for k, v in inference_kwargs.items() if k in allowed}
+
+    @staticmethod
+    def _is_kwarg_typeerror(error: TypeError) -> bool:
+        message = str(error).lower()
+        return (
+            "unexpected keyword argument" in message
+            or "multiple values for keyword argument" in message
+        )
     
     @property
     def is_bi_encoder(self) -> bool:
