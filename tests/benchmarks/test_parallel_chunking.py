@@ -431,7 +431,7 @@ class TestWorkerScaling:
     that optimal scaling depends heavily on hardware capabilities.
     """
     
-    def test_worker_scaling(self, tokenizer, sample_texts_medium, sample_labels):
+    def test_worker_scaling(self, tokenizer, sample_texts_large, sample_labels):
         """Measure throughput for 1, 2, 4, 8 workers."""
         worker_counts = [16, 20, 24, 28, 32] if is_hpc_environment() else [1, 2, 4, 8]
         results = {}
@@ -448,11 +448,11 @@ class TestWorkerScaling:
             words_splitter_type="whitespace",
         )
         base_elapsed, base_chunks = chunk_with_timing(
-            baseline_chunker, sample_texts_medium, sample_labels, use_parallel=True
+            baseline_chunker, sample_texts_large, sample_labels, use_parallel=True
         )
         results[1] = {
             "time": base_elapsed,
-            "throughput": len(sample_texts_medium) / base_elapsed,
+            "throughput": len(sample_texts_large) / base_elapsed,
             "chunks": base_chunks,
         }
         
@@ -473,10 +473,10 @@ class TestWorkerScaling:
             )
             
             elapsed, total_chunks = chunk_with_timing(
-                chunker, sample_texts_medium, sample_labels, use_parallel=True
+                chunker, sample_texts_large, sample_labels, use_parallel=True
             )
             
-            throughput = len(sample_texts_medium) / elapsed
+            throughput = len(sample_texts_large) / elapsed
             results[num_workers] = {
                 "time": elapsed,
                 "throughput": throughput,
