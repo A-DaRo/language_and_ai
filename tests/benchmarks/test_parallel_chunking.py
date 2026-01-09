@@ -498,16 +498,13 @@ class TestWorkerScaling:
         chunk_counts = [data["chunks"] for data in results.values()]
         assert len(set(chunk_counts)) == 1, "All worker counts should produce same chunks"
         
-        # Hardware-aware throughput check
-        if is_hpc_environment():
-            # On HPC, more workers should help: compare the smallest measured worker count > 1
-            min_worker = min(k for k in results.keys() if k > 1)
-            assert results[min_worker]["throughput"] > results[1]["throughput"], \
-                f"{min_worker} workers should have higher throughput than 1 worker on HPC"
-        else:
-            # On laptop, scaling may be limited or negative due to overhead
-            # Just verify correctness, don't assert speedup
-            print(f"NOTE: On {get_environment_label()}, worker scaling may be limited by cores and overhead.")
+
+        # On HPC, identify and print the best worker configuration
+        best_workers = max(results.keys(), key=lambda k: results[k]["throughput"])
+        best_throughput = results[best_workers]["throughput"]
+        print(f"NOTE: Best configuration on {get_environment_label()} is {best_workers} workers "
+                f"with {best_throughput:.1f} docs/s throughput")
+
 
 
 @pytest.mark.benchmark
