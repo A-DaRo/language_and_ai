@@ -6,10 +6,10 @@
 #SBATCH --partition=tue.gpu2.q
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=16
+#SBATCH --cpus-per-task=32
 #SBATCH --gpus-per-node=1
-#SBATCH --mem=220G
-#SBATCH --time=00:30:00
+#SBATCH --mem=256G
+#SBATCH --time=02:00:00
 #SBATCH --output=logs/phase_a_full_%j.out
 #SBATCH --error=logs/phase_a_full_%j.err
 
@@ -21,7 +21,7 @@ module load cuda/12.1
 module load cudnn/8.9.7
 
 # Activate virtual environment (adjust if different)
-source /home/$USER/venvs/neuro_stylometry/bin/activate
+source /home/$USER/venvs/langai/bin/activate
 
 # Resolve repo root from script location
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -34,10 +34,6 @@ CONFIG_PATH="${CONFIG_PATH:-${REPO_ROOT}/conf/experiments/my_experiment.yaml}"
 
 # GPU pinning (optional)
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
-NUMA_NODE=""
-if command -v nvidia-smi >/dev/null 2>&1; then
-  NUMA_NODE="$(nvidia-smi topo -m | grep GPU0 | awk '{print $NF}' | head -1 || true)"
-fi
 
 # Build optional config arg if file exists
 CONFIG_ARG=()
@@ -55,20 +51,11 @@ else
 fi
 
 # Run Phase A via CLI (HPC strategy)
-if command -v numactl >/dev/null 2>&1 && [[ -n "${NUMA_NODE}" ]]; then
-  numactl --cpunodebind="${NUMA_NODE}" --membind="${NUMA_NODE}" \
-    python -m neuro_stylometry run-phase-a \
-      --dataset "${DATASET_PATH}" \
-      --output-dir "${OUTPUT_DIR}" \
-      --mode hpc \
-      "${CONFIG_ARG[@]}"
-else
-  python -m neuro_stylometry run-phase-a \
-    --dataset "${DATASET_PATH}" \
-    --output-dir "${OUTPUT_DIR}" \
-    --mode hpc \
-    "${CONFIG_ARG[@]}"
-fi
+python -m neuro_stylometry run-phase-a \
+  --dataset "${DATASET_PATH}" \
+  --output-dir "${OUTPUT_DIR}" \
+  --mode hpc \
+  "${CONFIG_ARG[@]}"
 
 # Validate handover artifacts
 python scripts/validate_phase_a_handover.py "${OUTPUT_DIR}"

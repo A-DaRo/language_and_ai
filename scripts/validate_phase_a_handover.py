@@ -39,7 +39,7 @@ def validate_handover(output_dir: Path) -> bool:
     all_passed = True
     
     # Check 1: clean_dataset.arrow exists
-    clean_dataset_path = output_dir / "clean_dataset.arrow"
+    clean_dataset_path = output_dir / "sobr.arrow"
     if not clean_dataset_path.exists():
         logger.error(f"✗ Clean dataset not found: {clean_dataset_path}")
         all_passed = False
