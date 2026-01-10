@@ -1157,15 +1157,64 @@ class GLiNERDetector:
         # Step 3: Process each label group with length bucketing
         # Results indexed by chunk_idx
         chunk_results: Dict[int, List[Dict[str, Any]]] = {}
-        
-        total_batches = sum(
-            (len(group["chunks"]) + effective_batch_size - 1) // effective_batch_size
-            for group in label_groups.values()
-        )
 
         total_chunks = len(all_chunks)
         total_label_groups = len(label_groups)
-        
+
+        bucket_plans: List[Dict[str, Any]] = []
+        for group in label_groups.values():
+            labels = list(group["labels"])
+            group_chunks = group["chunks"]
+
+            # Get cached prompt embeddings if available (bi-encoder only)
+            cache_key = tuple(labels)
+            cache_hit_before = cache_key in self._prompt_embedding_cache
+            prompt_embeddings = self._get_cached_prompt_embeddings(labels)
+            cache_hit = bool(cache_hit_before and prompt_embeddings is not None)
+
+            # Compute chunk lengths for bucketing
+            chunk_texts = [c[2].text for c in group_chunks]
+            chunk_lengths = self._batched_token_lengths(chunk_texts)
+
+            # Create length buckets
+            min_bucket_size = max(1, int(self.batch_config.min_bucket_size))
+            num_buckets_config = self.batch_config.num_buckets or 1
+            max_buckets_by_size = max(1, len(group_chunks) // min_bucket_size)
+            num_buckets = min(
+                num_buckets_config,
+                len(group_chunks),
+                max_buckets_by_size,
+            )
+            if num_buckets < 2:
+                # Too few chunks for bucketing, process directly
+                bucket_to_indices = {0: list(range(len(group_chunks)))}
+            else:
+                _, bucket_to_indices = compute_chunk_length_buckets(
+                    chunk_lengths, num_buckets
+                )
+                bucket_to_indices = self._merge_small_buckets(
+                    bucket_to_indices,
+                    min_bucket_size,
+                )
+
+            bucket_plans.append(
+                {
+                    "labels": labels,
+                    "group_chunks": group_chunks,
+                    "chunk_texts": chunk_texts,
+                    "chunk_lengths": chunk_lengths,
+                    "bucket_to_indices": bucket_to_indices,
+                    "prompt_embeddings": prompt_embeddings,
+                    "cache_hit": cache_hit,
+                }
+            )
+
+        total_batches = sum(
+            (len(bucket_indices) + effective_batch_size - 1) // effective_batch_size
+            for plan in bucket_plans
+            for bucket_indices in plan["bucket_to_indices"].values()
+        )
+
         pbar = None
         if show_progress:
             pbar = tqdm(
@@ -1183,43 +1232,17 @@ class GLiNERDetector:
                 },
                 refresh=True,
             )
-        
+
         try:
-            for group in label_groups.values():
-                labels = list(group["labels"])
-                group_chunks = group["chunks"]
-                
-                # Get cached prompt embeddings if available (bi-encoder only)
-                cache_key = tuple(labels)
-                cache_hit_before = cache_key in self._prompt_embedding_cache
-                prompt_embeddings = self._get_cached_prompt_embeddings(labels)
-                cache_hit = bool(cache_hit_before and prompt_embeddings is not None)
-                
-                # Compute chunk lengths for bucketing
-                chunk_texts = [c[2].text for c in group_chunks]
-                chunk_lengths = self._batched_token_lengths(chunk_texts)
-                
-                # Create length buckets
-                min_bucket_size = max(1, int(self.batch_config.min_bucket_size))
-                num_buckets_config = self.batch_config.num_buckets or 1
-                max_buckets_by_size = max(1, len(group_chunks) // min_bucket_size)
-                num_buckets = min(
-                    num_buckets_config,
-                    len(group_chunks),
-                    max_buckets_by_size,
-                )
-                if num_buckets < 2:
-                    # Too few chunks for bucketing, process directly
-                    bucket_to_indices = {0: list(range(len(group_chunks)))}
-                else:
-                    _, bucket_to_indices = compute_chunk_length_buckets(
-                        chunk_lengths, num_buckets
-                    )
-                    bucket_to_indices = self._merge_small_buckets(
-                        bucket_to_indices,
-                        min_bucket_size,
-                    )
-                
+            for plan in bucket_plans:
+                labels = plan["labels"]
+                group_chunks = plan["group_chunks"]
+                chunk_texts = plan["chunk_texts"]
+                chunk_lengths = plan["chunk_lengths"]
+                bucket_to_indices = plan["bucket_to_indices"]
+                prompt_embeddings = plan["prompt_embeddings"]
+                cache_hit = plan["cache_hit"]
+
                 # Process each bucket
                 for bucket_indices in bucket_to_indices.values():
                     if not bucket_indices:
@@ -1236,29 +1259,29 @@ class GLiNERDetector:
                             },
                             refresh=False,
                         )
-                    
+
                     # Sort by length within bucket for optimal padding
                     sorted_indices = sorted(
                         bucket_indices,
-                        key=lambda i: chunk_lengths[i]
+                        key=lambda i: chunk_lengths[i],
                     )
-                    
+
                     # Process in batches
                     for batch_start in range(0, len(sorted_indices), effective_batch_size):
                         batch_indices = sorted_indices[batch_start:batch_start + effective_batch_size]
                         batch_texts = [chunk_texts[i] for i in batch_indices]
-                        
+
                         # Run batched inference
                         batch_entities = self._detect_batch(
                             batch_texts, labels, prompt_embeddings
                         )
-                        
+
                         # Store results with original indices
                         for local_idx, entities in enumerate(batch_entities):
                             group_idx = batch_indices[local_idx]
                             chunk_idx = group_chunks[group_idx][0]  # Original chunk index
                             chunk_results[chunk_idx] = entities
-                        
+
                         if pbar:
                             pbar.update(1)
         finally:

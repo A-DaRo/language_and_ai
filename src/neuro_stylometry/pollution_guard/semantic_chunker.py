@@ -36,6 +36,7 @@ import multiprocessing as mp
 import os
 import re
 import threading
+import time
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Callable, List, Literal, Tuple, Optional, Any
 
@@ -47,6 +48,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _PARALLEL_CHUNKER: Optional["SemanticChunker"] = None
+_PARALLEL_PROGRESS_COUNTER: Optional[Any] = None
 
 
 @dataclass
@@ -367,11 +369,47 @@ class SemanticChunker:
         results: List[List[ChunkInfo]] = [[] for _ in texts]
 
         ctx = mp.get_context("spawn")
+        progress_counter = None
+        progress_done = threading.Event()
+        progress_thread = None
+        if progress_callback:
+            progress_counter = ctx.Value("i", 0)
+
+            def _progress_monitor() -> None:
+                last_count = 0
+                while not progress_done.is_set():
+                    with progress_counter.get_lock():
+                        current = progress_counter.value
+                    delta = current - last_count
+                    if delta > 0:
+                        for _ in range(delta):
+                            progress_callback()
+                        last_count = current
+                    time.sleep(0.1)
+                with progress_counter.get_lock():
+                    current = progress_counter.value
+                delta = current - last_count
+                if delta > 0:
+                    for _ in range(delta):
+                        progress_callback()
+
+            progress_thread = threading.Thread(
+                target=_progress_monitor,
+                name="chunk-progress-monitor",
+                daemon=True,
+            )
+            progress_thread.start()
         try:
             with ctx.Pool(
                 processes=max_workers,
                 initializer=_parallel_chunker_init,
-                initargs=(tokenizer_name, worker_config, self._language, words_splitter_type),
+                initargs=(
+                    tokenizer_name,
+                    worker_config,
+                    self._language,
+                    words_splitter_type,
+                    progress_counter,
+                ),
             ) as pool:
                 # Process batches (not individual documents)
                 # Note: Progress callback is called per document to maintain document-level
@@ -382,13 +420,17 @@ class SemanticChunker:
                     # Flatten batch results back into original document order
                     for idx, chunks in zip(batch_indices, batch_results):
                         results[idx] = chunks
-                        if progress_callback:
+                        if progress_callback and progress_counter is None:
                             progress_callback()
         except Exception as exc:
             logger.warning(
                 "Parallel chunking failed; falling back to sequential chunking: %s", exc
             )
             return self._chunk_texts_sequential(texts, labels_list, progress_callback)
+        finally:
+            progress_done.set()
+            if progress_thread is not None:
+                progress_thread.join(timeout=1.0)
 
         return results
 
@@ -1024,9 +1066,10 @@ def _parallel_chunker_init(
     config: BudgetConfig,
     language: str,
     words_splitter_type: Optional[str],
+    progress_counter: Optional[Any],
 ) -> None:
     """Initializer for multiprocessing chunk workers."""
-    global _PARALLEL_CHUNKER
+    global _PARALLEL_CHUNKER, _PARALLEL_PROGRESS_COUNTER
     from transformers import AutoTokenizer
 
     # Prevent nested internal tokenizer parallelism inside multiple processes.
@@ -1052,6 +1095,7 @@ def _parallel_chunker_init(
         words_splitter=None,
         words_splitter_type=words_splitter_type,
     )
+    _PARALLEL_PROGRESS_COUNTER = progress_counter
 
 
 def _parallel_chunk_batch_task(
@@ -1084,6 +1128,9 @@ def _parallel_chunk_batch_task(
             results.append([])
         else:
             results.append(_PARALLEL_CHUNKER.chunk_text(text, labels))
+        if _PARALLEL_PROGRESS_COUNTER is not None:
+            with _PARALLEL_PROGRESS_COUNTER.get_lock():
+                _PARALLEL_PROGRESS_COUNTER.value += 1
     
     return indices, results
 
