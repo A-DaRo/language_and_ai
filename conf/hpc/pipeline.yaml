@@ -79,7 +79,7 @@ precision:
   use_grad_scaler: false
 
 gliner:
-  model: "knowledgator/gliner-bi-base-v1.0"
+  model: "knowledgator/gliner-bi-large-v2.0"
   batch_size: 128                  # Larger batch size for Stage 2 (global-sorted)
   device: "cuda"
   require_bi_encoder: true         # Enforce bi-encoder for label embedding caching
@@ -119,7 +119,7 @@ gliner:
     shard_size: 50000              # Large shards for HPC memory
 
 encoder:
-  model: "sentence-transformers/all-MiniLM-L6-v2"
+  model: "princeton-nlp/sup-simcse-roberta-base"
   device: "cuda"
   output_device: "cuda"            # Keep on GPU for HPC (fast LEACE accumulation)
   batch_size: 512                  # Large batch for embedding
