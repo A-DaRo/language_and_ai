@@ -38,6 +38,8 @@ from neuro_stylometry.pollution_guard.global_sort import (
     compute_padding_stats,
 )
 
+from neuro_stylometry.data_engine.chunking_validation import find_invalid_post_chunked_indices
+
 
 class TestChunkStruct:
     """Tests for CHUNK_STRUCT schema definition."""
@@ -361,3 +363,55 @@ class TestComputePaddingStats:
         assert "efficiency_gain" in stats
         # With batch_size=3, all chunks in one batch, ratios should be equal
         assert stats["unsorted_padding_ratio"] == pytest.approx(stats["sorted_padding_ratio"])
+
+
+class TestChunkingResumeValidation:
+    def test_valid_when_whitespace_reflowed(self):
+        posts = ["Hello\nworld", "  "]
+        post_chunked = pa.array(
+            [
+                [
+                    {
+                        "text": "Hello world",
+                        "start": 0,
+                        "end": 11,
+                        "token_count": 2,
+                        "is_hard_split": False,
+                    }
+                ],
+                [],
+            ],
+            type=pa.list_(CHUNK_STRUCT),
+        )
+
+        invalid = find_invalid_post_chunked_indices(posts=posts, post_chunked_column=post_chunked)
+        assert invalid == []
+
+    def test_invalid_on_non_whitespace_gap(self):
+        posts = ["HelloXworld"]
+        post_chunked = pa.array(
+            [
+                [
+                    {"text": "Hello", "start": 0, "end": 5, "token_count": 1, "is_hard_split": False},
+                    {"text": "world", "start": 6, "end": 11, "token_count": 1, "is_hard_split": False},
+                ]
+            ],
+            type=pa.list_(CHUNK_STRUCT),
+        )
+
+        invalid = find_invalid_post_chunked_indices(posts=posts, post_chunked_column=post_chunked)
+        assert invalid == [0]
+
+    def test_invalid_on_content_mismatch(self):
+        posts = ["Hello world"]
+        post_chunked = pa.array(
+            [
+                [
+                    {"text": "Hello wurld", "start": 0, "end": 11, "token_count": 2, "is_hard_split": False},
+                ]
+            ],
+            type=pa.list_(CHUNK_STRUCT),
+        )
+
+        invalid = find_invalid_post_chunked_indices(posts=posts, post_chunked_column=post_chunked)
+        assert invalid == [0]

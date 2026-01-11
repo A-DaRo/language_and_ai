@@ -120,12 +120,14 @@ class TestSOBRDatasetMigration:
 
         with tempfile.NamedTemporaryFile(suffix=".arrow", delete=False) as f:
             feather.write_feather(table_with_chunks, f.name)
-            dataset = SOBRDataset(Path(f.name))
+            tmp_path = Path(f.name)
 
-            # Column exists and has at least one non-null value
-            assert dataset.has_post_chunked()
+        dataset = SOBRDataset(tmp_path, memory_map=False)
 
-            Path(f.name).unlink(missing_ok=True)
+        # Column exists and has at least one non-null value
+        assert dataset.has_post_chunked()
+
+        tmp_path.unlink(missing_ok=True)
 
     def test_strict_schema_rejects_extra_columns(self, minimal_sobr_table):
         """strict_schema=True rejects tables with extra columns."""
@@ -137,12 +139,13 @@ class TestSOBRDatasetMigration:
 
         with tempfile.NamedTemporaryFile(suffix=".arrow", delete=False) as f:
             feather.write_feather(extra_table, f.name)
+            tmp_path = Path(f.name)
 
-            # strict_schema=True should reject
-            with pytest.raises(ValueError, match="unexpected_column"):
-                SOBRDataset(Path(f.name), strict_schema=True)
+        # strict_schema=True should reject
+        with pytest.raises(ValueError, match="unexpected_column"):
+            SOBRDataset(tmp_path, strict_schema=True, memory_map=False)
 
-            Path(f.name).unlink(missing_ok=True)
+        tmp_path.unlink(missing_ok=True)
 
     def test_flexible_schema_accepts_post_chunked(self, minimal_sobr_table):
         """Flexible schema (default) accepts post_chunked column."""
@@ -152,12 +155,13 @@ class TestSOBRDatasetMigration:
 
         with tempfile.NamedTemporaryFile(suffix=".arrow", delete=False) as f:
             feather.write_feather(table_with_chunks, f.name)
+            tmp_path = Path(f.name)
 
-            # Default (flexible) should accept
-            dataset = SOBRDataset(Path(f.name))
-            assert has_post_chunked_column(dataset.table)
+        # Default (flexible) should accept
+        dataset = SOBRDataset(tmp_path, memory_map=False)
+        assert has_post_chunked_column(dataset.table)
 
-            Path(f.name).unlink(missing_ok=True)
+        tmp_path.unlink(missing_ok=True)
 
 
 class TestLoadArrowDataset:

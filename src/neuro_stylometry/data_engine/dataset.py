@@ -44,6 +44,7 @@ class SOBRDataset:
         split_ratios: Tuple[float, float, float] = (0.8, 0.1, 0.1),
         seed: int = 42,
         strict_schema: bool = False,
+        memory_map: bool = True,
     ):
         """
         Initialize dataset from Arrow file.
@@ -64,6 +65,7 @@ class SOBRDataset:
         self.arrow_path = Path(arrow_path)
         self.split_ratios = split_ratios
         self.seed = seed
+        self.memory_map = bool(memory_map)
 
         # Load and validate (flexible by default to support staged execution)
         self.table = self._load_with_mmap()
@@ -89,7 +91,7 @@ class SOBRDataset:
         """
         table = feather.read_table(
             self.arrow_path,
-            memory_map=True  # Critical: enables zero-copy access
+            memory_map=self.memory_map
         )
         return table
 

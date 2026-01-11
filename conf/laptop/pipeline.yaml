@@ -10,7 +10,25 @@ defaults:
 # Conservative settings for limited VRAM and development/debugging.
 # Most advanced optimizations disabled to reduce complexity and memory usage.
 # ---------------------------------------------------------------------------
-execution:
+execution:  # ---------------------------------------------------------------------------
+  # Self-Optimizing Runtime (Autotuning)
+  # ---------------------------------------------------------------------------
+  # Adaptive token-budget batching with feedback loop.
+  # Conservative settings for laptop GPUs (8-16GB VRAM).
+  # ---------------------------------------------------------------------------
+  autotuning:
+    enabled: true
+    warmup_batches: 10             # Batches before adjusting budget
+    initial_token_budget: 8192     # Conservative start (~64 * 128 tokens)
+    min_token_budget: 2048         # Minimum budget (safety floor)
+    max_token_budget: 65536        # Max budget for 8-16GB VRAM
+    memory_headroom_mb: 1024       # Keep 1GB free for safety
+    scale_up_factor: 1.15          # 15% increase (cautious scaling)
+    scale_down_factor: 0.80        # 20% decrease when throttling
+    oom_slash_factor: 0.4          # 60% reduction after OOM (aggressive)
+    stability_threshold: 0.15      # 15% variance = stable (more tolerant)
+    history_window: 8              # Smaller window for faster response
+    recovery_patience: 3           # Quick recovery on laptop
   # CUDA graphs: DISABLED for laptop (limited VRAM, dynamic shapes during dev)
   enable_cuda_graphs: false
   cuda_graph_warmup: 3

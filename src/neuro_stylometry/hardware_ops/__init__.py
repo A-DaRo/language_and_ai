@@ -2,8 +2,8 @@
 Hardware Operations module - Hardware-aware execution.
 
 Provides hardware detection, CUDA graph caching, torch.compile integration,
-sequence packing, GPU span filtering, and async prefetching for optimized
-inference across laptop and HPC environments.
+sequence packing, GPU span filtering, async prefetching, and self-optimizing
+runtime for optimized inference across laptop and HPC environments.
 """
 
 from .detection import HardwareDetector, HardwareProfile, ProfileType
@@ -32,6 +32,32 @@ from .async_prefetch import (
     SyncPrefetchPipeline,
     create_prefetch_config_from_dict,
     create_prefetch_pipeline,
+)
+from .runtime import (
+    RuntimeController,
+    RuntimeConfig,
+    RuntimeMetrics,
+    RuntimeState,
+    RuntimeSnapshot,
+    get_gpu_memory_stats,
+)
+from .oom_guard import (
+    OOMEvent,
+    OOMRecoveryError,
+    execute_with_oom_protection,
+    oom_guarded_context,
+    oom_protected,
+    is_cuda_oom,
+    clear_cuda_cache,
+)
+from .telemetry import (
+    CUDATimer,
+    TelemetryCollector,
+    TelemetrySummary,
+    BatchMetrics,
+    timed_cuda_block,
+    cuda_timed_section,
+    create_runtime_metrics,
 )
 
 __all__ = [
@@ -62,4 +88,27 @@ __all__ = [
     "SyncPrefetchPipeline",
     "create_prefetch_config_from_dict",
     "create_prefetch_pipeline",
+    # Runtime Controller (Self-Optimizing)
+    "RuntimeController",
+    "RuntimeConfig",
+    "RuntimeMetrics",
+    "RuntimeState",
+    "RuntimeSnapshot",
+    "get_gpu_memory_stats",
+    # OOM Protection
+    "OOMEvent",
+    "OOMRecoveryError",
+    "execute_with_oom_protection",
+    "oom_guarded_context",
+    "oom_protected",
+    "is_cuda_oom",
+    "clear_cuda_cache",
+    # Telemetry
+    "CUDATimer",
+    "TelemetryCollector",
+    "TelemetrySummary",
+    "BatchMetrics",
+    "timed_cuda_block",
+    "cuda_timed_section",
+    "create_runtime_metrics",
 ]

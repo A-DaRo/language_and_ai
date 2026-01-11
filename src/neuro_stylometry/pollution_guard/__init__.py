@@ -2,6 +2,12 @@
 Pollution Guard Module.
 
 Exports pollution detection and mitigation components.
+
+Autotuning Integration (v2.2):
+- Both LaptopFilterStrategy and HPCFilterStrategy use RuntimeController
+- DynamicBatchIterator for adaptive token-budget batching
+- OOM protection with automatic retry and budget slashing
+- Configure via execution.autotuning section in pipeline YAML
 """
 
 from .gliner_detector import (
@@ -27,6 +33,16 @@ from .probe import LinearProbe, compute_amnesic_drop
 from .strategies.base import PollutionFilterStrategy
 from .strategies.laptop import LaptopFilterStrategy
 from .strategies.hpc import HPCFilterStrategy
+
+# Global sort utilities with autotuning support
+from .global_sort import (
+    FlattenedChunks,
+    flatten_chunks,
+    gather_results,
+    create_sorted_batches,
+    DynamicBatchIterator,
+    create_dynamic_batches,
+)
 
 __all__ = [
     # GLiNER Detection
@@ -56,4 +72,11 @@ __all__ = [
     "PollutionFilterStrategy",
     "LaptopFilterStrategy",
     "HPCFilterStrategy",
+    # Global Sort & Autotuning
+    "FlattenedChunks",
+    "flatten_chunks",
+    "gather_results",
+    "create_sorted_batches",
+    "DynamicBatchIterator",
+    "create_dynamic_batches",
 ]

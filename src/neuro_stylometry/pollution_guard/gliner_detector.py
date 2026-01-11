@@ -24,6 +24,12 @@ Semantic Chunker Optimizations (v2.1):
   of individual documents, reducing IPC overhead (2-4x speedup on multi-core)
   Configure via BudgetConfig.parallel_chunking_workers, batch_size_per_worker
 
+Autotuning Integration (v2.2):
+- RuntimeController feedback loop for adaptive token budget
+- DynamicBatchIterator for variable-size batches
+- OOM protection with automatic retry and budget slashing
+- Telemetry collection for monitoring throughput and memory
+
 Reference: GLiNER_ImpNementation_Strategy.md Sections 2.1-2.4
 Implements: FR-05 (GLiNER Integration), FR-06 (Chunking), FR-07 (Precision Filters)
 """
@@ -36,7 +42,7 @@ import pickle
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple, TYPE_CHECKING
 
 import numpy as np
 import pyarrow as pa
@@ -51,6 +57,9 @@ from .semantic_chunker import (
     deduplicate_entities,
     project_entity_offsets,
 )
+
+if TYPE_CHECKING:
+    from ..hardware_ops.runtime import RuntimeController, RuntimeMetrics
 
 logger = logging.getLogger(__name__)
 
@@ -1657,32 +1666,36 @@ class GLiNERDetector:
         cached_label_embeddings: Optional[torch.Tensor] = None,
         pin_memory: bool = False,
         show_progress: bool = True,
+        runtime_controller: Optional["RuntimeController"] = None,
     ) -> List[List[Dict[str, Any]]]:
         """
         Run inference from pre-computed chunks (Stage 2 of staged execution).
         
-        Implements global sorting for optimal batching:
+        Implements global sorting for optimal batching with optional autotuning:
         1. Flatten: Extract all chunks from nested Arrow column.
         2. Sort: Global argsort by token_count minimizes padding.
-        3. Batch: Create optimal batches from sorted chunks.
-        4. Infer: Run GPU inference on sorted batches.
+        3. Batch: Create optimal batches (dynamic if runtime_controller provided).
+        4. Infer: Run GPU inference with OOM protection (if controller provided).
         5. Gather: Reconstruct per-document results.
         
         Args:
             post_chunked_column: Arrow ListArray from table["post_chunked"].
                 Must be typed as list<struct<text, start, end, token_count, is_hard_split>>.
             labels: Inference labels. If None, uses full taxonomy.
-            batch_size: Batch size for inference. If None, uses config default.
+            batch_size: Fallback batch size. Ignored if runtime_controller provided.
             cached_label_embeddings: Pre-computed label embeddings from strategy.
                 Hoisted to strategy level for bi-encoder efficiency.
             pin_memory: Pin tensors for async GPU transfer (HPC mode).
             show_progress: Show progress bar.
+            runtime_controller: Optional RuntimeController for autotuning.
+                If provided, uses DynamicBatchIterator with adaptive token budgets
+                and OOM protection. If None, uses fixed batch_size batching.
             
         Returns:
             List of entity lists per document (nested, document-order).
         """
         import pyarrow as pa
-        from .global_sort import flatten_chunks, gather_results, create_sorted_batches
+        from .global_sort import flatten_chunks, gather_results, create_sorted_batches, DynamicBatchIterator
 
         # Guardrail: Stage 2 requires fully-populated post_chunked (no NULLs).
         try:
@@ -1723,11 +1736,22 @@ class GLiNERDetector:
         sort_indices = flattened.compute_sort_indices()
         sorted_texts = flattened.get_sorted_texts()
         
-        # Step 3: Create optimal batches
-        logger.info(f"Stage 2.3: Creating batches (batch_size={effective_batch_size})")
-        batches = create_sorted_batches(flattened, effective_batch_size)
+        # Step 3: Create batches (dynamic or fixed)
+        use_autotuning = runtime_controller is not None
         
-        logger.info(f"Created {len(batches)} batches for {flattened.num_chunks} chunks")
+        if use_autotuning:
+            logger.info("Stage 2.3: Using DynamicBatchIterator with RuntimeController")
+            batch_iterator = DynamicBatchIterator(
+                flattened=flattened,
+                controller=runtime_controller,
+                min_batch_size=1,
+                max_batch_size=effective_batch_size * 4,  # Upper bound
+            )
+        else:
+            logger.info(f"Stage 2.3: Creating fixed batches (batch_size={effective_batch_size})")
+            batches = create_sorted_batches(flattened, effective_batch_size)
+            batch_iterator = iter(batches)
+            logger.info(f"Created {len(batches)} batches for {flattened.num_chunks} chunks")
         
         # Step 4: Run inference on sorted batches
         # Pre-allocate results in sorted order
@@ -1743,16 +1767,60 @@ class GLiNERDetector:
                 leave=True,
             )
         
+        # Import OOM protection if using autotuning
+        if use_autotuning:
+            from ..hardware_ops.oom_guard import execute_with_oom_protection, OOMRecoveryError
+            from ..hardware_ops.runtime import RuntimeMetrics
+            from ..hardware_ops.telemetry import CUDATimer
+        
         try:
-            for batch_indices in batches:
+            for batch_indices in batch_iterator:
                 batch_texts = [flattened.texts[i] for i in batch_indices]
+                batch_tokens = sum(int(flattened.token_counts[i]) for i in batch_indices)
                 
-                # Run batched inference
-                batch_entities = self._detect_batch(
-                    batch_texts,
-                    inference_labels,
-                    prompt_embeddings,
-                )
+                if use_autotuning:
+                    # Run batched inference with OOM protection and timing
+                    with CUDATimer() as timer:
+                        try:
+                            batch_entities = execute_with_oom_protection(
+                                lambda bt=batch_texts: self._detect_batch(
+                                    bt,
+                                    inference_labels,
+                                    prompt_embeddings,
+                                ),
+                                controller=runtime_controller,
+                                retry_limit=3,
+                            )
+                        except OOMRecoveryError:
+                            logger.error(
+                                f"OOM recovery failed for batch of {len(batch_indices)} chunks; skipping"
+                            )
+                            # Store empty results for this batch
+                            for flat_idx in batch_indices:
+                                flat_results_sorted[flat_idx] = []
+                            if pbar is not None:
+                                pbar.update(len(batch_indices))
+                            continue
+                    
+                    # Report metrics to controller for feedback loop
+                    memory_mb = (
+                        torch.cuda.memory_allocated() / (1024 ** 2)
+                        if torch.cuda.is_available()
+                        else 0.0
+                    )
+                    runtime_controller.report_metrics(RuntimeMetrics(
+                        tokens_processed=batch_tokens,
+                        batch_time_ms=timer.elapsed_ms,
+                        memory_used_mb=memory_mb,
+                        batch_size=len(batch_indices),
+                    ))
+                else:
+                    # Run batched inference without autotuning
+                    batch_entities = self._detect_batch(
+                        batch_texts,
+                        inference_labels,
+                        prompt_embeddings,
+                    )
                 
                 # Store results at their sorted positions
                 for local_idx, entities in enumerate(batch_entities):
@@ -1765,6 +1833,15 @@ class GLiNERDetector:
         finally:
             if pbar is not None:
                 pbar.close()
+        
+        # Log autotuning summary if used
+        if use_autotuning:
+            snapshot = runtime_controller.get_snapshot()
+            logger.info(
+                f"Autotuning summary: state={snapshot.state}, "
+                f"final_budget={snapshot.current_budget:,}, "
+                f"oom_count={snapshot.oom_count}"
+            )
         
         # Step 5: Gather results back to document order
         logger.info("Stage 2.5: Gathering results to document order")

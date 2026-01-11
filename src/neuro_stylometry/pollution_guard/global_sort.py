@@ -5,6 +5,7 @@ Implements the Scatter-Gather pattern for globally-sorted inference:
 - Flatten: Convert nested post_chunked column to flat array with lineage tracking.
 - Sort: Global argsort by token_count for minimal padding batches.
 - Gather: Reconstruct per-document results after inference.
+- DynamicBatchIterator: Adaptive batching with RuntimeController feedback.
 
 Reference: Technical Report Section 3 (The "Global Sort" Inference Engine)
 
@@ -12,16 +13,20 @@ Key Optimizations:
 - Zero-copy token_count extraction via PyArrow child arrays.
 - Vectorized argsort via NumPy (cache-friendly for millions of chunks).
 - Efficient offset-based reconstruction using ListArray.offsets.
+- Dynamic token budget adjustment via RuntimeController for optimal GPU utilization.
 """
 
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Generator, List, Optional, Tuple, TYPE_CHECKING
 
 import numpy as np
 import pyarrow as pa
+
+if TYPE_CHECKING:
+    from ..hardware_ops.runtime import RuntimeController
 
 logger = logging.getLogger(__name__)
 
@@ -394,3 +399,172 @@ def compute_padding_stats(flattened: FlattenedChunks, batch_size: int) -> Dict[s
         "sorted_padding_ratio": sorted_ratio,
         "efficiency_gain": efficiency_gain,
     }
+
+
+# ---------------------------------------------------------------------------
+# Dynamic Batch Iterator (RuntimeController Integration)
+# ---------------------------------------------------------------------------
+
+
+class DynamicBatchIterator:
+    """
+    Adaptive batch iterator that queries RuntimeController for token budget.
+    
+    Unlike create_sorted_batches() which pre-computes fixed-size batches,
+    DynamicBatchIterator queries the controller for each batch, allowing
+    the budget to change dynamically based on:
+    - GPU memory pressure
+    - Throughput measurements
+    - OOM recovery
+    
+    This enables the controller's feedback loop to optimize batch sizes
+    in real-time.
+    
+    Usage:
+        controller = RuntimeController.from_config(config)
+        flattened = flatten_chunks(post_chunked_column)
+        
+        for batch_indices in DynamicBatchIterator(flattened, controller):
+            batch_texts = [flattened.texts[i] for i in batch_indices]
+            results = model(batch_texts)
+            
+            # Report metrics for feedback
+            controller.report_metrics(RuntimeMetrics(...))
+    
+    Attributes:
+        flattened: FlattenedChunks with sorted data.
+        controller: RuntimeController for budget queries.
+        fallback_batch_size: Batch size when controller unavailable.
+        min_batch_size: Never return fewer indices than this.
+    """
+    
+    def __init__(
+        self,
+        flattened: FlattenedChunks,
+        controller: Optional["RuntimeController"] = None,
+        fallback_batch_size: int = 128,
+        min_batch_size: int = 1,
+        max_batch_size: int = 2048,
+    ):
+        """
+        Initialize the dynamic batch iterator.
+        
+        Args:
+            flattened: FlattenedChunks with token counts and sort indices.
+            controller: RuntimeController for dynamic budget. If None,
+                uses fallback_batch_size.
+            fallback_batch_size: Batch size when controller is unavailable.
+            min_batch_size: Minimum sequences per batch.
+            max_batch_size: Maximum sequences per batch (safety cap).
+        """
+        self.flattened = flattened
+        self.controller = controller
+        self.fallback_batch_size = fallback_batch_size
+        self.min_batch_size = min_batch_size
+        self.max_batch_size = max_batch_size
+        
+        # Pre-compute sort indices
+        self._sort_indices = flattened.compute_sort_indices()
+        self._sorted_lengths = flattened.token_counts[self._sort_indices]
+        self._total_chunks = flattened.num_chunks
+        self._position = 0
+    
+    def __iter__(self) -> Generator[List[int], None, None]:
+        """Iterate over batches with dynamic sizing."""
+        self._position = 0
+        
+        while self._position < self._total_chunks:
+            # Query controller for current token budget
+            if self.controller is not None:
+                token_budget = self.controller.get_next_budget()
+            else:
+                # No controller: use fallback as token budget
+                # Estimate average tokens per sequence
+                avg_tokens = max(1, int(self._sorted_lengths.mean()))
+                token_budget = self.fallback_batch_size * avg_tokens
+            
+            # Build batch up to token budget
+            batch_indices = self._build_batch_to_budget(token_budget)
+            
+            if batch_indices:
+                yield batch_indices
+    
+    def _build_batch_to_budget(self, token_budget: int) -> List[int]:
+        """
+        Build a batch of indices fitting within the token budget.
+        
+        Args:
+            token_budget: Maximum total tokens for this batch.
+            
+        Returns:
+            List of sorted chunk indices for this batch.
+        """
+        batch_indices: List[int] = []
+        current_tokens = 0
+        
+        while self._position < self._total_chunks:
+            chunk_idx = int(self._sort_indices[self._position])
+            chunk_tokens = int(self._sorted_lengths[self._position])
+            
+            # Would this chunk exceed budget?
+            if current_tokens + chunk_tokens > token_budget and batch_indices:
+                # Batch full, stop here
+                break
+            
+            batch_indices.append(chunk_idx)
+            current_tokens += chunk_tokens
+            self._position += 1
+            
+            # Enforce max batch size
+            if len(batch_indices) >= self.max_batch_size:
+                break
+        
+        # Enforce min batch size (for very large chunks)
+        if len(batch_indices) < self.min_batch_size and self._position < self._total_chunks:
+            # Add more until min_batch_size
+            while len(batch_indices) < self.min_batch_size and self._position < self._total_chunks:
+                chunk_idx = int(self._sort_indices[self._position])
+                batch_indices.append(chunk_idx)
+                self._position += 1
+        
+        return batch_indices
+    
+    def reset(self) -> None:
+        """Reset iterator to beginning."""
+        self._position = 0
+    
+    @property
+    def progress(self) -> float:
+        """Current progress as fraction [0, 1]."""
+        if self._total_chunks == 0:
+            return 1.0
+        return self._position / self._total_chunks
+    
+    @property
+    def remaining_chunks(self) -> int:
+        """Number of chunks not yet yielded."""
+        return self._total_chunks - self._position
+
+
+def create_dynamic_batches(
+    flattened: FlattenedChunks,
+    controller: Optional["RuntimeController"] = None,
+    fallback_batch_size: int = 128,
+) -> Generator[List[int], None, None]:
+    """
+    Convenience function for dynamic batch iteration.
+    
+    Args:
+        flattened: FlattenedChunks with token counts.
+        controller: Optional RuntimeController for budget.
+        fallback_batch_size: Batch size when controller unavailable.
+        
+    Yields:
+        Lists of chunk indices for each batch.
+    """
+    iterator = DynamicBatchIterator(
+        flattened=flattened,
+        controller=controller,
+        fallback_batch_size=fallback_batch_size,
+    )
+    yield from iterator

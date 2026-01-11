@@ -112,9 +112,21 @@ def validate_schema(table: pa.Table, expected_schema: pa.Schema) -> bool:
     
     # Check column count
     if len(actual_schema) != len(expected_schema):
+        expected_names = [f.name for f in expected_schema]
+        actual_names = [f.name for f in actual_schema]
+        missing = [n for n in expected_names if n not in actual_names]
+        extra = [n for n in actual_names if n not in expected_names]
+
+        details = []
+        if missing:
+            details.append(f"missing={missing}")
+        if extra:
+            details.append(f"extra={extra}")
+
+        suffix = f" ({', '.join(details)})" if details else ""
         raise ValueError(
             f"Schema mismatch: Expected {len(expected_schema)} columns, "
-            f"got {len(actual_schema)}"
+            f"got {len(actual_schema)}{suffix}"
         )
     
     # Check column names and types
