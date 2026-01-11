@@ -68,18 +68,29 @@ class LinearProbe:
         valid_mask = y != -1
         X = X[valid_mask]
         y = y[valid_mask]
-        
-        if len(np.unique(y)) < 2:
+
+        unique_labels = np.unique(y)
+        if len(unique_labels) < 2:
             logger.warning("Less than 2 unique labels, cannot train probe")
+            # Create a dummy classifier that always predicts the single label
+            self.classifier = LogisticRegression(
+                max_iter=self.max_iter,
+                random_state=self.random_state,
+            )
+            # Fit on duplicated data to create a valid classifier
+            if len(unique_labels) == 1:
+                X_dummy = np.vstack([X[:1], X[:1]])
+                y_dummy = np.array([unique_labels[0], unique_labels[0]])
+                self.classifier.fit(X_dummy, y_dummy)
             return 0.0
-        
+
         # Train logistic regression
         self.classifier = LogisticRegression(
             max_iter=self.max_iter,
             random_state=self.random_state,
-            multi_class='multinomial' if len(np.unique(y)) > 2 else 'ovr',
+            multi_class='multinomial' if len(unique_labels) > 2 else 'ovr',
         )
-        
+
         self.classifier.fit(X, y)
         
         # Compute training accuracy

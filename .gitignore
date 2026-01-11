@@ -64,3 +64,5 @@ Thumbs.db
 # Temporary files
 *.tmp
 *.bak
+
+artifacts/data/output
