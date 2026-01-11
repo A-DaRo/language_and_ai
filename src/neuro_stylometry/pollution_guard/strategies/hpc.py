@@ -11,12 +11,14 @@ Implements: phaseA-D_implementation_plan.md Section 7.4
 """
 
 import logging
+import re
 import torch
 import pyarrow as pa
 import pyarrow.feather as feather
 from pathlib import Path
 from typing import Dict, Any
 import pandas as pd
+from tqdm import tqdm
 
 from .base import PollutionFilterStrategy
 from ..gliner_detector import GLiNERDetector, BatchInferenceConfig
@@ -177,66 +179,200 @@ class HPCFilterStrategy(PollutionFilterStrategy):
             chunk_cache_path=str(chunk_cache_path) if chunk_cache_path else None,
         )
         
-        # Detect spans
-        logger.info("  Detecting pollution spans...")
-        entities_batch = gliner.detect_spans_long(
-            posts,
-            batch_size=gliner_batch_size,
-            show_progress=True,
-        )
-        
-        # Mask spans
-        logger.info("  Applying typed masks...")
         masker = SpanMasker(
             tokenizer=gliner.model.data_processor.transformer_tokenizer,
             entity_to_mask=gliner.get_mask_tokens(),
         )
-        masked_texts, pollution_logs = masker.mask_batch(posts, entities_batch, post_ids)
-        
-        total_spans = sum(len(entities) for entities in entities_batch)
-        logger.info(f"  Masked {total_spans} pollution spans")
-        
+
+        shard_size = int(chunking_cfg.get("shard_size", 0) or 0)
+        if shard_size <= 0:
+            shard_size = len(posts)
+        total_shards = max(1, (len(posts) + shard_size - 1) // shard_size)
+        if total_shards > 1:
+            logger.info(
+                "Sharding enabled: %d posts per shard (%d shards total)",
+                shard_size,
+                total_shards,
+            )
+
+        inference_pbar = None
+        if total_shards > 1:
+            inference_pbar = tqdm(
+                total=0,
+                desc="GLiNER inference (total)",
+                unit="batch",
+                dynamic_ncols=True,
+            )
+
+        def _inference_total_update(count: int) -> None:
+            if inference_pbar is None:
+                return
+            if inference_pbar.total is None:
+                inference_pbar.total = 0
+            inference_pbar.total += int(count)
+            inference_pbar.refresh()
+
+        def _inference_update(count: int) -> None:
+            if inference_pbar is None:
+                return
+            inference_pbar.update(int(count))
+
+        chunk_cache_base = Path(chunk_cache_path) if chunk_cache_path else None
+        if total_shards > 1 and chunk_cache_base is not None:
+            logger.info("Chunk cache base: %s", chunk_cache_base)
+
+        compute_recall = bool(self._cfg_get(config, "gliner.compute_explicit_recall"))
+        reference_patterns = (
+            gliner.taxonomy.get_reference_patterns() if compute_recall else {}
+        )
+        total_ref = 0
+        matched_ref = 0
+        per_label_counts: Dict[str, Dict[str, int]] = {}
+
+        def _update_recall_stats(texts: list, entities: list) -> None:
+            nonlocal total_ref, matched_ref
+            for text, entity_list in zip(texts, entities):
+                ref_spans = []
+                for label, patterns in reference_patterns.items():
+                    for pattern in patterns:
+                        for match in re.finditer(pattern, text):
+                            ref_spans.append((match.start(), match.end(), label))
+
+                total_ref += len(ref_spans)
+                for start, end, label in ref_spans:
+                    matched = False
+                    for entity in entity_list:
+                        if entity.get("label") != label:
+                            continue
+                        if max(start, entity["start"]) < min(end, entity["end"]):
+                            matched = True
+                            break
+                    counts = per_label_counts.setdefault(
+                        label,
+                        {"matched": 0, "total": 0},
+                    )
+                    if matched:
+                        matched_ref += 1
+                        counts["matched"] += 1
+                    counts["total"] += 1
+
+        total_spans = 0
+        masked_texts: list = []
+        pollution_logs: list = []
+
         # Step 3: Embed masked texts
         # Critical (Section 5.1 of LEACE Strategy Report):
         # - LEACE MUST be computed on embeddings of MASKED text (post_masked), NOT raw text.
         # - FrozenEmbedder MUST register the same typed mask tokens as GLiNERDetector.
         logger.info("Step 2/3: Embedding Masked Texts")
-        
+
         # Extract mask tokens for tokenizer alignment (Section 5.1)
         mask_tokens = list(dict.fromkeys(gliner.get_mask_tokens().values()))
-        
+
         embedder = FrozenEmbedder(
             model_name=str(self._cfg_get(config, "encoder.model")),
             device=self._resolve_device(self._cfg_get(config, "encoder.device")),
             max_length=int(self._cfg_get(config, "encoder.max_length")),
             special_tokens=mask_tokens,  # Critical for tokenizer alignment
         )
-        
-        embeddings = embedder.embed_texts(
-            masked_texts,
-            batch_size=encoder_batch_size,
-            show_progress=True,
-        )
-        embeddings_cpu = embeddings.detach().to("cpu", dtype=torch.float32)
-        
-        # Move embeddings to GPU for full-batch LEACE
-        embeddings = embeddings.to(device)
-        
-        # Step 4: Compute LEACE projection (full-batch)
-        logger.info("Step 3/3: Computing LEACE Projection (Full-Batch GPU)")
 
         encoder = DemographicEncoder(get_demographic_columns()).fit(table)
-        concepts = torch.from_numpy(encoder.transform(table)).to(device, dtype=torch.float32)
-        
+
         leace = LEACEComputer(
             embedding_dim=embedder.get_embedding_dim(),
             regularization=float(self._cfg_get(config, "leace.regularization")),
             device=self._resolve_device(self._cfg_get(config, "encoder.device")),
             force_cpu=bool(self._cfg_get(config, "leace.force_cpu")),
         )
-        
-        # Full-batch computation (no accumulation needed)
-        projection_matrix = leace.compute_projection_from_concepts(embeddings, concepts)
+
+        probe_enabled = bool(self._cfg_get(config, "probe.compute_amnesic_drop"))
+        max_probe_samples = (
+            int(self._cfg_get(config, "probe.max_samples")) if probe_enabled else 0
+        )
+        probe_embeddings: list = []
+
+        # Detect spans + mask + embed in shards
+        logger.info("  Detecting pollution spans...")
+        concept_stats = None
+        for shard_idx in range(total_shards):
+            start = shard_idx * shard_size
+            end = min(len(posts), start + shard_size)
+            shard_len = end - start
+            if shard_len <= 0:
+                continue
+
+            logger.info(
+                "  Shard %d/%d: rows %d-%d",
+                shard_idx + 1,
+                total_shards,
+                start,
+                end - 1,
+            )
+
+            shard_table = table.slice(start, shard_len)
+            shard_posts = shard_table["post"].to_pylist()
+            shard_post_ids = shard_table["post_id"].to_pylist()
+
+            if total_shards > 1 and chunk_cache_base is not None:
+                shard_cache = chunk_cache_base.with_name(
+                    f"{chunk_cache_base.stem}.shard{shard_idx:04d}{chunk_cache_base.suffix}"
+                )
+                gliner.chunk_cache_path = shard_cache
+
+            entities_shard = gliner.detect_spans_long(
+                shard_posts,
+                batch_size=gliner_batch_size,
+                show_progress=total_shards == 1,
+                inference_progress_callback=_inference_update if total_shards > 1 else None,
+                inference_total_callback=_inference_total_update if total_shards > 1 else None,
+            )
+
+            masked_shard, logs_shard = masker.mask_batch(
+                shard_posts,
+                entities_shard,
+                shard_post_ids,
+            )
+
+            masked_texts.extend(masked_shard)
+            pollution_logs.extend(logs_shard)
+            total_spans += sum(len(entities) for entities in entities_shard)
+
+            if compute_recall:
+                _update_recall_stats(shard_posts, entities_shard)
+
+            embeddings_shard = embedder.embed_texts(
+                masked_shard,
+                batch_size=encoder_batch_size,
+                show_progress=True,
+            )
+
+            if probe_enabled and len(probe_embeddings) < max_probe_samples:
+                remaining = max_probe_samples - len(probe_embeddings)
+                if remaining > 0:
+                    embeddings_cpu = embeddings_shard.detach().to(
+                        "cpu", dtype=torch.float32
+                    )
+                    probe_embeddings.append(embeddings_cpu[:remaining])
+
+            concepts_shard = torch.from_numpy(encoder.transform(shard_table))
+            concept_stats = leace.accumulate_batch_concepts(
+                embeddings_shard,
+                concepts_shard,
+                concept_stats,
+            )
+            del embeddings_shard
+
+        if inference_pbar is not None:
+            inference_pbar.close()
+
+        if concept_stats is None:
+            raise RuntimeError("LEACE accumulation failed: no concept statistics computed")
+
+        logger.info("  Masked %d pollution spans", total_spans)
+
+        # Step 4: Compute LEACE projection from accumulated stats
+        logger.info("Step 3/3: Computing LEACE Projection (Accumulated)")
+        projection_matrix = leace.compute_projection_from_concept_stats(concept_stats)
         
         # Step 5: Save outputs
         logger.info("Saving outputs...")
@@ -263,59 +399,73 @@ class HPCFilterStrategy(PollutionFilterStrategy):
             "use_bf16": self.use_bf16,
         }
 
-        if bool(self._cfg_get(config, "gliner.compute_explicit_recall")):
-            recall = compute_explicit_recall(
-                posts,
-                entities_batch,
-                gliner.taxonomy.get_reference_patterns(),
-            )
-            metadata["explicit_recall"] = recall
-
-        if bool(self._cfg_get(config, "probe.compute_amnesic_drop")):
-            max_samples = self._cfg_get(config, "probe.max_samples")
-            if max_samples and len(embeddings_cpu) > max_samples:
-                embeddings_before = embeddings_cpu[:max_samples]
-                probe_table = table.slice(0, int(max_samples))
-            else:
-                embeddings_before = embeddings_cpu
-                probe_table = table
-
-            P_cpu = projection_matrix.detach().to("cpu", dtype=torch.float32)
-            embeddings_after = embeddings_before @ P_cpu.T
-
-            by_column: Dict[str, Any] = {}
-            drops = []
-            for col in get_demographic_columns():
-                labels_np = extract_probe_labels(probe_table, col)
-                labels_t = torch.tensor(labels_np, dtype=torch.long)
-                acc_before, acc_after, amnesic_drop = compute_amnesic_drop(
-                    embeddings_before,
-                    embeddings_after,
-                    labels_t,
-                    train_split=float(self._cfg_get(config, "probe.train_split")),
-                    random_state=int(self._cfg_get(config, "seed")),
-                )
-                by_column[col] = {
-                    "accuracy_before": acc_before,
-                    "accuracy_after": acc_after,
-                    "amnesic_drop": amnesic_drop,
-                }
-                drops.append(float(amnesic_drop))
-
-            min_drop = float(min(drops)) if drops else 0.0
-            metadata["probe"] = {
-                "by_column": by_column,
-                "min_amnesic_drop": min_drop,
-                "threshold": float(self._cfg_get(config, "probe.amnesic_drop_threshold")),
-                "max_samples": int(len(embeddings_before)),
+        if compute_recall:
+            overall = (matched_ref / total_ref) if total_ref > 0 else None
+            per_label_recall = {
+                label: (counts["matched"] / counts["total"])
+                if counts["total"] > 0
+                else None
+                for label, counts in per_label_counts.items()
+            }
+            metadata["explicit_recall"] = {
+                "overall": overall,
+                "total_reference_spans": total_ref,
+                "matched_reference_spans": matched_ref,
+                "per_label": per_label_recall,
             }
 
-            if bool(self._cfg_get(config, "quality.enforce_thresholds")):
-                threshold = float(self._cfg_get(config, "probe.amnesic_drop_threshold"))
-                if min_drop < threshold:
-                    raise ValueError(
-                        f"Amnesic drop gate failed: min={min_drop:.3f} < threshold={threshold:.3f}"
+        if probe_enabled:
+            if probe_embeddings:
+                embeddings_before = torch.cat(probe_embeddings, dim=0)
+            else:
+                embeddings_before = torch.empty((0, embedder.get_embedding_dim()))
+
+            if embeddings_before.numel() == 0:
+                logger.warning("Probe skipped: no embeddings collected")
+            else:
+                max_samples = self._cfg_get(config, "probe.max_samples")
+                if max_samples and len(embeddings_before) > max_samples:
+                    embeddings_before = embeddings_before[:max_samples]
+                    probe_table = table.slice(0, int(max_samples))
+                else:
+                    probe_table = table.slice(0, int(len(embeddings_before)))
+
+                P_cpu = projection_matrix.detach().to("cpu", dtype=torch.float32)
+                embeddings_after = embeddings_before @ P_cpu.T
+
+                by_column: Dict[str, Any] = {}
+                drops = []
+                for col in get_demographic_columns():
+                    labels_np = extract_probe_labels(probe_table, col)
+                    labels_t = torch.tensor(labels_np, dtype=torch.long)
+                    acc_before, acc_after, amnesic_drop = compute_amnesic_drop(
+                        embeddings_before,
+                        embeddings_after,
+                        labels_t,
+                        train_split=float(self._cfg_get(config, "probe.train_split")),
+                        random_state=int(self._cfg_get(config, "seed")),
                     )
+                    by_column[col] = {
+                        "accuracy_before": acc_before,
+                        "accuracy_after": acc_after,
+                        "amnesic_drop": amnesic_drop,
+                    }
+                    drops.append(float(amnesic_drop))
+
+                min_drop = float(min(drops)) if drops else 0.0
+                metadata["probe"] = {
+                    "by_column": by_column,
+                    "min_amnesic_drop": min_drop,
+                    "threshold": float(self._cfg_get(config, "probe.amnesic_drop_threshold")),
+                    "max_samples": int(len(embeddings_before)),
+                }
+
+                if bool(self._cfg_get(config, "quality.enforce_thresholds")):
+                    threshold = float(self._cfg_get(config, "probe.amnesic_drop_threshold"))
+                    if min_drop < threshold:
+                        raise ValueError(
+                            f"Amnesic drop gate failed: min={min_drop:.3f} < threshold={threshold:.3f}"
+                        )
         
         logger.info("Phase A complete!")
         return metadata

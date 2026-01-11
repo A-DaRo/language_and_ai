@@ -1002,6 +1002,8 @@ class GLiNERDetector:
         active_columns: Optional[List[Optional[List[str]]]] = None,
         batch_size: Optional[int] = None,
         show_progress: bool = False,
+        inference_progress_callback: Optional[Any] = None,
+        inference_total_callback: Optional[Any] = None,
     ) -> List[List[Dict[str, Any]]]:
         """
         Detect pollution spans in texts with optional per-row column selection.
@@ -1021,6 +1023,8 @@ class GLiNERDetector:
                 Example: [["birth_year", "female"], ["nationality"], None, ...]
             batch_size: Batch size for inference. If None, uses config default.
             show_progress: Show progress bar.
+            inference_progress_callback: Optional callback invoked per inference batch/text.
+            inference_total_callback: Optional callback invoked with total batches/texts.
 
         Returns:
             List of detected spans per text. Each span dict contains:
@@ -1033,12 +1037,22 @@ class GLiNERDetector:
         # Use legacy sequential mode if configured or batching is disabled
         if self.budget_config.legacy_sequential_mode or not self.batch_config.enable_batching:
             return self._detect_spans_sequential(
-                texts, active_columns, batch_size, show_progress
+                texts,
+                active_columns,
+                batch_size,
+                show_progress,
+                inference_progress_callback,
+                inference_total_callback,
             )
         
         # Use optimized batched inference
         return self._detect_spans_batched(
-            texts, active_columns, batch_size, show_progress
+            texts,
+            active_columns,
+            batch_size,
+            show_progress,
+            inference_progress_callback,
+            inference_total_callback,
         )
     
     def _detect_spans_sequential(
@@ -1047,6 +1061,8 @@ class GLiNERDetector:
         active_columns: Optional[List[Optional[List[str]]]] = None,
         batch_size: Optional[int] = None,
         show_progress: bool = False,
+        inference_progress_callback: Optional[Any] = None,
+        inference_total_callback: Optional[Any] = None,
     ) -> List[List[Dict[str, Any]]]:
         """
         Original sequential detection (legacy mode for backward compatibility).
@@ -1064,10 +1080,14 @@ class GLiNERDetector:
                 unit="text",
                 dynamic_ncols=True,
             )
+        elif inference_total_callback is not None:
+            inference_total_callback(len(texts))
 
         for idx, text in iterator:
             if not text or not text.strip():
                 all_results.append([])
+                if inference_progress_callback is not None:
+                    inference_progress_callback(1)
                 continue
 
             # Determine active columns for this row
@@ -1110,6 +1130,8 @@ class GLiNERDetector:
             # Deduplicate entities from overlapping chunks
             doc_entities = deduplicate_entities(doc_entities)
             all_results.append(doc_entities)
+            if inference_progress_callback is not None:
+                inference_progress_callback(1)
 
         return all_results
 
@@ -1119,6 +1141,8 @@ class GLiNERDetector:
         active_columns: Optional[List[Optional[List[str]]]] = None,
         batch_size: Optional[int] = None,
         show_progress: bool = True,
+        inference_progress_callback: Optional[Any] = None,
+        inference_total_callback: Optional[Any] = None,
     ) -> List[List[Dict[str, Any]]]:
         """
         Optimized batched detection with length bucketing.
@@ -1301,6 +1325,9 @@ class GLiNERDetector:
             for bucket_indices in plan["bucket_to_indices"].values()
         )
 
+        if inference_total_callback is not None:
+            inference_total_callback(total_batches)
+
         pbar = None
         if show_progress:
             pbar = tqdm(
@@ -1370,6 +1397,8 @@ class GLiNERDetector:
 
                         if pbar:
                             pbar.update(1)
+                        if inference_progress_callback is not None:
+                            inference_progress_callback(1)
         finally:
             if pbar:
                 pbar.close()
@@ -1531,6 +1560,8 @@ class GLiNERDetector:
         active_columns: Optional[List[Optional[List[str]]]] = None,
         batch_size: int = 8,
         show_progress: bool = False,
+        inference_progress_callback: Optional[Any] = None,
+        inference_total_callback: Optional[Any] = None,
     ) -> List[List[Dict[str, Any]]]:
         """
         Detect pollution spans in long texts.
@@ -1552,6 +1583,8 @@ class GLiNERDetector:
             active_columns=active_columns,
             batch_size=batch_size,
             show_progress=show_progress,
+            inference_progress_callback=inference_progress_callback,
+            inference_total_callback=inference_total_callback,
         )
 
     def _merge_small_buckets(

@@ -88,6 +88,7 @@ gliner:
     legacy_sequential_mode: false
     parallel_chunking_workers: 16
     checkpoint_path: "${paths.output}/phase_a/gliner_chunk_cache.pkl"
+    shard_size: 20000
     # Batched parallel processing: send large batches per worker
     # 0 = auto-compute (total_docs // num_workers)
     batch_size_per_worker: 0
