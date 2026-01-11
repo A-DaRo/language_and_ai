@@ -13,7 +13,7 @@ Implements: phaseA-D_implementation_plan.md Section 9.1
 import logging
 from pathlib import Path
 from typing import Dict, Any, Optional, Tuple
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from .pollution_guard.strategies.base import PollutionFilterStrategy
 from .config import load_pipeline_config
@@ -35,12 +35,20 @@ class PhaseArtifacts:
         clean_dataset_path: Path to cleaned dataset with post_masked.
         projection_matrix_path: Path to LEACE projection matrix.
         pollution_logs_path: Path to pollution detection logs.
+        metrics_path: Path to phase_a_metrics.json.
+        reports_dir: Directory containing visualizations.
         metadata: Execution metadata.
     """
     clean_dataset_path: Path
     projection_matrix_path: Path
     pollution_logs_path: Path
-    metadata: Dict[str, Any]
+    metrics_path: Optional[Path] = None
+    reports_dir: Optional[Path] = None
+    metadata: Dict[str, Any] = None
+    
+    def __post_init__(self):
+        if self.metadata is None:
+            self.metadata = {}
 
 
 class PhaseAPipeline:
@@ -297,22 +305,93 @@ class PhaseAPipeline:
             config=self.config,
         )
         
+        # Initialize paths for reports
+        reports_dir = None
+        metrics_path = None
+        
+        # --- Reporting & Visualization (config-driven) ---
+        viz_config = self.config.get("visualization", {})
+        viz_enabled = viz_config.get("enabled", True)
+        
+        if viz_enabled:
+            try:
+                logger.info("Generating Phase A reports and visualizations...")
+                reports_dir = output_dir / "reports" / "phase_a"
+                reports_dir.mkdir(parents=True, exist_ok=True)
+
+                # Load artifacts for reporting
+                import pyarrow.feather as feather
+                import torch
+                import json
+                clean_table = feather.read_table(clean_dataset_path)
+                logs_table = feather.read_table(pollution_logs_path)
+                projection_matrix = torch.load(projection_matrix_path, map_location="cpu")
+
+                # Compute and save metrics
+                from .evaluation.metrics import compute_phase_a_metrics, save_metrics
+                metrics_data = compute_phase_a_metrics(
+                    clean_table=clean_table,
+                    logs_table=logs_table,
+                    projection_matrix=projection_matrix,
+                    strategy_metadata=metadata,
+                    config=self.config,
+                )
+                metrics_path = reports_dir / "phase_a_metrics.json"
+                save_metrics(metrics_data, metrics_path)
+
+                # Generate visualizations
+                from .evaluation.visualizations_phase_a import generate_phase_a_plots
+                import numpy as np
+                
+                # Sample for pandas conversion based on config
+                vis_sample_size = int(viz_config.get("pca_max_samples", 1000)) * 2  # 2x for viz sampling buffer
+                if len(clean_table) > vis_sample_size:
+                    indices = np.random.choice(len(clean_table), vis_sample_size, replace=False)
+                    indices.sort()
+                    clean_df_sample = clean_table.take(indices).to_pandas()
+                else:
+                    clean_df_sample = clean_table.to_pandas()
+                
+                logs_df = logs_table.to_pandas()
+
+                generate_phase_a_plots(
+                    clean_df_sample=clean_df_sample,
+                    logs_df=logs_df,
+                    projection_matrix=projection_matrix,
+                    embedder=self.get_embedder(),
+                    output_dir=reports_dir,
+                    metrics=metrics_data,
+                    config=self.config,
+                )
+                logger.info(f"Saved visualizations to {reports_dir}")
+
+            except Exception as e:
+                logger.warning(f"Reporting/Visualization failed: {e}", exc_info=True)
+        else:
+            logger.info("Visualization generation disabled in config")
+
         # Create artifacts
         artifacts = PhaseArtifacts(
             clean_dataset_path=clean_dataset_path,
             projection_matrix_path=projection_matrix_path,
             pollution_logs_path=pollution_logs_path,
+            metrics_path=metrics_path,
+            reports_dir=reports_dir,
             metadata=metadata,
         )
 
         self._check_quality_gates(metadata)
-        
+
         logger.info("=" * 80)
         logger.info("PHASE A COMPLETE")
         logger.info("=" * 80)
         logger.info(f"Clean dataset: {clean_dataset_path}")
         logger.info(f"Projection matrix: {projection_matrix_path}")
         logger.info(f"Pollution logs: {pollution_logs_path}")
+        if metrics_path:
+            logger.info(f"Metrics: {metrics_path}")
+        if reports_dir:
+            logger.info(f"Reports directory: {reports_dir}")
         
         return artifacts
 

@@ -1,63 +1,77 @@
 # conf/hpc/pipeline.yaml - HPC-specific overrides (A100/H100)
-# Optimized for high-VRAM datacenter GPUs (40-80GB)
+# Optimized for staged execution on datacenter GPUs (40-80GB VRAM)
 
 defaults:
   - /base/pipeline
 
 # ---------------------------------------------------------------------------
-# HPC Advanced Execution Optimizations
+# Staged Execution Architecture (HPC Mode)
 # ---------------------------------------------------------------------------
-# Full optimization suite enabled for datacenter GPUs with ample VRAM.
-# These settings maximize throughput on A100/H100 class hardware.
+# Two-stage pipeline decoupling CPU chunking from GPU inference:
+# - Stage 1: CPU-saturated parallel chunking → persist to post_chunked
+# - Stage 2: GPU-saturated global-sorted inference → minimal padding
 # ---------------------------------------------------------------------------
+
 execution:
-  # CUDA graphs: enabled for static-shape inference (significant speedup)
+  # Staged execution: primary configuration
+  staged_execution:
+    enabled: true
+    persist_chunks: true           # Always persist to post_chunked for crash recovery
+    global_sort_by_length: true    # Enable global argsort for padding efficiency
+    gc_between_stages: true        # Force gc.collect() between stages
+
+  # CUDA graphs: enabled for static-shape inference
   enable_cuda_graphs: true
-  cuda_graph_warmup: 3
-  cuda_graph_cache_size: 32  # More cache for HPC workloads
-  
+  cuda_graph_warmup: 5
+  cuda_graph_cache_size: 64        # Larger cache for global-sorted batches
+
   # torch.compile: enabled with reduce-overhead mode
   enable_torch_compile: true
   torch_compile_mode: "reduce-overhead"
   torch_compile_fullgraph: false
   torch_compile_dynamic: false
   torch_compile_backend: "inductor"
-  
+
   # Sequence packing: enabled for zero-padding inference
-  # Concatenates sentences with block-diagonal attention masks
   sequence_packing:
     enabled: true
-    max_packed_length: 4096   # Higher limit for high-VRAM GPUs
+    max_packed_length: 8192        # Higher limit for H100 (80GB)
     min_sequences_to_pack: 2
     use_block_diagonal_mask: true
     pack_by_similarity: true
-  
-  # Async prefetch: enabled with multiprocessing for HPC
-  # Multiple workers for aggressive prefetching
+
+  # Async prefetch: critical for Stage 2 GPU saturation
   async_prefetch:
     enabled: true
-    queue_size: 8             # Larger queue for HPC throughput
-    num_workers: 2            # Multiple prefetch workers
-    timeout_seconds: 60.0
-    prefetch_factor: 4
+    queue_size: 16                 # Larger queue for global-sorted batches
+    num_workers: 4                 # More workers for aggressive prefetching
+    timeout_seconds: 120.0
+    prefetch_factor: 8
     use_multiprocessing: true
-    pin_memory: true
+    pin_memory: true               # Critical for overlapped PCIe transfers
+    non_blocking: true             # Enable async CUDA transfers
     profile_aware: true
-  
-  # GPU span filtering: enabled with high capacity
+
+  # GPU span filtering
   gpu_span_filter:
     enabled: true
-    max_spans_per_sequence: 200
+    max_spans_per_sequence: 256
     use_topk: false
-    topk_k: 100
-  
+    topk_k: 128
+
   numa_pinning: true
 
+  # Memory management for large datasets
+  memory:
+    preallocate_buffers: true
+    max_cached_batches: 32
+    release_cache_every_n_batches: 100
+
 dataloader:
-  batch_size: 256
-  num_workers: 8
+  batch_size: 512                  # Larger batches for global-sorted inference
+  num_workers: 16
   persistent_workers: true
-  prefetch_factor: 4
+  prefetch_factor: 8
   pin_memory: true
 
 precision:
@@ -66,36 +80,78 @@ precision:
 
 gliner:
   model: "knowledgator/gliner-bi-base-v1.0"
-  batch_size: 48
+  batch_size: 128                  # Larger batch size for Stage 2 (global-sorted)
   device: "cuda"
-  require_bi_encoder: true   # Enforce bi-encoder usage
+  require_bi_encoder: true         # Enforce bi-encoder for label embedding caching
+  gliner_max_words: 512
+  tokens_per_word_ratio: 1.3
+
   # ---------------------------------------------------------------------------
-  # HPC-optimized Batch Inference Settings
-  # ---------------------------------------------------------------------------
-  # Aggressive settings for high-VRAM environments (A100/H100).
-  # More buckets = finer length grouping = less padding waste.
-  # Large batch sizes maximize GPU utilization.
+  # HPC Batch Inference (Stage 2 Optimization)
   # ---------------------------------------------------------------------------
   batch_inference:
     enable_batching: true
-    # 8 buckets for balanced bucketing on mid-VRAM GPUs (e.g., L4)
-    num_buckets: 8
-    min_bucket_size: 8  # Larger min size since we have more samples
+    num_buckets: 16                # More buckets for finer length grouping
+    min_bucket_size: 16            # Larger min size for GPU efficiency
     enable_prompt_caching: true
-  
+
+    # Global sorting eliminates most bucketing waste
+    # These are fallback settings when global sort unavailable
+    fallback_num_buckets: 8
+    fallback_min_bucket_size: 8
+
+  # ---------------------------------------------------------------------------
+  # Staged Execution Chunking Settings (Stage 1)
+  # ---------------------------------------------------------------------------
   chunking:
     mode: "single_sentence"
-    legacy_sequential_mode: false
-    parallel_chunking_workers: 16
+    legacy_sequential_mode: false  # MUST be false for staged execution
+
+    # Stage 1: CPU saturation
+    parallel_chunking_workers: 32  # Saturate HPC CPU cores
+    parallel_chunking_min_texts: 256
+    micro_batch_size: 2000         # Larger micro-batches for HPC RAM
+
+    # Checkpoint for crash recovery
     checkpoint_path: "${paths.output}/phase_a/gliner_chunk_cache.pkl"
-    shard_size: 20000
-    # Batched parallel processing: send large batches per worker
-    # 0 = auto-compute (total_docs // num_workers)
-    batch_size_per_worker: 0
+
+    # Shard size for embedding + LEACE
+    shard_size: 50000              # Large shards for HPC memory
+
+encoder:
+  model: "sentence-transformers/all-MiniLM-L6-v2"
+  device: "cuda"
+  output_device: "cuda"            # Keep on GPU for HPC (fast LEACE accumulation)
+  batch_size: 512                  # Large batch for embedding
+  max_length: 512
+
+leace:
+  regularization: 1.0e-4
+  force_cpu: false                 # GPU LEACE on HPC
+  batch_size: 10000                # Large LEACE batches
+
+probe:
+  compute_amnesic_drop: true
+  max_samples: 10000
+  train_split: 0.8
+  amnesic_drop_threshold: 0.05
+
+quality:
+  enforce_thresholds: true
 
 subset:
-  enabled: false
+  enabled: false                   # Process full dataset on HPC
 
 logging:
   level: "INFO"
-  wandb_enabled: true
+  log_gpu_memory: true
+  log_batch_timing: true
+
+# Paths for staged execution artifacts
+paths:
+  output: "artifacts"
+  phase_a:
+    clean_dataset: "${paths.output}/phase_a/clean_dataset.arrow"
+    projection_matrix: "${paths.output}/phase_a/projection_matrix.pt"
+    pollution_logs: "${paths.output}/phase_a/pollution_logs.arrow"
+    staged_checkpoint: "${paths.output}/phase_a/staged_checkpoint.arrow"

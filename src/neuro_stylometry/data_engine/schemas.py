@@ -3,17 +3,44 @@ Arrow Schema Definitions for SOBR Dataset and Pollution Logs.
 
 This module serves as the source of truth for all data type contracts,
 ensuring type safety before data reaches tensor computation.
+
+Staged Execution Architecture:
+- post_chunked: Persisted chunks enable CPU/GPU decoupling and crash recovery.
+- CHUNK_STRUCT: Nested struct with pre-computed token_count for zero-copy global sorting.
 """
 
 import pyarrow as pa
-from typing import List
+from typing import List, Optional
+
+
+# ==============================================================================
+# Chunk Struct Definition (Staged Execution)
+# ==============================================================================
+# Elevates chunks from ephemeral Python objects to first-class schema citizens.
+# The token_count field enables O(1) length lookup for global argsort without
+# deserializing text content (zero-copy inspection).
+#
+# Reference: Technical Report Section 1.1 (Enhanced Arrow Schema)
+# ==============================================================================
+
+CHUNK_STRUCT = pa.struct([
+    ("text", pa.string()),           # The chunk text content
+    ("start", pa.int32()),           # Global character start offset (for reconstruction)
+    ("end", pa.int32()),             # Global character end offset (for reconstruction)
+    ("token_count", pa.int16()),     # Pre-computed token length (critical for global sorting)
+    ("is_hard_split", pa.bool_()),   # True if resulted from fallback hard-slicing
+])
+
+# Field definition for the chunked column (list of chunk structs per document)
+POST_CHUNKED_FIELD = pa.field("post_chunked", pa.list_(CHUNK_STRUCT), nullable=True)
 
 
 # ==============================================================================
 # SOBR Unified Dataset Schema
 # ==============================================================================
 
-SOBR_SCHEMA = pa.schema([
+# Base schema fields (without optional staged execution columns)
+_SOBR_BASE_FIELDS = [
     # Primary Key and Content
     ("post_id", pa.string()),  # Unique identifier for each post
     ("author_id", pa.dictionary(pa.int32(), pa.string())),  # Dictionary-encoded for memory efficiency
@@ -35,7 +62,12 @@ SOBR_SCHEMA = pa.schema([
     # Metadata
     ("split", pa.dictionary(pa.int8(), pa.string())),  # train/val/test (assigned during splitting)
     ("text_length", pa.int32()),  # Cached character count for bucketing
-])
+]
+
+SOBR_SCHEMA = pa.schema(_SOBR_BASE_FIELDS)
+
+# Extended schema including post_chunked for staged execution
+SOBR_SCHEMA_STAGED = pa.schema(_SOBR_BASE_FIELDS + [POST_CHUNKED_FIELD])
 
 
 # ==============================================================================
@@ -145,3 +177,74 @@ def get_nullable_columns() -> List[str]:
     demographic labels correctly (e.g., map to ignore_index=-100).
     """
     return get_demographic_columns()  # All demographic labels are nullable
+
+
+def has_post_chunked_column(table: pa.Table) -> bool:
+    """
+    Check if a table has the post_chunked column for staged execution.
+    
+    Used for resume logic: if post_chunked exists, skip Stage 1 (chunking).
+    
+    Args:
+        table: PyArrow Table to check.
+        
+    Returns:
+        True if post_chunked column exists and is properly typed.
+    """
+    if "post_chunked" not in table.column_names:
+        return False
+    
+    col_type = table.schema.field("post_chunked").type
+    # Verify it's a list of structs (not just any column named post_chunked)
+    return pa.types.is_list(col_type) and pa.types.is_struct(col_type.value_type)
+
+
+def validate_schema_flexible(
+    table: pa.Table,
+    expected_schema: pa.Schema,
+    allow_extra_columns: bool = True,
+) -> bool:
+    """
+    Flexible schema validation that allows extra columns (e.g., post_chunked).
+    
+    Used for staged execution where post_chunked may or may not be present.
+    
+    Args:
+        table: The PyArrow Table to validate.
+        expected_schema: The base schema to validate against.
+        allow_extra_columns: If True, extra columns are permitted.
+        
+    Returns:
+        True if validation passes.
+        
+    Raises:
+        ValueError: If schema validation fails.
+    """
+    actual_names = set(table.column_names)
+    expected_names = set(f.name for f in expected_schema)
+    
+    # Check all expected columns exist
+    missing = expected_names - actual_names
+    if missing:
+        raise ValueError(f"Missing required columns: {missing}")
+    
+    # Check types of expected columns
+    mismatches = []
+    for expected_field in expected_schema:
+        actual_field = table.schema.field(expected_field.name)
+        if not actual_field.type.equals(expected_field.type):
+            mismatches.append(
+                f"Type mismatch for '{expected_field.name}': "
+                f"Expected {expected_field.type}, got {actual_field.type}"
+            )
+    
+    if mismatches:
+        raise ValueError("Schema validation failed:\n" + "\n".join(mismatches))
+    
+    # Check for unexpected columns
+    if not allow_extra_columns:
+        extra = actual_names - expected_names
+        if extra:
+            raise ValueError(f"Unexpected columns: {extra}")
+    
+    return True

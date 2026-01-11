@@ -1587,6 +1587,240 @@ class GLiNERDetector:
             inference_total_callback=inference_total_callback,
         )
 
+    # -------------------------------------------------------------------------
+    # Staged Execution API (Decoupled Chunking & Inference)
+    # -------------------------------------------------------------------------
+
+    def chunk_batch(
+        self,
+        texts: List[str],
+        labels_list: Optional[List[Optional[List[str]]]] = None,
+        show_progress: bool = False,
+    ) -> List[List[ChunkInfo]]:
+        """
+        Chunk texts without running inference (Stage 1 of staged execution).
+        
+        Pure CPU operation. Generates ChunkInfo objects with pre-computed
+        token_count for zero-copy global sorting in Stage 2.
+        
+        Args:
+            texts: List of documents to chunk.
+            labels_list: Per-document labels for budget calculation.
+                If None, uses full taxonomy labels for all documents.
+            show_progress: Show progress bar.
+            
+        Returns:
+            List of ChunkInfo lists, one per document.
+        """
+        # Default to full taxonomy labels if not provided
+        if labels_list is None:
+            all_labels = self.taxonomy.get_inference_labels()
+            labels_list = [all_labels for _ in texts]
+        
+        if len(texts) != len(labels_list):
+            raise ValueError(
+                f"texts and labels_list must have same length: "
+                f"{len(texts)} vs {len(labels_list)}"
+            )
+        
+        def _progress_callback() -> None:
+            if show_progress and pbar is not None:
+                pbar.update(1)
+        
+        pbar = None
+        if show_progress:
+            pbar = tqdm(
+                total=len(texts),
+                desc="Chunking (Stage 1)",
+                unit="text",
+                dynamic_ncols=True,
+            )
+        
+        try:
+            chunk_lists = self.chunker.chunk_texts(
+                texts=texts,
+                labels_list=labels_list,
+                progress_callback=_progress_callback if show_progress else None,
+            )
+        finally:
+            if pbar is not None:
+                pbar.close()
+        
+        return chunk_lists
+
+    def inference_from_manifest(
+        self,
+        post_chunked_column: "pa.Array",
+        labels: Optional[List[str]] = None,
+        batch_size: Optional[int] = None,
+        cached_label_embeddings: Optional[torch.Tensor] = None,
+        pin_memory: bool = False,
+        show_progress: bool = True,
+    ) -> List[List[Dict[str, Any]]]:
+        """
+        Run inference from pre-computed chunks (Stage 2 of staged execution).
+        
+        Implements global sorting for optimal batching:
+        1. Flatten: Extract all chunks from nested Arrow column.
+        2. Sort: Global argsort by token_count minimizes padding.
+        3. Batch: Create optimal batches from sorted chunks.
+        4. Infer: Run GPU inference on sorted batches.
+        5. Gather: Reconstruct per-document results.
+        
+        Args:
+            post_chunked_column: Arrow ListArray from table["post_chunked"].
+                Must be typed as list<struct<text, start, end, token_count, is_hard_split>>.
+            labels: Inference labels. If None, uses full taxonomy.
+            batch_size: Batch size for inference. If None, uses config default.
+            cached_label_embeddings: Pre-computed label embeddings from strategy.
+                Hoisted to strategy level for bi-encoder efficiency.
+            pin_memory: Pin tensors for async GPU transfer (HPC mode).
+            show_progress: Show progress bar.
+            
+        Returns:
+            List of entity lists per document (nested, document-order).
+        """
+        import pyarrow as pa
+        from .global_sort import flatten_chunks, gather_results, create_sorted_batches
+        
+        effective_batch_size = batch_size or self.batch_config.batch_size
+        inference_labels = labels or self.taxonomy.get_inference_labels()
+        
+        # Use cached embeddings if provided, otherwise compute/retrieve from cache
+        prompt_embeddings = cached_label_embeddings
+        if prompt_embeddings is None:
+            prompt_embeddings = self._get_cached_prompt_embeddings(inference_labels)
+        
+        # Step 1: Flatten chunks with lineage tracking
+        logger.info("Stage 2.1: Flattening post_chunked column")
+        flattened = flatten_chunks(post_chunked_column, extract_texts=True)
+        
+        if flattened.num_chunks == 0:
+            logger.warning("No chunks to process")
+            return [[] for _ in range(flattened.num_docs)]
+        
+        logger.info(
+            f"Flattened {flattened.num_docs} documents into {flattened.num_chunks} chunks"
+        )
+        
+        # Step 2: Compute global sort permutation
+        logger.info("Stage 2.2: Computing global sort permutation by token_count")
+        sort_indices = flattened.compute_sort_indices()
+        sorted_texts = flattened.get_sorted_texts()
+        
+        # Step 3: Create optimal batches
+        logger.info(f"Stage 2.3: Creating batches (batch_size={effective_batch_size})")
+        batches = create_sorted_batches(flattened, effective_batch_size)
+        
+        logger.info(f"Created {len(batches)} batches for {flattened.num_chunks} chunks")
+        
+        # Step 4: Run inference on sorted batches
+        # Pre-allocate results in sorted order
+        flat_results_sorted: List[List[Dict[str, Any]]] = [[] for _ in range(flattened.num_chunks)]
+        
+        pbar = None
+        if show_progress:
+            pbar = tqdm(
+                total=len(batches),
+                desc="GLiNER inference (Stage 2)",
+                unit="batch",
+                dynamic_ncols=True,
+            )
+        
+        try:
+            for batch_indices in batches:
+                batch_texts = [sorted_texts[sort_indices.tolist().index(i)] if i in sort_indices else flattened.texts[i] for i in batch_indices]
+                # Actually just use the pre-sorted texts order
+                batch_texts = [flattened.texts[i] for i in batch_indices]
+                
+                # Run batched inference
+                batch_entities = self._detect_batch(
+                    batch_texts,
+                    inference_labels,
+                    prompt_embeddings,
+                )
+                
+                # Store results at their sorted positions
+                for local_idx, entities in enumerate(batch_entities):
+                    flat_idx = batch_indices[local_idx]
+                    flat_results_sorted[flat_idx] = entities
+                
+                if pbar is not None:
+                    pbar.update(1)
+        finally:
+            if pbar is not None:
+                pbar.close()
+        
+        # Step 5: Gather results back to document order
+        logger.info("Stage 2.5: Gathering results to document order")
+        
+        # Results are in flat (document) order, not sorted order
+        # Need to project offsets for each chunk
+        nested_entities = gather_results(
+            flat_results_sorted,
+            flattened,
+            restore_sort_order=False,  # Results already in flat order
+        )
+        
+        # Apply offset projection and deduplication per document
+        # We need chunk metadata to project offsets
+        all_results: List[List[Dict[str, Any]]] = []
+        
+        # Re-read chunk metadata for offset projection
+        if isinstance(post_chunked_column, pa.ChunkedArray):
+            post_chunked_column = post_chunked_column.combine_chunks()
+        
+        list_array = post_chunked_column
+        flat_structs = list_array.flatten()
+        
+        for doc_idx, doc_chunk_entities in enumerate(nested_entities):
+            doc_start = flattened.doc_offsets[doc_idx]
+            doc_end = flattened.doc_offsets[doc_idx + 1]
+            
+            projected_entities: List[Dict[str, Any]] = []
+            
+            for local_chunk_idx, chunk_entities in enumerate(doc_chunk_entities):
+                flat_idx = doc_start + local_chunk_idx
+                
+                # Get chunk metadata from Arrow struct
+                try:
+                    chunk_start = int(flat_structs.field("start")[flat_idx].as_py())
+                except Exception:
+                    chunk_start = 0
+                
+                # Project each entity's offsets
+                for entity in chunk_entities:
+                    projected = dict(entity)
+                    projected["start"] = projected.get("start", 0) + chunk_start
+                    projected["end"] = projected.get("end", 0) + chunk_start
+                    projected_entities.append(projected)
+            
+            # Deduplicate entities from overlapping chunks
+            deduped = deduplicate_entities(projected_entities)
+            all_results.append(deduped)
+        
+        return all_results
+
+    def get_cached_label_embeddings(
+        self,
+        labels: Optional[List[str]] = None,
+    ) -> Optional[torch.Tensor]:
+        """
+        Get or compute cached label embeddings for bi-encoder models.
+        
+        This method is exposed for staged execution strategies to hoist
+        label embedding computation to the strategy level.
+        
+        Args:
+            labels: Labels to encode. If None, uses full taxonomy.
+            
+        Returns:
+            Cached embeddings tensor, or None if not bi-encoder.
+        """
+        if labels is None:
+            labels = self.taxonomy.get_inference_labels()
+        return self._get_cached_prompt_embeddings(labels)
+
     def _merge_small_buckets(
         self,
         bucket_to_indices: Dict[int, List[int]],

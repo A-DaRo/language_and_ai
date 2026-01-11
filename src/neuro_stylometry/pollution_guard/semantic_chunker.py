@@ -54,19 +54,65 @@ _PARALLEL_PROGRESS_COUNTER: Optional[Any] = None
 @dataclass
 class ChunkInfo:
     """
-    Metadata for a text chunk with offset tracking.
+    Metadata for a text chunk with offset tracking and pre-computed token count.
 
     Attributes:
         text: The chunk text content.
         char_start: Character offset of chunk start in original document.
         char_end: Character offset of chunk end in original document.
         is_hard_split: True if this chunk resulted from fallback hard-slicing.
+        token_count: Pre-computed token count for zero-copy global sorting.
+            Stored as int16 (max 32767) since chunks are capped at ~512 tokens.
+    
+    Note:
+        token_count is computed during chunking and cached to enable O(1) length
+        lookup during global argsort without deserializing text content.
     """
 
     text: str
     char_start: int
     char_end: int
     is_hard_split: bool = False
+    token_count: int = 0  # Pre-computed for staged execution
+    
+    def to_arrow_struct(self) -> dict:
+        """
+        Convert to PyArrow-compatible dictionary for CHUNK_STRUCT serialization.
+        
+        Returns:
+            Dict with keys matching CHUNK_STRUCT field names:
+            - text: str
+            - start: int (char_start)
+            - end: int (char_end)
+            - token_count: int (clamped to int16 range)
+            - is_hard_split: bool
+        """
+        return {
+            "text": self.text,
+            "start": self.char_start,
+            "end": self.char_end,
+            "token_count": min(self.token_count, 32767),  # Clamp to int16 max
+            "is_hard_split": self.is_hard_split,
+        }
+    
+    @classmethod
+    def from_arrow_struct(cls, struct: dict) -> "ChunkInfo":
+        """
+        Reconstruct ChunkInfo from a PyArrow struct dictionary.
+        
+        Args:
+            struct: Dict from Arrow with keys: text, start, end, token_count, is_hard_split.
+            
+        Returns:
+            ChunkInfo instance.
+        """
+        return cls(
+            text=struct["text"],
+            char_start=struct["start"],
+            char_end=struct["end"],
+            is_hard_split=struct.get("is_hard_split", False),
+            token_count=struct.get("token_count", 0),
+        )
 
 
 @dataclass
@@ -762,6 +808,7 @@ class SemanticChunker:
                         char_start=char_start,
                         char_end=char_end,
                         is_hard_split=False,
+                        token_count=sent_token_count,
                     )
                 )
 
@@ -810,7 +857,7 @@ class SemanticChunker:
             if exceeds_token_budget or exceeds_word_limit:
                 # Flush any accumulated sentences first
                 if current_sentences:
-                    chunks.append(self._create_chunk(current_sentences, is_hard_split=False))
+                    chunks.append(self._create_chunk(current_sentences, is_hard_split=False, token_count=current_token_count))
                     current_sentences = []
                     current_token_count = 0
                     current_word_count = 0
@@ -839,7 +886,7 @@ class SemanticChunker:
             if would_exceed_tokens or would_exceed_words:
                 # Budget exceeded - commit current chunk
                 if current_sentences:
-                    chunks.append(self._create_chunk(current_sentences, is_hard_split=False))
+                    chunks.append(self._create_chunk(current_sentences, is_hard_split=False, token_count=current_token_count))
 
                 # Start new chunk with current sentence
                 current_sentences = [(sent_text, char_start, char_end)]
@@ -853,7 +900,7 @@ class SemanticChunker:
 
         # Commit final buffer
         if current_sentences:
-            chunks.append(self._create_chunk(current_sentences, is_hard_split=False))
+            chunks.append(self._create_chunk(current_sentences, is_hard_split=False, token_count=current_token_count))
 
         return chunks
 
@@ -906,6 +953,7 @@ class SemanticChunker:
         self,
         sentences: List[Tuple[str, int, int]],
         is_hard_split: bool,
+        token_count: int = 0,
     ) -> ChunkInfo:
         """
         Create a ChunkInfo from accumulated sentences.
@@ -913,12 +961,13 @@ class SemanticChunker:
         Args:
             sentences: List of (text, char_start, char_end) tuples.
             is_hard_split: Whether this chunk resulted from hard-slicing.
+            token_count: Pre-computed token count (for staged execution).
 
         Returns:
             ChunkInfo with concatenated text and span offsets.
         """
         if not sentences:
-            return ChunkInfo(text="", char_start=0, char_end=0, is_hard_split=is_hard_split)
+            return ChunkInfo(text="", char_start=0, char_end=0, is_hard_split=is_hard_split, token_count=0)
 
         # Join sentences with space (preserving readable text)
         text = " ".join(sent[0] for sent in sentences)
@@ -930,6 +979,7 @@ class SemanticChunker:
             char_start=char_start,
             char_end=char_end,
             is_hard_split=is_hard_split,
+            token_count=token_count,
         )
 
     def _hard_split_sentence(
@@ -1031,6 +1081,20 @@ class SemanticChunker:
                 start_word += 1
                 continue
 
+            # Compute token count for this chunk (for staged execution)
+            window_words_list = [w[0] for w in chunk_words]
+            try:
+                encoded = self.tokenizer(
+                    window_words_list,
+                    is_split_into_words=True,
+                    add_special_tokens=False,
+                    return_attention_mask=False,
+                )
+                chunk_token_count = len(encoded["input_ids"])
+            except Exception:
+                chunk_text_temp = " ".join(window_words_list)
+                chunk_token_count = len(self.tokenizer.encode(chunk_text_temp, add_special_tokens=False))
+
             # Reconstruct text from word spans (preserves original spacing via offsets)
             first_span = chunk_words[0]
             last_span = chunk_words[-1]
@@ -1049,6 +1113,7 @@ class SemanticChunker:
                     char_start=global_char_start,
                     char_end=global_char_end,
                     is_hard_split=True,
+                    token_count=chunk_token_count,
                 )
             )
 

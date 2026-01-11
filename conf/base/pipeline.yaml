@@ -160,6 +160,33 @@ subset:
   enabled: false
   size: null
 
+# ---------------------------------------------------------------------------
+# Phase A Visualization Settings
+# ---------------------------------------------------------------------------
+# Controls report and plot generation after Phase A completes.
+# Visualizations are generated inline after artifacts are saved (minimal overhead).
+# ---------------------------------------------------------------------------
+visualization:
+  enabled: true                    # Set false to skip visualization generation
+  pca_max_samples: 1000            # Max samples for PCA scatter plots (memory bound)
+  embedding_batch_size: 32         # Batch size for computing embeddings for viz
+  figure_dpi: 150                  # DPI for saved PNG figures
+  figure_format: "png"             # Output format: "png" | "pdf" | "svg"
+  color_palette: "husl"            # Seaborn color palette for demographic plots
+  
+  # Per-plot toggles (all enabled by default)
+  plots:
+    pca_before_after: true         # PCA scatter colored by demographic
+    singular_values: true          # Projection matrix SVD spectrum
+    embedding_norms: true          # Histogram of embedding norms
+    amnesic_drop_bars: true        # Bar chart of probe accuracy drop
+    gliner_confidence: true        # GLiNER confidence distribution
+    detection_counts: true         # Detection count by entity type
+    explicit_recall_bars: true     # Per-column recall bar chart
+    entity_cooccurrence: true      # Entity co-occurrence heatmap
+    demographic_scores: true       # Demographic score scatter matrix
+    masking_coverage: true         # Masking coverage statistics
+
 logging:
   level: "INFO"
   wandb_enabled: false

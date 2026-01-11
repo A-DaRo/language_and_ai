@@ -107,6 +107,10 @@ def run_phase_a(dataset: Path, output_dir: Path, mode: str, config_path: Path | 
         click.echo(f"Clean dataset: {artifacts.clean_dataset_path}")
         click.echo(f"Projection matrix: {artifacts.projection_matrix_path}")
         click.echo(f"Pollution logs: {artifacts.pollution_logs_path}")
+        if artifacts.metrics_path:
+            click.echo(f"Metrics: {artifacts.metrics_path}")
+        if artifacts.reports_dir:
+            click.echo(f"Reports directory: {artifacts.reports_dir}")
         click.echo(f"\nProcessed {artifacts.metadata['num_samples']} samples")
         click.echo(f"Detected {artifacts.metadata['num_pollution_spans']} pollution spans")
         

@@ -1,23 +1,32 @@
 """
-HPC Strategy for Phase A Pollution Filtering.
+HPC Strategy for Phase A Pollution Filtering (Staged Execution Architecture).
 
-Optimized for:
-- High VRAM (40-80GB A100/H100)
-- Full-batch GPU computation
-- BF16/TF32 precision
-- Large dataset processing
+Implements two-stage decoupled execution for maximum throughput:
+- Stage 1 (CPU Saturation): Parallel chunking with streaming writes to post_chunked.
+- Stage 2 (GPU Saturation): Global-sorted inference with near-zero padding.
 
-Implements: phaseA-D_implementation_plan.md Section 7.4
+Key Optimizations:
+- Chunks persisted to Arrow column enable crash recovery.
+- Global argsort by token_count minimizes padding waste.
+- Label embeddings hoisted to strategy level for bi-encoder efficiency.
+- pin_memory + non_blocking for overlapped PCIe transfers.
+
+Reference: Technical Reports on Staged Execution Architecture.
+Implements: phaseA-D_implementation_plan.md Section 7.4 (HPC Mode)
 """
 
+from __future__ import annotations
+
+import gc
 import logging
 import re
-import torch
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+import numpy as np
 import pyarrow as pa
 import pyarrow.feather as feather
-from pathlib import Path
-from typing import Dict, Any
-import pandas as pd
+import torch
 from tqdm import tqdm
 
 from .base import PollutionFilterStrategy
@@ -30,36 +39,43 @@ from ..leace import LEACEComputer
 from ..probe import compute_amnesic_drop
 from ..concept_encoding import DemographicEncoder, extract_probe_labels
 from ...data_engine.dataset import SOBRDataset
-from ...data_engine.schemas import SOBR_SCHEMA, POLLUTION_LOG_SCHEMA, get_demographic_columns
+from ...data_engine.schemas import (
+    SOBR_SCHEMA,
+    POLLUTION_LOG_SCHEMA,
+    get_demographic_columns,
+    has_post_chunked_column,
+    validate_schema_flexible,
+)
+from ...data_engine.chunking_writer import ChunkingArtifactWriter
 
 logger = logging.getLogger(__name__)
 
 
 class HPCFilterStrategy(PollutionFilterStrategy):
     """
-    HPC-optimized pollution filtering strategy.
+    HPC-optimized pollution filtering strategy with staged execution.
     
-    Key features:
-    - Full GPU utilization (A100/H100)
-    - Larger batch sizes (16-32)
-    - Full-batch LEACE computation
-    - BF16 mixed precision (if available)
+    Architecture (Staged Execution):
+    - Stage 1: CPU-saturated parallel chunking → persist to post_chunked column.
+    - Stage 2: GPU-saturated global-sorted inference → near-zero padding.
     
-    Implements: FR-12 (HPC Mode)
+    Key Features:
+    - Full GPU utilization (A100/H100) via global length sorting.
+    - Crash recovery: if post_chunked exists, skip Stage 1.
+    - Bi-encoder label embedding caching hoisted to strategy level.
+    - BF16 mixed precision (if available).
+    
+    Implements: FR-12 (HPC Mode), Staged Execution Architecture.
     """
     
     def __init__(self):
-        """Initialize HPC strategy.
-
-        Under strict YAML authority, this strategy does not set batch size.
-        Device is expected to be explicitly configured (typically "cuda").
-        """
+        """Initialize HPC strategy with staged execution support."""
         self._last_device: str = "cuda"
         self._last_batch_size: int = 0
         self.use_bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
         if self.use_bf16:
             logger.info("BF16 mixed precision available")
-        logger.info("HPCFilterStrategy initialized")
+        logger.info("HPCFilterStrategy initialized (staged execution mode)")
     
     def get_device(self) -> torch.device:
         """Get PyTorch device."""
@@ -70,6 +86,7 @@ class HPCFilterStrategy(PollutionFilterStrategy):
         return self._last_batch_size
 
     def _cfg_get(self, config: Dict[str, Any], path: str) -> Any:
+        """Safely get nested config value."""
         cur: Any = config
         for part in path.split("."):
             if not isinstance(cur, dict) or part not in cur:
@@ -77,7 +94,15 @@ class HPCFilterStrategy(PollutionFilterStrategy):
             cur = cur[part]
         return cur
 
+    def _cfg_get_optional(self, config: Dict[str, Any], path: str, default: Any = None) -> Any:
+        """Get nested config value with default."""
+        try:
+            return self._cfg_get(config, path)
+        except KeyError:
+            return default
+
     def _resolve_device(self, device_spec: str) -> str:
+        """Resolve device specification to actual device string."""
         spec = str(device_spec).lower()
         if spec == "auto":
             return "cuda" if torch.cuda.is_available() else "cpu"
@@ -96,19 +121,20 @@ class HPCFilterStrategy(PollutionFilterStrategy):
         config: Dict[str, Any],
     ) -> Dict[str, Any]:
         """
-        Execute Phase A on HPC.
+        Execute Phase A with staged execution architecture.
         
         Pipeline:
-        1. Load full dataset
-        2. GLiNER pollution detection + masking
-        3. Embed masked texts
-        4. Compute LEACE projection (full-batch GPU)
-        5. Save outputs
+        1. Load dataset (check for existing post_chunked).
+        2. Stage 1: Parallel chunking → persist post_chunked (skip if exists).
+        3. Stage 2: Global-sorted inference from post_chunked.
+        4. Masking & LEACE computation.
+        5. Save outputs.
         """
         logger.info("=" * 80)
-        logger.info("Phase A: HPC Strategy")
+        logger.info("Phase A: HPC Strategy (Staged Execution)")
         logger.info("=" * 80)
 
+        # Validate device
         device = self._resolve_device(self._cfg_get(config, "gliner.device"))
         if device != "cuda":
             raise RuntimeError("HPC strategy requires config gliner.device='cuda'")
@@ -119,17 +145,20 @@ class HPCFilterStrategy(PollutionFilterStrategy):
         self._last_device = device
         self._last_batch_size = gliner_batch_size
         
-        # Step 1: Load dataset
+        # =======================================================================
+        # Step 1: Load Dataset
+        # =======================================================================
         logger.info(f"Loading dataset: {input_dataset_path}")
-        dataset = SOBRDataset(arrow_path=input_dataset_path, seed=int(self._cfg_get(config, "seed")))
+        dataset = SOBRDataset(
+            arrow_path=input_dataset_path,
+            seed=int(self._cfg_get(config, "seed")),
+        )
         table = dataset.table
 
         # Optional subset (strictly config-driven)
         if bool(self._cfg_get(config, "subset.enabled")):
             size = self._cfg_get(config, "subset.size")
             if size is not None and len(table) > int(size):
-                import numpy as np
-
                 rng = np.random.default_rng(int(self._cfg_get(config, "seed")))
                 indices = rng.choice(len(table), size=int(size), replace=False)
                 logger.info(f"Using subset (seeded): {int(size)}/{len(table)} samples")
@@ -140,32 +169,35 @@ class HPCFilterStrategy(PollutionFilterStrategy):
         
         logger.info(f"Loaded {len(posts)} posts")
         
-        # Step 2: GLiNER detection + masking
-        logger.info("Step 1/3: Pollution Detection & Masking")
+        # =======================================================================
+        # Initialize GLiNER Detector & Components
+        # =======================================================================
+        logger.info("Initializing GLiNER detector and components")
         taxonomy_config, constraints_config = self._load_taxonomy_config(config)
         gliner_cfg = config.get("gliner", {})
         batch_inference_cfg = gliner_cfg.get("batch_inference", {})
+        
         batch_config = BatchInferenceConfig(
             enable_batching=batch_inference_cfg.get("enable_batching", True),
-            batch_size=int(self._cfg_get(config, "gliner.batch_size")),
+            batch_size=gliner_batch_size,
             num_buckets=batch_inference_cfg.get("num_buckets"),
             min_bucket_size=batch_inference_cfg.get("min_bucket_size", 4),
             enable_prompt_caching=batch_inference_cfg.get("enable_prompt_caching", True),
         )
+        
         chunking_cfg = gliner_cfg.get("chunking", {})
-        chunk_cache_path = chunking_cfg.get("checkpoint_path") or chunking_cfg.get(
-            "chunk_cache_path"
-        )
         budget_config = BudgetConfig(
             model_max_length=int(self._cfg_get(config, "encoder.max_length")),
             mode=chunking_cfg.get("mode", "single_sentence"),
-            legacy_sequential_mode=chunking_cfg.get("legacy_sequential_mode", False),
-            parallel_chunking_workers=int(chunking_cfg.get("parallel_chunking_workers", 0)),
+            legacy_sequential_mode=False,  # Always use staged mode
+            parallel_chunking_workers=int(chunking_cfg.get("parallel_chunking_workers", 16)),
             parallel_chunking_min_texts=int(chunking_cfg.get("parallel_chunking_min_texts", 512)),
             gliner_max_words=int(gliner_cfg.get("gliner_max_words", 512)),
             tokens_per_word_ratio=float(gliner_cfg.get("tokens_per_word_ratio", 1.3)),
         )
+        
         require_bi_encoder = bool(gliner_cfg.get("require_bi_encoder", False))
+        
         gliner = GLiNERDetector(
             model_name=str(self._cfg_get(config, "gliner.model")),
             device=device,
@@ -176,296 +208,273 @@ class HPCFilterStrategy(PollutionFilterStrategy):
             budget_config=budget_config,
             batch_inference_config=batch_config,
             require_bi_encoder=require_bi_encoder,
-            chunk_cache_path=str(chunk_cache_path) if chunk_cache_path else None,
         )
+        
+        # Hoist label embeddings to strategy level (bi-encoder optimization)
+        inference_labels = gliner.taxonomy.get_inference_labels()
+        cached_label_embeddings = gliner.get_cached_label_embeddings(inference_labels)
+        if cached_label_embeddings is not None:
+            logger.info(f"Hoisted label embeddings for {len(inference_labels)} labels")
+        
+        # =======================================================================
+        # Step 2: Stage 1 - CPU Saturated Parallel Chunking
+        # =======================================================================
+        # Check for resume: if post_chunked exists, skip Stage 1
+        has_chunks = has_post_chunked_column(table)
+        
+        if has_chunks:
+            logger.info("Resume detected: post_chunked column exists, skipping Stage 1")
+            table_with_chunks = table
+        else:
+            logger.info("Stage 1/2: CPU-Saturated Parallel Chunking")
+            
+            # Prepare labels list (full taxonomy for all documents)
+            labels_list: List[Optional[List[str]]] = [inference_labels for _ in posts]
+            
+            # Get tokenizer name for worker initialization
+            tokenizer_name = gliner.tokenizer.name_or_path
+            words_splitter_type = gliner.chunker._words_splitter_type
+            
+            num_workers = int(chunking_cfg.get("parallel_chunking_workers", 16))
+            micro_batch_size = int(chunking_cfg.get("micro_batch_size", 1000))
+            
+            chunk_pbar = tqdm(
+                total=len(posts),
+                desc="Stage 1: Chunking",
+                unit="doc",
+                dynamic_ncols=True,
+            )
+            
+            def _chunk_progress(count: int) -> None:
+                chunk_pbar.n = count
+                chunk_pbar.refresh()
+            
+            try:
+                writer = ChunkingArtifactWriter(
+                    tokenizer_name=tokenizer_name,
+                    budget_config=budget_config,
+                    words_splitter_type=words_splitter_type,
+                    language="en",
+                    num_workers=num_workers,
+                    micro_batch_size=micro_batch_size,
+                    progress_callback=_chunk_progress,
+                )
+                
+                table_with_chunks = writer.process_and_save(
+                    posts=posts,
+                    labels_list=labels_list,
+                    table=table,
+                )
+            finally:
+                chunk_pbar.close()
+            
+            logger.info("Stage 1 complete: post_chunked column populated")
+            
+            # Force garbage collection between stages
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        
+        # =======================================================================
+        # Step 3: Stage 2 - GPU Saturated Global-Sorted Inference
+        # =======================================================================
+        logger.info("Stage 2/2: GPU-Saturated Global-Sorted Inference")
+        
+        post_chunked_column = table_with_chunks["post_chunked"]
+        
+        # Configure pin_memory for HPC
+        pin_memory = bool(self._cfg_get_optional(
+            config, "execution.async_prefetch.pin_memory", True
+        ))
+        
+        entities_batch = gliner.inference_from_manifest(
+            post_chunked_column=post_chunked_column,
+            labels=inference_labels,
+            batch_size=gliner_batch_size,
+            cached_label_embeddings=cached_label_embeddings,
+            pin_memory=pin_memory,
+            show_progress=True,
+        )
+        
+        logger.info("Stage 2 complete: inference finished")
+        
+        # =======================================================================
+        # Step 4: Masking & Pollution Logs
+        # =======================================================================
+        logger.info("Applying typed masks")
         
         masker = SpanMasker(
             tokenizer=gliner.model.data_processor.transformer_tokenizer,
             entity_to_mask=gliner.get_mask_tokens(),
         )
-
-        shard_size = int(chunking_cfg.get("shard_size", 0) or 0)
-        if shard_size <= 0:
-            shard_size = len(posts)
-        total_shards = max(1, (len(posts) + shard_size - 1) // shard_size)
-        if total_shards > 1:
-            logger.info(
-                "Sharding enabled: %d posts per shard (%d shards total)",
-                shard_size,
-                total_shards,
-            )
-
-        inference_pbar = None
-        if total_shards > 1:
-            inference_pbar = tqdm(
-                total=0,
-                desc="GLiNER inference (total)",
-                unit="batch",
-                dynamic_ncols=True,
-            )
-
-        def _inference_total_update(count: int) -> None:
-            if inference_pbar is None:
-                return
-            if inference_pbar.total is None:
-                inference_pbar.total = 0
-            inference_pbar.total += int(count)
-            inference_pbar.refresh()
-
-        def _inference_update(count: int) -> None:
-            if inference_pbar is None:
-                return
-            inference_pbar.update(int(count))
-
-        chunk_cache_base = Path(chunk_cache_path) if chunk_cache_path else None
-        if total_shards > 1 and chunk_cache_base is not None:
-            logger.info("Chunk cache base: %s", chunk_cache_base)
-
-        compute_recall = bool(self._cfg_get(config, "gliner.compute_explicit_recall"))
-        reference_patterns = (
-            gliner.taxonomy.get_reference_patterns() if compute_recall else {}
-        )
-        total_ref = 0
-        matched_ref = 0
-        per_label_counts: Dict[str, Dict[str, int]] = {}
-
-        def _update_recall_stats(texts: list, entities: list) -> None:
-            nonlocal total_ref, matched_ref
-            for text, entity_list in zip(texts, entities):
-                ref_spans = []
-                for label, patterns in reference_patterns.items():
-                    for pattern in patterns:
-                        for match in re.finditer(pattern, text):
-                            ref_spans.append((match.start(), match.end(), label))
-
-                total_ref += len(ref_spans)
-                for start, end, label in ref_spans:
-                    matched = False
-                    for entity in entity_list:
-                        if entity.get("label") != label:
-                            continue
-                        if max(start, entity["start"]) < min(end, entity["end"]):
-                            matched = True
-                            break
-                    counts = per_label_counts.setdefault(
-                        label,
-                        {"matched": 0, "total": 0},
-                    )
-                    if matched:
-                        matched_ref += 1
-                        counts["matched"] += 1
-                    counts["total"] += 1
-
-        total_spans = 0
-        masked_texts: list = []
-        pollution_logs: list = []
-
-        # Step 3: Embed masked texts
-        # Critical (Section 5.1 of LEACE Strategy Report):
-        # - LEACE MUST be computed on embeddings of MASKED text (post_masked), NOT raw text.
-        # - FrozenEmbedder MUST register the same typed mask tokens as GLiNERDetector.
-        logger.info("Step 2/3: Embedding Masked Texts")
-
-        # Extract mask tokens for tokenizer alignment (Section 5.1)
+        
+        masked_texts, pollution_logs = masker.mask_batch(posts, entities_batch, post_ids)
+        total_spans = sum(len(entities) for entities in entities_batch)
+        logger.info(f"Masked {total_spans} pollution spans")
+        
+        # =======================================================================
+        # Step 5: Embedding & LEACE
+        # =======================================================================
+        logger.info("Embedding masked texts and computing LEACE projection")
+        
+        # Extract mask tokens for tokenizer alignment
         mask_tokens = list(dict.fromkeys(gliner.get_mask_tokens().values()))
-
+        
         embedder = FrozenEmbedder(
             model_name=str(self._cfg_get(config, "encoder.model")),
             device=self._resolve_device(self._cfg_get(config, "encoder.device")),
             max_length=int(self._cfg_get(config, "encoder.max_length")),
-            special_tokens=mask_tokens,  # Critical for tokenizer alignment
+            special_tokens=mask_tokens,
         )
-
-        encoder = DemographicEncoder(get_demographic_columns()).fit(table)
-
+        
+        encoder = DemographicEncoder(get_demographic_columns()).fit(table_with_chunks)
+        
         leace = LEACEComputer(
             embedding_dim=embedder.get_embedding_dim(),
             regularization=float(self._cfg_get(config, "leace.regularization")),
             device=self._resolve_device(self._cfg_get(config, "encoder.device")),
             force_cpu=bool(self._cfg_get(config, "leace.force_cpu")),
         )
-
+        
+        # Sharded embedding + LEACE accumulation
+        shard_size = int(chunking_cfg.get("shard_size", 0) or len(masked_texts))
+        if shard_size <= 0:
+            shard_size = len(masked_texts)
+        
+        total_shards = max(1, (len(masked_texts) + shard_size - 1) // shard_size)
+        
         probe_enabled = bool(self._cfg_get(config, "probe.compute_amnesic_drop"))
-        max_probe_samples = (
-            int(self._cfg_get(config, "probe.max_samples")) if probe_enabled else 0
-        )
-        probe_embeddings: list = []
-
-        # Detect spans + mask + embed in shards
-        logger.info("  Detecting pollution spans...")
+        max_probe_samples = int(self._cfg_get(config, "probe.max_samples")) if probe_enabled else 0
+        probe_embeddings: List[torch.Tensor] = []
+        
         concept_stats = None
-        for shard_idx in range(total_shards):
-            start = shard_idx * shard_size
-            end = min(len(posts), start + shard_size)
-            shard_len = end - start
-            if shard_len <= 0:
-                continue
-
-            logger.info(
-                "  Shard %d/%d: rows %d-%d",
-                shard_idx + 1,
-                total_shards,
-                start,
-                end - 1,
-            )
-
-            shard_table = table.slice(start, shard_len)
-            shard_posts = shard_table["post"].to_pylist()
-            shard_post_ids = shard_table["post_id"].to_pylist()
-
-            if total_shards > 1 and chunk_cache_base is not None:
-                shard_cache = chunk_cache_base.with_name(
-                    f"{chunk_cache_base.stem}.shard{shard_idx:04d}{chunk_cache_base.suffix}"
+        
+        embed_pbar = tqdm(
+            total=total_shards,
+            desc="Embedding & LEACE",
+            unit="shard",
+            dynamic_ncols=True,
+        )
+        
+        try:
+            for shard_idx in range(total_shards):
+                start = shard_idx * shard_size
+                end = min(len(masked_texts), start + shard_size)
+                
+                shard_masked = masked_texts[start:end]
+                shard_table = table_with_chunks.slice(start, end - start)
+                
+                embeddings_shard = embedder.embed_texts(
+                    shard_masked,
+                    batch_size=encoder_batch_size,
+                    show_progress=False,
                 )
-                gliner.chunk_cache_path = shard_cache
-
-            entities_shard = gliner.detect_spans_long(
-                shard_posts,
-                batch_size=gliner_batch_size,
-                show_progress=total_shards == 1,
-                inference_progress_callback=_inference_update if total_shards > 1 else None,
-                inference_total_callback=_inference_total_update if total_shards > 1 else None,
-            )
-
-            masked_shard, logs_shard = masker.mask_batch(
-                shard_posts,
-                entities_shard,
-                shard_post_ids,
-            )
-
-            masked_texts.extend(masked_shard)
-            pollution_logs.extend(logs_shard)
-            total_spans += sum(len(entities) for entities in entities_shard)
-
-            if compute_recall:
-                _update_recall_stats(shard_posts, entities_shard)
-
-            embeddings_shard = embedder.embed_texts(
-                masked_shard,
-                batch_size=encoder_batch_size,
-                show_progress=True,
-            )
-
-            if probe_enabled and len(probe_embeddings) < max_probe_samples:
-                remaining = max_probe_samples - len(probe_embeddings)
-                if remaining > 0:
-                    embeddings_cpu = embeddings_shard.detach().to(
-                        "cpu", dtype=torch.float32
-                    )
-                    probe_embeddings.append(embeddings_cpu[:remaining])
-
-            concepts_shard = torch.from_numpy(encoder.transform(shard_table))
-            concept_stats = leace.accumulate_batch_concepts(
-                embeddings_shard,
-                concepts_shard,
-                concept_stats,
-            )
-            del embeddings_shard
-
-        if inference_pbar is not None:
-            inference_pbar.close()
-
+                
+                if probe_enabled and len(probe_embeddings) < max_probe_samples:
+                    remaining = max_probe_samples - sum(e.shape[0] for e in probe_embeddings)
+                    if remaining > 0:
+                        probe_embeddings.append(
+                            embeddings_shard[:remaining].detach().to("cpu", dtype=torch.float32)
+                        )
+                
+                concepts_shard = torch.from_numpy(encoder.transform(shard_table))
+                concept_stats = leace.accumulate_batch_concepts(
+                    embeddings_shard,
+                    concepts_shard,
+                    concept_stats,
+                )
+                
+                del embeddings_shard
+                embed_pbar.update(1)
+        finally:
+            embed_pbar.close()
+        
         if concept_stats is None:
             raise RuntimeError("LEACE accumulation failed: no concept statistics computed")
-
-        logger.info("  Masked %d pollution spans", total_spans)
-
-        # Step 4: Compute LEACE projection from accumulated stats
-        logger.info("Step 3/3: Computing LEACE Projection (Accumulated)")
+        
+        # Compute projection matrix
+        logger.info("Computing LEACE projection matrix")
         projection_matrix = leace.compute_projection_from_concept_stats(concept_stats)
         
-        # Step 5: Save outputs
-        logger.info("Saving outputs...")
+        # =======================================================================
+        # Step 6: Save Outputs
+        # =======================================================================
+        logger.info("Saving outputs")
         
-        # Save cleaned dataset
-        self._save_cleaned_dataset(
-            table, masked_texts, output_dataset_path
-        )
+        # Save cleaned dataset (without post_chunked to match expected schema)
+        self._save_cleaned_dataset(table_with_chunks, masked_texts, output_dataset_path)
         
         # Save projection matrix
         torch.save(projection_matrix.cpu(), projection_matrix_path)
-        logger.info(f"  Saved projection matrix: {projection_matrix_path}")
+        logger.info(f"Saved projection matrix: {projection_matrix_path}")
         
         # Save pollution logs
         self._save_pollution_logs(pollution_logs, pollution_logs_path)
-        logger.info(f"  Saved pollution logs: {pollution_logs_path}")
         
-        # Return metadata
-        metadata = {
-            "num_samples": len(table),
+        # =======================================================================
+        # Step 7: Compute Metrics & Return
+        # =======================================================================
+        metadata: Dict[str, Any] = {
+            "num_samples": len(table_with_chunks),
             "num_pollution_spans": total_spans,
             "projection_matrix_shape": list(projection_matrix.shape),
             "device": device,
             "use_bf16": self.use_bf16,
+            "staged_execution": True,
+            "stage1_skipped": has_chunks,
         }
-
-        if compute_recall:
-            overall = (matched_ref / total_ref) if total_ref > 0 else None
-            per_label_recall = {
-                label: (counts["matched"] / counts["total"])
-                if counts["total"] > 0
-                else None
-                for label, counts in per_label_counts.items()
-            }
-            metadata["explicit_recall"] = {
-                "overall": overall,
-                "total_reference_spans": total_ref,
-                "matched_reference_spans": matched_ref,
-                "per_label": per_label_recall,
-            }
-
-        if probe_enabled:
-            if probe_embeddings:
-                embeddings_before = torch.cat(probe_embeddings, dim=0)
-            else:
-                embeddings_before = torch.empty((0, embedder.get_embedding_dim()))
-
-            if embeddings_before.numel() == 0:
-                logger.warning("Probe skipped: no embeddings collected")
-            else:
-                max_samples = self._cfg_get(config, "probe.max_samples")
-                if max_samples and len(embeddings_before) > max_samples:
-                    embeddings_before = embeddings_before[:max_samples]
-                    probe_table = table.slice(0, int(max_samples))
-                else:
-                    probe_table = table.slice(0, int(len(embeddings_before)))
-
-                P_cpu = projection_matrix.detach().to("cpu", dtype=torch.float32)
-                embeddings_after = embeddings_before @ P_cpu.T
-
-                by_column: Dict[str, Any] = {}
-                drops = []
-                for col in get_demographic_columns():
-                    labels_np = extract_probe_labels(probe_table, col)
-                    labels_t = torch.tensor(labels_np, dtype=torch.long)
-                    acc_before, acc_after, amnesic_drop = compute_amnesic_drop(
-                        embeddings_before,
-                        embeddings_after,
-                        labels_t,
-                        train_split=float(self._cfg_get(config, "probe.train_split")),
-                        random_state=int(self._cfg_get(config, "seed")),
-                    )
-                    by_column[col] = {
-                        "accuracy_before": acc_before,
-                        "accuracy_after": acc_after,
-                        "amnesic_drop": amnesic_drop,
-                    }
-                    drops.append(float(amnesic_drop))
-
-                min_drop = float(min(drops)) if drops else 0.0
-                metadata["probe"] = {
-                    "by_column": by_column,
-                    "min_amnesic_drop": min_drop,
-                    "threshold": float(self._cfg_get(config, "probe.amnesic_drop_threshold")),
-                    "max_samples": int(len(embeddings_before)),
+        
+        # Explicit recall
+        if bool(self._cfg_get(config, "gliner.compute_explicit_recall")):
+            recall = compute_explicit_recall(
+                posts,
+                entities_batch,
+                gliner.taxonomy.get_reference_patterns(),
+            )
+            metadata["explicit_recall"] = recall
+        
+        # Amnesic drop probe
+        if probe_enabled and probe_embeddings:
+            embeddings_before = torch.cat(probe_embeddings, dim=0)[:max_probe_samples]
+            probe_table = table_with_chunks.slice(0, len(embeddings_before))
+            
+            P_cpu = projection_matrix.detach().to("cpu", dtype=torch.float32)
+            embeddings_after = embeddings_before @ P_cpu.T
+            
+            by_column: Dict[str, Any] = {}
+            drops: List[float] = []
+            
+            for col in get_demographic_columns():
+                labels_np = extract_probe_labels(probe_table, col)
+                labels_t = torch.tensor(labels_np, dtype=torch.long)
+                acc_before, acc_after, amnesic_drop = compute_amnesic_drop(
+                    embeddings_before,
+                    embeddings_after,
+                    labels_t,
+                    train_split=float(self._cfg_get(config, "probe.train_split")),
+                    random_state=int(self._cfg_get(config, "seed")),
+                )
+                by_column[col] = {
+                    "accuracy_before": acc_before,
+                    "accuracy_after": acc_after,
+                    "amnesic_drop": amnesic_drop,
                 }
-
-                if bool(self._cfg_get(config, "quality.enforce_thresholds")):
-                    threshold = float(self._cfg_get(config, "probe.amnesic_drop_threshold"))
-                    if min_drop < threshold:
-                        raise ValueError(
-                            f"Amnesic drop gate failed: min={min_drop:.3f} < threshold={threshold:.3f}"
-                        )
+                drops.append(float(amnesic_drop))
+            
+            min_drop = float(min(drops)) if drops else 0.0
+            metadata["probe"] = {
+                "by_column": by_column,
+                "min_amnesic_drop": min_drop,
+                "threshold": float(self._cfg_get(config, "probe.amnesic_drop_threshold")),
+                "max_samples": len(embeddings_before),
+            }
+            
+            if bool(self._cfg_get(config, "quality.enforce_thresholds")):
+                threshold = float(self._cfg_get(config, "probe.amnesic_drop_threshold"))
+                if min_drop < threshold:
+                    raise ValueError(
+                        f"Amnesic drop gate failed: min={min_drop:.3f} < threshold={threshold:.3f}"
+                    )
         
         logger.info("Phase A complete!")
         return metadata
@@ -473,26 +482,36 @@ class HPCFilterStrategy(PollutionFilterStrategy):
     def _save_cleaned_dataset(
         self,
         original_table: pa.Table,
-        masked_texts: list,
+        masked_texts: List[str],
         output_path: Path,
     ) -> None:
         """Save cleaned dataset with post_masked column populated."""
-        df = original_table.to_pandas()
+        import pandas as pd
+        
+        # Remove post_chunked if present (not part of base schema)
+        columns_to_keep = [
+            name for name in original_table.column_names
+            if name != "post_chunked"
+        ]
+        clean_table = original_table.select(columns_to_keep)
+        
+        # Convert to pandas, update post_masked, convert back
+        df = clean_table.to_pandas()
         df["post_masked"] = masked_texts
         
         cleaned_table = pa.Table.from_pandas(df, schema=SOBR_SCHEMA)
         feather.write_feather(cleaned_table, output_path)
         
-        logger.info(f"  Saved cleaned dataset: {output_path}")
+        logger.info(f"Saved cleaned dataset: {output_path}")
     
     def _save_pollution_logs(
         self,
-        pollution_logs: list,
+        pollution_logs: List[Dict[str, Any]],
         output_path: Path,
     ) -> None:
         """Save pollution logs as Arrow table."""
         if not pollution_logs:
-            logger.warning("  No pollution logs to save")
+            logger.warning("No pollution logs to save")
             empty_table = pa.Table.from_pylist([], schema=POLLUTION_LOG_SCHEMA)
             feather.write_feather(empty_table, output_path)
             return
@@ -500,7 +519,7 @@ class HPCFilterStrategy(PollutionFilterStrategy):
         logs_table = pa.Table.from_pylist(pollution_logs, schema=POLLUTION_LOG_SCHEMA)
         feather.write_feather(logs_table, output_path)
         
-        logger.info(f"  Saved {len(pollution_logs)} pollution log entries")
+        logger.info(f"Saved {len(pollution_logs)} pollution log entries: {output_path}")
 
     def _load_taxonomy_config(self, config: Dict[str, Any]) -> tuple:
         """Load taxonomy config (labels, masks, constraints) if provided."""
@@ -522,4 +541,3 @@ class HPCFilterStrategy(PollutionFilterStrategy):
         taxonomy_cfg = cfg.get("taxonomy", {})
         constraints_cfg = taxonomy_cfg.get("width_constraints", {})
         return taxonomy_cfg, constraints_cfg
-# HPCFilterStrategy - HPC implementation with CUDA Graphs and full-batch LEACE
