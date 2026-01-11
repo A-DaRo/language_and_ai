@@ -45,6 +45,9 @@ class FlattenedChunks:
     token_counts: np.ndarray  # int16 for memory efficiency
     doc_offsets: np.ndarray   # int64 for large datasets
     chunk_metadata: List[Tuple[int, int]]  # (doc_idx, local_chunk_idx)
+    # Per-flat-chunk start offset for projecting entities back to document coords.
+    # Optional because some callers only need planning stats.
+    chunk_starts: Optional[np.ndarray] = None
     sort_indices: Optional[np.ndarray] = None
     inverse_indices: Optional[np.ndarray] = None
     
@@ -86,6 +89,7 @@ class FlattenedChunks:
 def flatten_chunks(
     post_chunked_column: pa.Array,
     extract_texts: bool = True,
+    include_chunk_metadata: bool = True,
 ) -> FlattenedChunks:
     """
     Flatten nested post_chunked column into flat arrays with lineage tracking.
@@ -107,62 +111,124 @@ def flatten_chunks(
             f"Expected ListArray for post_chunked, got {post_chunked_column.type}"
         )
     
-    # Convert to ListArray for offset access
-    if isinstance(post_chunked_column, pa.ChunkedArray):
-        # Combine chunks for contiguous access
-        post_chunked_column = post_chunked_column.combine_chunks()
-    
-    list_array = post_chunked_column
-    
-    # Get document offsets from ListArray
-    # offsets[i] is the start of document i's chunks in the flattened array
-    # offsets[i+1] - offsets[i] is the number of chunks in document i
-    offsets = list_array.offsets.to_numpy()  # int32 or int64
-    doc_offsets = offsets.astype(np.int64)
-    
-    # Get flattened struct array (all chunks across all documents)
-    flat_structs = list_array.flatten()
-    total_chunks = len(flat_structs)
-    
-    logger.debug(
-        f"Flattening {len(doc_offsets) - 1} documents with {total_chunks} total chunks"
-    )
-    
-    # Extract token_count as contiguous array (zero-copy if possible)
-    try:
-        token_count_array = flat_structs.field("token_count")
-        token_counts = token_count_array.to_numpy(zero_copy_only=False).astype(np.int16)
-    except Exception as exc:
-        logger.warning(f"Failed to extract token_count field: {exc}. Using zeros.")
-        token_counts = np.zeros(total_chunks, dtype=np.int16)
-    
-    # Extract texts if requested
-    if extract_texts:
+    # IMPORTANT: Avoid combine_chunks() for very large datasets.
+    # Combining can overflow 32-bit offsets for large string buffers (>2GB).
+
+    def _process_list_array(
+        list_array: pa.Array,
+        global_doc_offsets: List[int],
+        global_texts: List[str],
+        token_count_parts: List[np.ndarray],
+        chunk_start_parts: List[np.ndarray],
+        chunk_metadata_out: Optional[List[Tuple[int, int]]],
+    ) -> None:
+        # offsets[i] is start index of doc i's chunks in this list_array.flatten()
+        offsets = list_array.offsets.to_numpy(zero_copy_only=False)
+
+        flat_structs = list_array.flatten()
+        total_chunks_local = len(flat_structs)
+
+        # token_count
         try:
-            text_array = flat_structs.field("text")
-            texts = text_array.to_pylist()
+            token_count_array = flat_structs.field("token_count")
+            token_count_parts.append(
+                token_count_array.to_numpy(zero_copy_only=False).astype(np.int16)
+            )
         except Exception as exc:
-            logger.warning(f"Failed to extract text field: {exc}. Using empty strings.")
-            texts = [""] * total_chunks
+            logger.warning(f"Failed to extract token_count field: {exc}. Using zeros.")
+            token_count_parts.append(np.zeros(total_chunks_local, dtype=np.int16))
+
+        # chunk start offsets
+        try:
+            start_array = flat_structs.field("start")
+            chunk_start_parts.append(
+                start_array.to_numpy(zero_copy_only=False).astype(np.int32)
+            )
+        except Exception as exc:
+            logger.warning(f"Failed to extract start field: {exc}. Using zeros.")
+            chunk_start_parts.append(np.zeros(total_chunks_local, dtype=np.int32))
+
+        # texts
+        if extract_texts:
+            try:
+                text_array = flat_structs.field("text")
+                global_texts.extend(text_array.to_pylist())
+            except Exception as exc:
+                logger.warning(f"Failed to extract text field: {exc}. Using empty strings.")
+                global_texts.extend([""] * total_chunks_local)
+
+        # doc_offsets
+        # global_doc_offsets already has a trailing sentinel for previous docs.
+        # We append new sentinels based on doc lengths in this chunk.
+        current_flat_total = global_doc_offsets[-1]
+        num_docs_local = len(offsets) - 1
+        for doc_idx_local in range(num_docs_local):
+            doc_len = int(offsets[doc_idx_local + 1] - offsets[doc_idx_local])
+            current_flat_total += doc_len
+            global_doc_offsets.append(current_flat_total)
+
+        # Optional metadata
+        if chunk_metadata_out is not None:
+            # doc index in global space is (len(global_doc_offsets_before)-1) + local
+            doc_base = (len(global_doc_offsets) - 1) - num_docs_local
+            local_flat_idx = 0
+            for doc_idx_local in range(num_docs_local):
+                doc_len = int(offsets[doc_idx_local + 1] - offsets[doc_idx_local])
+                for local_chunk_idx in range(doc_len):
+                    chunk_metadata_out.append((doc_base + doc_idx_local, local_chunk_idx))
+                local_flat_idx += doc_len
+
+    texts: List[str] = []
+    token_count_parts: List[np.ndarray] = []
+    chunk_start_parts: List[np.ndarray] = []
+    doc_offsets_list: List[int] = [0]
+    chunk_metadata: Optional[List[Tuple[int, int]]] = [] if include_chunk_metadata else None
+
+    if isinstance(post_chunked_column, pa.ChunkedArray):
+        for chunk in post_chunked_column.iterchunks():
+            _process_list_array(
+                chunk,
+                doc_offsets_list,
+                texts,
+                token_count_parts,
+                chunk_start_parts,
+                chunk_metadata,
+            )
     else:
-        texts = []  # Caller will handle text extraction later
-    
-    # Build chunk metadata for reconstruction
-    # chunk_metadata[flat_idx] = (doc_idx, local_chunk_idx)
-    chunk_metadata: List[Tuple[int, int]] = []
-    num_docs = len(doc_offsets) - 1
-    
-    for doc_idx in range(num_docs):
-        start = doc_offsets[doc_idx]
-        end = doc_offsets[doc_idx + 1]
-        for local_idx, flat_idx in enumerate(range(start, end)):
-            chunk_metadata.append((doc_idx, local_idx))
-    
+        _process_list_array(
+            post_chunked_column,
+            doc_offsets_list,
+            texts,
+            token_count_parts,
+            chunk_start_parts,
+            chunk_metadata,
+        )
+
+    token_counts = (
+        np.concatenate(token_count_parts, axis=0)
+        if token_count_parts
+        else np.zeros(0, dtype=np.int16)
+    )
+    chunk_starts = (
+        np.concatenate(chunk_start_parts, axis=0)
+        if chunk_start_parts
+        else np.zeros(0, dtype=np.int32)
+    )
+    doc_offsets = np.asarray(doc_offsets_list, dtype=np.int64)
+
+    if not extract_texts:
+        texts = []
+
+    logger.debug(
+        f"Flattening {len(doc_offsets) - 1} documents with {len(token_counts)} total chunks"
+    )
+
     return FlattenedChunks(
         texts=texts,
         token_counts=token_counts,
         doc_offsets=doc_offsets,
-        chunk_metadata=chunk_metadata,
+        chunk_metadata=chunk_metadata or [],
+        chunk_starts=chunk_starts,
     )
 
 

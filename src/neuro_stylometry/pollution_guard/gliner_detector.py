@@ -1704,7 +1704,11 @@ class GLiNERDetector:
         
         # Step 1: Flatten chunks with lineage tracking
         logger.info("Stage 2.1: Flattening post_chunked column")
-        flattened = flatten_chunks(post_chunked_column, extract_texts=True)
+        flattened = flatten_chunks(
+            post_chunked_column,
+            extract_texts=True,
+            include_chunk_metadata=False,
+        )
         
         if flattened.num_chunks == 0:
             logger.warning("No chunks to process")
@@ -1777,12 +1781,9 @@ class GLiNERDetector:
         # We need chunk metadata to project offsets
         all_results: List[List[Dict[str, Any]]] = []
         
-        # Re-read chunk metadata for offset projection
-        if isinstance(post_chunked_column, pa.ChunkedArray):
-            post_chunked_column = post_chunked_column.combine_chunks()
-        
-        list_array = post_chunked_column
-        flat_structs = list_array.flatten()
+        chunk_starts = flattened.chunk_starts
+        if chunk_starts is None:
+            chunk_starts = np.zeros(flattened.num_chunks, dtype=np.int32)
         
         for doc_idx, doc_chunk_entities in enumerate(nested_entities):
             doc_start = flattened.doc_offsets[doc_idx]
@@ -1793,11 +1794,7 @@ class GLiNERDetector:
             for local_chunk_idx, chunk_entities in enumerate(doc_chunk_entities):
                 flat_idx = doc_start + local_chunk_idx
                 
-                # Get chunk metadata from Arrow struct
-                try:
-                    chunk_start = int(flat_structs.field("start")[flat_idx].as_py())
-                except Exception:
-                    chunk_start = 0
+                chunk_start = int(chunk_starts[flat_idx])
                 
                 # Project each entity's offsets
                 for entity in chunk_entities:
