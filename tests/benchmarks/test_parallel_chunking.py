@@ -442,7 +442,7 @@ class TestWorkerScaling:
         start = max(1, int(physical_cores - (physical_cores / 2)))
         end = int(physical_cores + (physical_cores / 2))
         
-        worker_counts = list(range(start, end, 4))
+        worker_counts = list(range(4, 32, 4))
         if physical_cores not in worker_counts:
             worker_counts.append(physical_cores)
         worker_counts = sorted(list(set(worker_counts)))
