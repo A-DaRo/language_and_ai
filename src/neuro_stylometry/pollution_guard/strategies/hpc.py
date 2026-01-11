@@ -10,6 +10,7 @@ Key Optimizations:
 - Global argsort by token_count minimizes padding waste.
 - Label embeddings hoisted to strategy level for bi-encoder efficiency.
 - pin_memory + non_blocking for overlapped PCIe transfers.
+- RuntimeController autotuning for adaptive batch sizing (OOM resilience).
 
 Reference: Technical Reports on Staged Execution Architecture.
 Implements: phaseA-D_implementation_plan.md Section 7.4 (HPC Mode)
@@ -48,7 +49,9 @@ from ...data_engine.schemas import (
     is_post_chunked_fully_populated,
     validate_schema_flexible,
 )
-from ...data_engine.chunking_writer import ChunkingArtifactWriter
+from ...data_engine.chunking_writer import ChunkingArtifactWriter, save_chunked_table_atomic
+from ...data_engine.chunking_validation import find_invalid_post_chunked_indices
+from ...hardware_ops.runtime import RuntimeController, RuntimeConfig
 
 logger = logging.getLogger(__name__)
 
@@ -113,6 +116,49 @@ class HPCFilterStrategy(PollutionFilterStrategy):
                 raise RuntimeError("Config requests CUDA but torch.cuda.is_available() is False")
             return spec
         raise ValueError(f"Unsupported device spec '{device_spec}'")
+    
+    def _create_runtime_controller(self, config: Dict[str, Any]) -> RuntimeController:
+        """
+        Create RuntimeController from config for autotuning.
+        
+        Reads from execution.autotuning section in config.
+        Falls back to HPC-optimized defaults if not specified.
+        
+        Args:
+            config: Pipeline configuration dict.
+            
+        Returns:
+            RuntimeController configured for HPC inference.
+        """
+        autotuning_cfg = self._cfg_get_optional(config, "execution.autotuning", {})
+        
+        # Check if autotuning is explicitly disabled
+        if not autotuning_cfg.get("enabled", True):
+            logger.info("Autotuning disabled in config; using minimal controller")
+            # Return a minimal controller that won't change batch sizes
+            return RuntimeController(RuntimeConfig(
+                warmup_batches=0,
+                initial_token_budget=2**30,  # Very large, effectively no limit
+                min_token_budget=2**30,
+                max_token_budget=2**30,
+            ))
+        
+        # HPC defaults (optimized for A100/H100)
+        runtime_config = RuntimeConfig(
+            warmup_batches=int(autotuning_cfg.get("warmup_batches", 10)),
+            initial_token_budget=int(autotuning_cfg.get("initial_token_budget", 32768)),
+            min_token_budget=int(autotuning_cfg.get("min_token_budget", 4096)),
+            max_token_budget=int(autotuning_cfg.get("max_token_budget", 524288)),
+            memory_headroom_mb=float(autotuning_cfg.get("memory_headroom_mb", 2048)),
+            scale_up_factor=float(autotuning_cfg.get("scale_up_factor", 1.25)),
+            scale_down_factor=float(autotuning_cfg.get("scale_down_factor", 0.85)),
+            oom_slash_factor=float(autotuning_cfg.get("oom_slash_factor", 0.5)),
+            stability_threshold=float(autotuning_cfg.get("stability_threshold", 0.1)),
+            history_window=int(autotuning_cfg.get("history_window", 10)),
+            recovery_patience=int(autotuning_cfg.get("recovery_patience", 5)),
+        )
+        
+        return RuntimeController(runtime_config)
     
     def execute(
         self,
@@ -225,13 +271,40 @@ class HPCFilterStrategy(PollutionFilterStrategy):
         # Resume logic:
         # - Stage 2 can only run when post_chunked exists AND has no NULLs.
         # - If post_chunked exists but has NULLs, run Stage 1 only for remaining rows.
-        stage1_skipped = is_post_chunked_fully_populated(table)
+        invalid_chunk_rows: List[int] = []
+        stage1_skipped = False
 
-        if stage1_skipped:
-            logger.info("Resume detected: post_chunked fully populated; skipping Stage 1")
-            table_with_chunks = table
-        else:
+        if is_post_chunked_fully_populated(table):
+            logger.info("Resume candidate detected: validating post_chunked against raw posts")
+            invalid_chunk_rows = find_invalid_post_chunked_indices(
+                posts=posts,
+                post_chunked_column=table["post_chunked"],
+            )
+            if not invalid_chunk_rows:
+                stage1_skipped = True
+                logger.info(
+                    "Resume validated: post_chunked fully populated and matches raw posts; skipping Stage 1"
+                )
+                table_with_chunks = table
+            else:
+                logger.warning(
+                    f"Resume validation failed for {len(invalid_chunk_rows)} rows; recomputing those chunks"
+                )
+
+        if not stage1_skipped:
             logger.info("Stage 1/2: CPU-Saturated Parallel Chunking")
+
+            # IMPORTANT (Windows + mmap): to permanently persist post_chunked back into
+            # the *input* Arrow file, we must avoid holding a memory-mapped handle to it.
+            # Reload the dataset without mmap for Stage 1.
+            dataset_stage1 = SOBRDataset(
+                arrow_path=input_dataset_path,
+                seed=int(self._cfg_get(config, "seed")),
+                memory_map=False,
+            )
+            table = dataset_stage1.table
+            posts = table["post"].to_pylist()
+            post_ids = table["post_id"].to_pylist()
             
             # Prepare labels list (full taxonomy for all documents)
             labels_list: List[Optional[List[str]]] = [inference_labels for _ in posts]
@@ -243,7 +316,11 @@ class HPCFilterStrategy(PollutionFilterStrategy):
             num_workers = int(chunking_cfg.get("parallel_chunking_workers", 16))
             micro_batch_size = int(chunking_cfg.get("micro_batch_size", 1000))
             
-            missing = count_missing_post_chunked(table) if has_post_chunked_column(table) else len(posts)
+            missing = (
+                len(invalid_chunk_rows)
+                if invalid_chunk_rows
+                else (count_missing_post_chunked(table) if has_post_chunked_column(table) else len(posts))
+            )
 
             chunk_pbar = tqdm(
                 total=missing,
@@ -271,11 +348,15 @@ class HPCFilterStrategy(PollutionFilterStrategy):
                     posts=posts,
                     labels_list=labels_list,
                     table=table,
+                    indices_to_recompute=invalid_chunk_rows if invalid_chunk_rows else None,
                 )
             finally:
                 chunk_pbar.close()
             
             logger.info("Stage 1 complete: post_chunked column populated")
+
+            # Permanent save: make Stage 1 crash-recoverable by overwriting the input dataset.
+            save_chunked_table_atomic(table_with_chunks, input_dataset_path)
 
             # Safety check before Stage 2
             if not is_post_chunked_fully_populated(table_with_chunks):
@@ -289,7 +370,7 @@ class HPCFilterStrategy(PollutionFilterStrategy):
                 torch.cuda.empty_cache()
         
         # =======================================================================
-        # Step 3: Stage 2 - GPU Saturated Global-Sorted Inference
+        # Step 3: Stage 2 - GPU Saturated Global-Sorted Inference (with Autotuning)
         # =======================================================================
         logger.info("Stage 2/2: GPU-Saturated Global-Sorted Inference")
         
@@ -300,6 +381,13 @@ class HPCFilterStrategy(PollutionFilterStrategy):
             config, "execution.async_prefetch.pin_memory", True
         ))
         
+        # Create RuntimeController from config (autotuning)
+        runtime_controller = self._create_runtime_controller(config)
+        logger.info(
+            f"Autotuning enabled: initial_budget={runtime_controller.current_budget:,}, "
+            f"warmup_batches={runtime_controller.config.warmup_batches}"
+        )
+        
         entities_batch = gliner.inference_from_manifest(
             post_chunked_column=post_chunked_column,
             labels=inference_labels,
@@ -307,6 +395,7 @@ class HPCFilterStrategy(PollutionFilterStrategy):
             cached_label_embeddings=cached_label_embeddings,
             pin_memory=pin_memory,
             show_progress=True,
+            runtime_controller=runtime_controller,  # Enable autotuning
         )
         
         logger.info("Stage 2 complete: inference finished")

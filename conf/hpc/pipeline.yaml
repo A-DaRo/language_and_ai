@@ -20,6 +20,26 @@ execution:
     global_sort_by_length: true    # Enable global argsort for padding efficiency
     gc_between_stages: true        # Force gc.collect() between stages
 
+  # ---------------------------------------------------------------------------
+  # Self-Optimizing Runtime (Autotuning)
+  # ---------------------------------------------------------------------------
+  # Adaptive token-budget batching with feedback loop.
+  # Automatically adjusts batch sizes based on GPU throughput and memory.
+  # ---------------------------------------------------------------------------
+  autotuning:
+    enabled: true
+    warmup_batches: 10             # Batches before adjusting budget
+    initial_token_budget: 32768    # Starting budget (~256 * 128 tokens)
+    min_token_budget: 4096         # Minimum budget (safety floor)
+    max_token_budget: 524288       # Maximum budget (A100/H100 can handle this)
+    memory_headroom_mb: 2048       # Keep 2GB free for safety
+    scale_up_factor: 1.25          # 25% increase when scaling up
+    scale_down_factor: 0.85        # 15% decrease when throttling
+    oom_slash_factor: 0.5          # 50% reduction after OOM
+    stability_threshold: 0.1       # 10% variance = stable
+    history_window: 10             # Batches for moving average
+    recovery_patience: 5           # Batches in recovery before scaling
+
   # CUDA graphs: enabled for static-shape inference
   enable_cuda_graphs: true
   cuda_graph_warmup: 5
@@ -80,7 +100,7 @@ precision:
 
 gliner:
   model: "knowledgator/gliner-bi-large-v2.0"
-  batch_size: 128                  # Larger batch size for Stage 2 (global-sorted)
+  batch_size: 128                  # Larger batch size for Stage 2 (global-sorted) -> check autotuning
   device: "cuda"
   require_bi_encoder: true         # Enforce bi-encoder for label embedding caching
   gliner_max_words: 512
@@ -89,7 +109,7 @@ gliner:
   # ---------------------------------------------------------------------------
   # HPC Batch Inference (Stage 2 Optimization)
   # ---------------------------------------------------------------------------
-  batch_inference:
+  batch_inference: # check autotuning settings
     enable_batching: true
     num_buckets: 32                # More buckets for finer length grouping
     min_bucket_size: 16            # Larger min size for GPU efficiency
@@ -108,7 +128,7 @@ gliner:
     legacy_sequential_mode: false  # MUST be false for staged execution
 
     # Stage 1: CPU saturation
-    parallel_chunking_workers: 64  # Saturate HPC CPU cores
+    parallel_chunking_workers: 120  # Saturate HPC CPU cores
     parallel_chunking_min_texts: 256
     micro_batch_size: 2000         # Larger micro-batches for HPC RAM
 

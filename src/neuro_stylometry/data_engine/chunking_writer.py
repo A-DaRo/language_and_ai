@@ -208,6 +208,7 @@ class ChunkingArtifactWriter:
         posts: List[str],
         labels_list: List[Optional[List[str]]],
         table: pa.Table,
+        indices_to_recompute: Optional[List[int]] = None,
     ) -> pa.Table:
         """
         Chunk all posts and append post_chunked column to table.
@@ -231,21 +232,27 @@ class ChunkingArtifactWriter:
         if n_docs != len(labels_list):
             raise ValueError(f"Length mismatch: {n_docs} posts vs {len(labels_list)} labels")
         
-        # If resuming, only process docs where post_chunked is NULL.
-        missing_indices: Optional[List[int]] = None
-        existing_array: Optional[pa.Array] = None
-        null_mask: Optional[np.ndarray] = None
+        # If resuming, only process docs where post_chunked is NULL, unless
+        # indices_to_recompute is explicitly provided.
+        existing_col = table["post_chunked"] if "post_chunked" in table.column_names else None
 
-        if "post_chunked" in table.column_names:
-            existing_col = table["post_chunked"]
+        if indices_to_recompute is not None:
+            indices_to_process = sorted(set(int(i) for i in indices_to_recompute))
+            logger.info(
+                f"ChunkingArtifactWriter: Recomputing {len(indices_to_process)} documents (forced)"
+            )
+        elif existing_col is not None:
+            missing_indices: List[int] = []
             if isinstance(existing_col, pa.ChunkedArray):
-                existing_array = existing_col.combine_chunks()
+                offset = 0
+                for chunk in existing_col.iterchunks():
+                    mask = chunk.is_null().to_numpy(zero_copy_only=False)
+                    local_missing = np.flatnonzero(mask).astype(int)
+                    missing_indices.extend((local_missing + offset).tolist())
+                    offset += len(chunk)
             else:
-                existing_array = existing_col
-
-            # NULL means not yet computed; empty-list is a valid computed value.
-            null_mask = existing_array.is_null().to_numpy(zero_copy_only=False)
-            missing_indices = np.flatnonzero(null_mask).astype(int).tolist()
+                mask = existing_col.is_null().to_numpy(zero_copy_only=False)
+                missing_indices = np.flatnonzero(mask).astype(int).tolist()
 
             if len(missing_indices) == 0:
                 logger.info(
@@ -253,13 +260,13 @@ class ChunkingArtifactWriter:
                 )
                 return table
 
+            indices_to_process = missing_indices
             logger.info(
-                f"ChunkingArtifactWriter: Resume detected; processing {len(missing_indices)} missing documents"
+                f"ChunkingArtifactWriter: Resume detected; processing {len(indices_to_process)} missing documents"
             )
         else:
             logger.info(f"ChunkingArtifactWriter: Processing {n_docs} documents")
-        
-        indices_to_process = missing_indices if missing_indices is not None else list(range(n_docs))
+            indices_to_process = list(range(n_docs))
         posts_to_process = [posts[i] for i in indices_to_process]
         labels_to_process = [labels_list[i] for i in indices_to_process]
 
@@ -269,20 +276,18 @@ class ChunkingArtifactWriter:
             chunk_dicts = self._compute_chunk_dicts_parallel(indices_to_process, posts_to_process, labels_to_process)
 
         # No existing column: attach directly
-        if existing_array is None or null_mask is None or missing_indices is None:
+        if existing_col is None:
             return self._attach_chunks_to_table(table, chunk_dicts)
 
-        # Existing column: merge computed values into NULL positions without
-        # round-tripping the existing Arrow data through Python.
-        missing_array = pa.array(chunk_dicts, type=pa.list_(CHUNK_STRUCT))
-        merged = self._merge_existing_and_missing(
-            existing=existing_array,
-            missing=missing_array,
-            null_mask=null_mask,
+        # Existing column: replace / fill specific indices, preserving chunking
+        merged_col = self._merge_into_existing_column(
+            existing_col=existing_col,
+            indices_to_process=indices_to_process,
+            computed_chunk_dicts=chunk_dicts,
         )
 
         col_idx = table.column_names.index("post_chunked")
-        return table.set_column(col_idx, POST_CHUNKED_FIELD, merged)
+        return table.set_column(col_idx, POST_CHUNKED_FIELD, merged_col)
     
     def _compute_chunk_dicts_sequential(
         self,
@@ -400,48 +405,48 @@ class ChunkingArtifactWriter:
         return [c if c is not None else [] for c in results_in_order]
 
     @staticmethod
-    def _merge_existing_and_missing(
-        existing: pa.Array,
-        missing: pa.Array,
-        null_mask: np.ndarray,
+    def _merge_into_existing_column(
+        *,
+        existing_col: pa.Array,
+        indices_to_process: List[int],
+        computed_chunk_dicts: List[List[Dict[str, Any]]],
     ) -> pa.Array:
-        """Merge `missing` values into NULL slots of `existing`.
+        """Merge computed chunk dicts into an existing post_chunked column.
 
-        `missing` must be in the same order as the NULL positions of null_mask.
+        This avoids combine_chunks()/concat_arrays() over huge string buffers by
+        operating chunk-by-chunk.
         """
-        if len(null_mask) != len(existing):
-            raise ValueError("null_mask length does not match existing array")
-
-        expected_missing = int(null_mask.sum())
-        if expected_missing != len(missing):
+        if len(indices_to_process) != len(computed_chunk_dicts):
             raise ValueError(
-                f"Missing length mismatch: mask expects {expected_missing}, got {len(missing)}"
+                f"Index/result length mismatch: {len(indices_to_process)} vs {len(computed_chunk_dicts)}"
             )
 
-        segments: List[pa.Array] = []
-        i = 0
-        missing_pos = 0
-        n = len(null_mask)
+        if not indices_to_process:
+            return existing_col
 
-        while i < n:
-            if not null_mask[i]:
-                start = i
-                while i < n and not null_mask[i]:
-                    i += 1
-                segments.append(existing.slice(start, i - start))
-            else:
-                start = i
-                while i < n and null_mask[i]:
-                    i += 1
-                run_len = i - start
-                segments.append(missing.slice(missing_pos, run_len))
-                missing_pos += run_len
+        idx_to_value = {int(i): v for i, v in zip(indices_to_process, computed_chunk_dicts)}
 
-        if not segments:
-            return existing
-        if len(segments) == 1:
-            return segments[0]
-        return pa.concat_arrays(segments)
+        # If the existing column is not chunked, rebuild it once.
+        if not isinstance(existing_col, pa.ChunkedArray):
+            values = existing_col.to_pylist()
+            for i, v in idx_to_value.items():
+                values[i] = v
+            return pa.array(values, type=pa.list_(CHUNK_STRUCT))
+
+        # ChunkedArray path: rebuild each chunk independently.
+        new_chunks: List[pa.Array] = []
+        offset = 0
+        for chunk in existing_col.iterchunks():
+            chunk_len = len(chunk)
+            chunk_values = chunk.to_pylist()
+            for local in range(chunk_len):
+                global_idx = offset + local
+                if global_idx in idx_to_value:
+                    chunk_values[local] = idx_to_value[global_idx]
+            new_chunks.append(pa.array(chunk_values, type=pa.list_(CHUNK_STRUCT)))
+            offset += chunk_len
+
+        return pa.chunked_array(new_chunks, type=pa.list_(CHUNK_STRUCT))
     
     def _attach_chunks_to_table(
         self,
@@ -505,3 +510,35 @@ def save_chunked_table(table: pa.Table, path: Path) -> None:
     import pyarrow.feather as feather
     feather.write_feather(table, path)
     logger.info(f"Saved chunked table to {path}")
+
+
+def save_chunked_table_atomic(table: pa.Table, path: Path) -> None:
+    """Atomically save a table (including post_chunked) to an Arrow/Feather file.
+
+    Writes to a temporary file in the same directory and replaces the target.
+    This ensures Stage 1 results are durably persisted and recoverable after crashes.
+    """
+    import pyarrow.feather as feather
+
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f"{target.name}.",
+        suffix=".tmp",
+        dir=str(target.parent),
+    )
+    os.close(fd)
+    tmp_path = Path(tmp_name)
+
+    try:
+        feather.write_feather(table, tmp_path)
+        os.replace(tmp_path, target)
+        logger.info(f"Atomically saved chunked table to {target}")
+    finally:
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except Exception:
+            # Best-effort cleanup
+            pass
