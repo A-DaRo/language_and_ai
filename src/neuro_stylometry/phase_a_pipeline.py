@@ -176,6 +176,9 @@ class PhaseAPipeline:
         # Build chunking/budget config from YAML (includes word-aware budgeting)
         gliner_cfg = self.config.get("gliner", {})
         chunking_cfg = gliner_cfg.get("chunking", {})
+        chunk_cache_path = chunking_cfg.get("checkpoint_path") or chunking_cfg.get(
+            "chunk_cache_path"
+        )
         budget_config = BudgetConfig(
             model_max_length=int(self._cfg_get("encoder.max_length")),
             mode=chunking_cfg.get("mode", "single_sentence"),
@@ -201,6 +204,7 @@ class PhaseAPipeline:
             budget_config=budget_config,
             batch_inference_config=batch_config,
             require_bi_encoder=require_bi_encoder,
+            chunk_cache_path=str(chunk_cache_path) if chunk_cache_path else None,
         )
         return self._detector
 

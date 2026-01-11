@@ -32,8 +32,10 @@ from __future__ import annotations
 
 import inspect
 import logging
+import pickle
 from collections import deque
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import numpy as np
@@ -473,6 +475,7 @@ class GLiNERDetector:
         budget_config: Optional[BudgetConfig] = None,
         batch_inference_config: Optional[BatchInferenceConfig] = None,
         require_bi_encoder: bool = False,
+        chunk_cache_path: Optional[str] = None,
         # Legacy parameters (ignored but accepted for backward compatibility)
         center_window_keep: int = 100,
     ):
@@ -492,6 +495,7 @@ class GLiNERDetector:
             batch_inference_config: Configuration for batched inference optimization.
             require_bi_encoder: If True, raise error if loaded model is not bi-encoder.
                 Bi-encoder models support encode_labels() for prompt caching.
+            chunk_cache_path: Optional path to store/load chunking checkpoint.
             center_window_keep: DEPRECATED - Ignored. Semantic chunking handles this.
         """
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
@@ -499,6 +503,7 @@ class GLiNERDetector:
         self.confidence_threshold = confidence_threshold
         self.model_name = model_name
         self.require_bi_encoder = require_bi_encoder
+        self.chunk_cache_path = Path(chunk_cache_path) if chunk_cache_path else None
 
         # Initialize taxonomy and constraints
         if taxonomy is None and taxonomy_config is not None:
@@ -934,6 +939,59 @@ class GLiNERDetector:
         # Fallback: per-text encode (slower but safe).
         return [len(self.tokenizer.encode(t, add_special_tokens=False)) for t in texts]
 
+    def _load_chunk_cache(
+        self,
+        cache_path: Path,
+        doc_count: int,
+        total_chars: int,
+    ) -> Optional[List[List[ChunkInfo]]]:
+        if not cache_path.exists():
+            return None
+
+        try:
+            with cache_path.open("rb") as handle:
+                payload = pickle.load(handle)
+        except Exception as exc:
+            logger.warning("Failed to load chunk cache from %s: %s", cache_path, exc)
+            return None
+
+        if not isinstance(payload, dict):
+            logger.warning("Invalid chunk cache format at %s", cache_path)
+            return None
+
+        if payload.get("doc_count") != doc_count or payload.get("total_chars") != total_chars:
+            logger.warning("Chunk cache metadata mismatch; ignoring %s", cache_path)
+            return None
+
+        chunk_lists = payload.get("chunk_lists")
+        if not isinstance(chunk_lists, list) or len(chunk_lists) != doc_count:
+            logger.warning("Chunk cache content mismatch; ignoring %s", cache_path)
+            return None
+
+        logger.info("Loaded chunk cache from %s", cache_path)
+        return chunk_lists
+
+    def _save_chunk_cache(
+        self,
+        cache_path: Path,
+        chunk_lists: List[List[ChunkInfo]],
+        doc_count: int,
+        total_chars: int,
+    ) -> None:
+        payload = {
+            "version": 1,
+            "doc_count": doc_count,
+            "total_chars": total_chars,
+            "chunk_lists": chunk_lists,
+        }
+
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = cache_path.with_name(f"{cache_path.name}.tmp")
+        with tmp_path.open("wb") as handle:
+            pickle.dump(payload, handle, protocol=pickle.HIGHEST_PROTOCOL)
+        tmp_path.replace(cache_path)
+        logger.info("Saved chunk cache to %s", cache_path)
+
     # -----------------------------------------------------------------------
     # Detection Methods
     # -----------------------------------------------------------------------
@@ -1091,8 +1149,11 @@ class GLiNERDetector:
             )
 
         doc_labels: List[Optional[List[str]]] = []
+        total_chars = 0
         for doc_idx in range(len(texts)):
             text = texts[doc_idx]
+            if text:
+                total_chars += len(text)
             if not text or not text.strip():
                 doc_labels.append(None)
                 continue
@@ -1112,12 +1173,37 @@ class GLiNERDetector:
             if chunk_pbar:
                 chunk_pbar.update(1)
 
-        try:
-            chunk_lists = self.chunker.chunk_texts(
-                texts=texts,
-                labels_list=doc_labels,
-                progress_callback=_tick_progress if show_progress else None,
+        chunk_lists: Optional[List[List[ChunkInfo]]] = None
+        if self.chunk_cache_path is not None:
+            chunk_lists = self._load_chunk_cache(
+                self.chunk_cache_path,
+                len(texts),
+                total_chars,
             )
+
+        try:
+            if chunk_lists is None:
+                chunk_lists = self.chunker.chunk_texts(
+                    texts=texts,
+                    labels_list=doc_labels,
+                    progress_callback=_tick_progress if show_progress else None,
+                )
+                if self.chunk_cache_path is not None:
+                    try:
+                        self._save_chunk_cache(
+                            self.chunk_cache_path,
+                            chunk_lists,
+                            len(texts),
+                            total_chars,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "Failed to save chunk cache to %s: %s",
+                            self.chunk_cache_path,
+                            exc,
+                        )
+            elif chunk_pbar:
+                chunk_pbar.update(len(texts))
 
             for doc_idx, chunks in enumerate(chunk_lists):
                 labels = doc_labels[doc_idx]
