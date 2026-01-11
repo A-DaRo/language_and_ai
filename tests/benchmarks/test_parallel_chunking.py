@@ -432,8 +432,21 @@ class TestWorkerScaling:
     """
     
     def test_worker_scaling(self, tokenizer, sample_texts_large, sample_labels):
-        """Measure throughput for 4, 8, 12, 16, 20, 24, 28, 32 workers."""
-        worker_counts = [4, 8, 12, 16, 20, 24, 28, 32] if is_hpc_environment() else [1, 2, 4, 8]
+        """Measure throughput scaling with worker counts based on physical cores."""
+        try:
+            import psutil
+            physical_cores = psutil.cpu_count(logical=False) or os.cpu_count() or 1
+        except ImportError:
+            physical_cores = os.cpu_count() or 1
+
+        start = max(1, int(physical_cores - (physical_cores / 2)))
+        end = int(physical_cores + (physical_cores / 2))
+        
+        worker_counts = list(range(start, end, 4))
+        if physical_cores not in worker_counts:
+            worker_counts.append(physical_cores)
+        worker_counts = sorted(list(set(worker_counts)))
+        
         results = {}
 
         # Baseline run with 1 worker to compute speedups and provide a stable baseline
