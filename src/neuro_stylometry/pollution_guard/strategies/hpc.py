@@ -44,6 +44,8 @@ from ...data_engine.schemas import (
     POLLUTION_LOG_SCHEMA,
     get_demographic_columns,
     has_post_chunked_column,
+    count_missing_post_chunked,
+    is_post_chunked_fully_populated,
     validate_schema_flexible,
 )
 from ...data_engine.chunking_writer import ChunkingArtifactWriter
@@ -220,10 +222,13 @@ class HPCFilterStrategy(PollutionFilterStrategy):
         # Step 2: Stage 1 - CPU Saturated Parallel Chunking
         # =======================================================================
         # Check for resume: if post_chunked exists, skip Stage 1
-        has_chunks = has_post_chunked_column(table)
-        
-        if has_chunks:
-            logger.info("Resume detected: post_chunked column exists, skipping Stage 1")
+        # Resume logic:
+        # - Stage 2 can only run when post_chunked exists AND has no NULLs.
+        # - If post_chunked exists but has NULLs, run Stage 1 only for remaining rows.
+        stage1_skipped = is_post_chunked_fully_populated(table)
+
+        if stage1_skipped:
+            logger.info("Resume detected: post_chunked fully populated; skipping Stage 1")
             table_with_chunks = table
         else:
             logger.info("Stage 1/2: CPU-Saturated Parallel Chunking")
@@ -238,8 +243,10 @@ class HPCFilterStrategy(PollutionFilterStrategy):
             num_workers = int(chunking_cfg.get("parallel_chunking_workers", 16))
             micro_batch_size = int(chunking_cfg.get("micro_batch_size", 1000))
             
+            missing = count_missing_post_chunked(table) if has_post_chunked_column(table) else len(posts)
+
             chunk_pbar = tqdm(
-                total=len(posts),
+                total=missing,
                 desc="Stage 1: Chunking",
                 unit="doc",
                 dynamic_ncols=True,
@@ -269,6 +276,12 @@ class HPCFilterStrategy(PollutionFilterStrategy):
                 chunk_pbar.close()
             
             logger.info("Stage 1 complete: post_chunked column populated")
+
+            # Safety check before Stage 2
+            if not is_post_chunked_fully_populated(table_with_chunks):
+                raise RuntimeError(
+                    "Stage 1 finished but post_chunked still contains NULLs; cannot start Stage 2"
+                )
             
             # Force garbage collection between stages
             gc.collect()
@@ -421,7 +434,7 @@ class HPCFilterStrategy(PollutionFilterStrategy):
             "device": device,
             "use_bf16": self.use_bf16,
             "staged_execution": True,
-            "stage1_skipped": has_chunks,
+            "stage1_skipped": stage1_skipped,
         }
         
         # Explicit recall

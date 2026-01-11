@@ -131,6 +131,25 @@ def _worker_chunk_batch(
     return doc_indices, results
 
 
+def _worker_chunk_one(
+    args: Tuple[int, str, Optional[List[str]]],
+) -> Tuple[int, List[Dict[str, Any]]]:
+    """Worker task: chunk a single document and return Arrow-compatible dicts."""
+    global _WORKER_CHUNKER
+
+    doc_idx, text, labels = args
+
+    if _WORKER_CHUNKER is None:
+        raise RuntimeError("Worker chunker not initialized")
+
+    if not text or not text.strip() or not labels:
+        return doc_idx, []
+
+    chunks = _WORKER_CHUNKER.chunk_text(text, labels)
+    chunk_dicts = [chunk.to_arrow_struct() for chunk in chunks]
+    return doc_idx, chunk_dicts
+
+
 class ChunkingArtifactWriter:
     """
     Streaming writer for chunked text artifacts.
@@ -212,21 +231,65 @@ class ChunkingArtifactWriter:
         if n_docs != len(labels_list):
             raise ValueError(f"Length mismatch: {n_docs} posts vs {len(labels_list)} labels")
         
-        logger.info(f"ChunkingArtifactWriter: Processing {n_docs} documents")
-        
-        if self.num_workers <= 1 or n_docs < 1000:
-            # Sequential mode for small datasets or when parallelism disabled
-            return self._process_sequential(posts, labels_list, table)
+        # If resuming, only process docs where post_chunked is NULL.
+        missing_indices: Optional[List[int]] = None
+        existing_array: Optional[pa.Array] = None
+        null_mask: Optional[np.ndarray] = None
+
+        if "post_chunked" in table.column_names:
+            existing_col = table["post_chunked"]
+            if isinstance(existing_col, pa.ChunkedArray):
+                existing_array = existing_col.combine_chunks()
+            else:
+                existing_array = existing_col
+
+            # NULL means not yet computed; empty-list is a valid computed value.
+            null_mask = existing_array.is_null().to_numpy(zero_copy_only=False)
+            missing_indices = np.flatnonzero(null_mask).astype(int).tolist()
+
+            if len(missing_indices) == 0:
+                logger.info(
+                    "ChunkingArtifactWriter: post_chunked already fully populated; skipping Stage 1"
+                )
+                return table
+
+            logger.info(
+                f"ChunkingArtifactWriter: Resume detected; processing {len(missing_indices)} missing documents"
+            )
         else:
-            return self._process_parallel(posts, labels_list, table)
+            logger.info(f"ChunkingArtifactWriter: Processing {n_docs} documents")
+        
+        indices_to_process = missing_indices if missing_indices is not None else list(range(n_docs))
+        posts_to_process = [posts[i] for i in indices_to_process]
+        labels_to_process = [labels_list[i] for i in indices_to_process]
+
+        if self.num_workers <= 1 or len(indices_to_process) < 1000:
+            chunk_dicts = self._compute_chunk_dicts_sequential(posts_to_process, labels_to_process)
+        else:
+            chunk_dicts = self._compute_chunk_dicts_parallel(indices_to_process, posts_to_process, labels_to_process)
+
+        # No existing column: attach directly
+        if existing_array is None or null_mask is None or missing_indices is None:
+            return self._attach_chunks_to_table(table, chunk_dicts)
+
+        # Existing column: merge computed values into NULL positions without
+        # round-tripping the existing Arrow data through Python.
+        missing_array = pa.array(chunk_dicts, type=pa.list_(CHUNK_STRUCT))
+        merged = self._merge_existing_and_missing(
+            existing=existing_array,
+            missing=missing_array,
+            null_mask=null_mask,
+        )
+
+        col_idx = table.column_names.index("post_chunked")
+        return table.set_column(col_idx, POST_CHUNKED_FIELD, merged)
     
-    def _process_sequential(
+    def _compute_chunk_dicts_sequential(
         self,
         posts: List[str],
         labels_list: List[Optional[List[str]]],
-        table: pa.Table,
-    ) -> pa.Table:
-        """Sequential processing for small datasets."""
+    ) -> List[List[Dict[str, Any]]]:
+        """Sequential chunking. Returns list-of-chunk-dicts per document."""
         from ..pollution_guard.semantic_chunker import SemanticChunker, BudgetConfig
         from transformers import AutoTokenizer
         
@@ -265,52 +328,38 @@ class ChunkingArtifactWriter:
             words_splitter_type=self.words_splitter_type,
         )
         
-        # Process all documents
         all_chunk_dicts: List[List[Dict[str, Any]]] = []
-        
+
         for i, (text, labels) in enumerate(zip(posts, labels_list)):
             if not text or not text.strip() or not labels:
                 all_chunk_dicts.append([])
             else:
                 chunks = chunker.chunk_text(text, labels)
                 all_chunk_dicts.append([c.to_arrow_struct() for c in chunks])
-            
-            if self.progress_callback and (i + 1) % 100 == 0:
+
+            if self.progress_callback:
+                # Per-document progress (requested behavior)
                 self.progress_callback(i + 1)
-        
-        if self.progress_callback:
-            self.progress_callback(len(posts))
-        
-        return self._attach_chunks_to_table(table, all_chunk_dicts)
+
+        return all_chunk_dicts
     
-    def _process_parallel(
+    def _compute_chunk_dicts_parallel(
         self,
+        original_indices: List[int],
         posts: List[str],
         labels_list: List[Optional[List[str]]],
-        table: pa.Table,
-    ) -> pa.Table:
-        """Parallel processing with streaming writes."""
+    ) -> List[List[Dict[str, Any]]]:
+        """Parallel chunking with per-document progress updates."""
         n_docs = len(posts)
         max_workers = min(self.num_workers, os.cpu_count() or 1)
         
         logger.info(f"Using parallel chunking: {max_workers} workers")
-        
-        # Partition into batches for workers
-        batch_size = max(100, n_docs // (max_workers * 4))  # 4 batches per worker
-        batches: List[Tuple[List[int], List[str], List[Optional[List[str]]]]] = []
-        
-        for i in range(0, n_docs, batch_size):
-            end = min(i + batch_size, n_docs)
-            batch_indices = list(range(i, end))
-            batch_texts = posts[i:end]
-            batch_labels = labels_list[i:end]
-            batches.append((batch_indices, batch_texts, batch_labels))
-        
-        logger.info(f"Created {len(batches)} batches ({batch_size} docs/batch)")
-        
-        # Pre-allocate results array
-        all_chunk_dicts: List[Optional[List[Dict[str, Any]]]] = [None] * n_docs
+
+        # Pre-allocate results in input order (which corresponds to original_indices order)
+        results_in_order: List[Optional[List[Dict[str, Any]]]] = [None] * n_docs
         processed_count = 0
+
+        index_to_pos = {orig_idx: pos for pos, orig_idx in enumerate(original_indices)}
         
         ctx = mp.get_context("spawn")
         
@@ -325,27 +374,74 @@ class ChunkingArtifactWriter:
                     self.words_splitter_type,
                 ),
             ) as pool:
-                # Process batches with imap_unordered for non-blocking
-                for doc_indices, batch_results in pool.imap_unordered(
-                    _worker_chunk_batch, batches
+                tasks = zip(original_indices, posts, labels_list)
+
+                # Per-document completion updates via imap_unordered
+                for orig_idx, chunk_dicts in pool.imap_unordered(
+                    _worker_chunk_one,
+                    tasks,
+                    chunksize=64,
                 ):
-                    # Store results at original indices
-                    for idx, chunks in zip(doc_indices, batch_results):
-                        all_chunk_dicts[idx] = chunks
-                    
-                    processed_count += len(doc_indices)
+                    pos = index_to_pos.get(orig_idx)
+                    if pos is None:
+                        continue
+                    results_in_order[pos] = chunk_dicts
+
+                    processed_count += 1
                     if self.progress_callback:
                         self.progress_callback(processed_count)
         
         except Exception as exc:
             logger.error(f"Parallel chunking failed: {exc}")
             logger.info("Falling back to sequential chunking")
-            return self._process_sequential(posts, labels_list, table)
-        
+            return self._compute_chunk_dicts_sequential(posts, labels_list)
+
         # Convert None to empty lists for any missed documents
-        all_chunk_dicts = [c if c is not None else [] for c in all_chunk_dicts]
-        
-        return self._attach_chunks_to_table(table, all_chunk_dicts)
+        return [c if c is not None else [] for c in results_in_order]
+
+    @staticmethod
+    def _merge_existing_and_missing(
+        existing: pa.Array,
+        missing: pa.Array,
+        null_mask: np.ndarray,
+    ) -> pa.Array:
+        """Merge `missing` values into NULL slots of `existing`.
+
+        `missing` must be in the same order as the NULL positions of null_mask.
+        """
+        if len(null_mask) != len(existing):
+            raise ValueError("null_mask length does not match existing array")
+
+        expected_missing = int(null_mask.sum())
+        if expected_missing != len(missing):
+            raise ValueError(
+                f"Missing length mismatch: mask expects {expected_missing}, got {len(missing)}"
+            )
+
+        segments: List[pa.Array] = []
+        i = 0
+        missing_pos = 0
+        n = len(null_mask)
+
+        while i < n:
+            if not null_mask[i]:
+                start = i
+                while i < n and not null_mask[i]:
+                    i += 1
+                segments.append(existing.slice(start, i - start))
+            else:
+                start = i
+                while i < n and null_mask[i]:
+                    i += 1
+                run_len = i - start
+                segments.append(missing.slice(missing_pos, run_len))
+                missing_pos += run_len
+
+        if not segments:
+            return existing
+        if len(segments) == 1:
+            return segments[0]
+        return pa.concat_arrays(segments)
     
     def _attach_chunks_to_table(
         self,

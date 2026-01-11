@@ -199,6 +199,25 @@ def has_post_chunked_column(table: pa.Table) -> bool:
     return pa.types.is_list(col_type) and pa.types.is_struct(col_type.value_type)
 
 
+def count_missing_post_chunked(table: pa.Table) -> int:
+    """Count how many rows have NULL post_chunked.
+
+    Empty lists are treated as valid (computed) values; only Arrow NULLs count as missing.
+    """
+    if not has_post_chunked_column(table):
+        return len(table)
+
+    col = table["post_chunked"]
+    return int(col.null_count)
+
+
+def is_post_chunked_fully_populated(table: pa.Table) -> bool:
+    """True iff post_chunked exists and has no NULLs."""
+    if not has_post_chunked_column(table):
+        return False
+    return count_missing_post_chunked(table) == 0
+
+
 def validate_schema_flexible(
     table: pa.Table,
     expected_schema: pa.Schema,

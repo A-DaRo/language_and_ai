@@ -39,6 +39,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import numpy as np
+import pyarrow as pa
 import torch
 from gliner import GLiNER
 from tqdm.auto import tqdm
@@ -1682,6 +1683,16 @@ class GLiNERDetector:
         """
         import pyarrow as pa
         from .global_sort import flatten_chunks, gather_results, create_sorted_batches
+
+        # Guardrail: Stage 2 requires fully-populated post_chunked (no NULLs).
+        try:
+            nulls = int(post_chunked_column.null_count)
+        except Exception:
+            nulls = 0
+        if nulls > 0:
+            raise ValueError(
+                f"post_chunked contains {nulls} NULL rows; run Stage 1 chunking for remaining entries before Stage 2"
+            )
         
         effective_batch_size = batch_size or self.batch_config.batch_size
         inference_labels = labels or self.taxonomy.get_inference_labels()
@@ -1721,16 +1732,15 @@ class GLiNERDetector:
         pbar = None
         if show_progress:
             pbar = tqdm(
-                total=len(batches),
+                total=flattened.num_chunks,
                 desc="GLiNER inference (Stage 2)",
-                unit="batch",
+                unit="chunk",
                 dynamic_ncols=True,
+                leave=True,
             )
         
         try:
             for batch_indices in batches:
-                batch_texts = [sorted_texts[sort_indices.tolist().index(i)] if i in sort_indices else flattened.texts[i] for i in batch_indices]
-                # Actually just use the pre-sorted texts order
                 batch_texts = [flattened.texts[i] for i in batch_indices]
                 
                 # Run batched inference
@@ -1744,9 +1754,10 @@ class GLiNERDetector:
                 for local_idx, entities in enumerate(batch_entities):
                     flat_idx = batch_indices[local_idx]
                     flat_results_sorted[flat_idx] = entities
-                
-                if pbar is not None:
-                    pbar.update(1)
+
+                    if pbar is not None:
+                        # Per-chunk progress update (requested behavior)
+                        pbar.update(1)
         finally:
             if pbar is not None:
                 pbar.close()

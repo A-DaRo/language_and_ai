@@ -91,7 +91,7 @@ gliner:
   # ---------------------------------------------------------------------------
   batch_inference:
     enable_batching: true
-    num_buckets: 16                # More buckets for finer length grouping
+    num_buckets: 32                # More buckets for finer length grouping
     min_bucket_size: 16            # Larger min size for GPU efficiency
     enable_prompt_caching: true
 
@@ -108,7 +108,7 @@ gliner:
     legacy_sequential_mode: false  # MUST be false for staged execution
 
     # Stage 1: CPU saturation
-    parallel_chunking_workers: 32  # Saturate HPC CPU cores
+    parallel_chunking_workers: 64  # Saturate HPC CPU cores
     parallel_chunking_min_texts: 256
     micro_batch_size: 2000         # Larger micro-batches for HPC RAM
 
