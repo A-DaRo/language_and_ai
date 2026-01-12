@@ -103,16 +103,16 @@ class EncoderConfig:
 @dataclass
 class LEACEConfig:
     """LEACE projection configuration."""
-    device: str = "cpu"
+    device: Optional[str] = "cpu"
     force_cpu: bool = True
     regularization: float = 1e-5
     batch_size: int = 100
     compute_dtype: str = "float64"
     
     def __post_init__(self):
-        if self.device not in ("cpu", "cuda"):
+        if self.device is not None and self.device not in ("cpu", "cuda"):
             raise ConfigValidationError(
-                f"leace.device must be 'cpu' or 'cuda', got '{self.device}'"
+                f"leace.device must be None, 'cpu' or 'cuda', got '{self.device}'"
             )
         if self.regularization < 1e-10:
             raise ConfigValidationError(
@@ -148,6 +148,34 @@ class ProbeConfig:
     amnesic_drop_threshold: float = 0.30
     train_split: float = 0.8
     max_samples: Optional[int] = 20000
+    backend: str = "auto"
+    use_kfold: bool = True
+    n_folds: int = 5
+    pvalue_threshold: float = 0.05
+    torch_lr: float = 0.01
+    torch_epochs: int = 100
+    torch_batch_size: int = 256
+    torch_weight_decay: float = 0.0001
+    use_class_weights: bool = True
+    benchmark_solvers: bool = False
+
+    def __post_init__(self):
+        if self.backend not in ("auto", "sklearn", "cuml", "torch"):
+            raise ConfigValidationError(
+                f"probe.backend must be 'auto', 'sklearn', 'cuml', or 'torch', got '{self.backend}'"
+            )
+        if self.train_split <= 0 or self.train_split >= 1:
+            raise ConfigValidationError(
+                f"probe.train_split must be between 0 and 1, got {self.train_split}"
+            )
+        if self.n_folds < 2:
+            raise ConfigValidationError(
+                f"probe.n_folds must be at least 2, got {self.n_folds}"
+            )
+        if self.max_samples is not None and self.max_samples <= 0:
+            raise ConfigValidationError(
+                f"probe.max_samples must be positive, got {self.max_samples}"
+            )
     
     def __post_init__(self):
         if not 0.0 < self.train_split < 1.0:
