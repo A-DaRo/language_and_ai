@@ -271,17 +271,127 @@ def validate_handover(artifacts_dir: Path):
 
 
 @cli.command("run-phase-d")
-def run_phase_d():
-    """Phase D (Neural Stylometry) - Not yet implemented.
-    
-    Phase D training requires Phase A artifacts to be generated first.
-    Run `neuro-stylometry run-phase-a` to generate the required artifacts.
-    """
-    raise click.ClickException(
-        "Phase D is not yet implemented.\n"
-        "Phase A artifacts can be generated with: neuro-stylometry run-phase-a\n"
-        "Phase D will use artifacts from: artifacts/phase_a/"
+@click.option(
+    "--dataset",
+    type=click.Path(exists=True, path_type=Path),
+    required=True,
+    help="Path to Phase D dataset (e.g., artifacts/phase_a/clean_dataset.arrow)",
+)
+@click.option(
+    "--output-dir",
+    type=click.Path(path_type=Path),
+    required=True,
+    help="Output directory for Phase D artifacts",
+)
+@click.option(
+    "--artifacts-dir",
+    type=click.Path(exists=True, path_type=Path),
+    default=Path("artifacts/phase_a"),
+    show_default=True,
+    help="Phase A artifacts directory containing projection_matrix.pt",
+)
+@click.option(
+    "--model-name",
+    default="roberta-base",
+    show_default=True,
+    help="Base Hugging Face model for Phase D",
+)
+@click.option(
+    "--taxonomy-path",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=Path("conf/base/gliner_taxonomy.yaml"),
+    show_default=True,
+    help="GLiNER taxonomy path for mask-token alignment",
+)
+@click.option(
+    "--max-length",
+    default=512,
+    show_default=True,
+    help="Tokenizer max length for Phase D",
+)
+@click.option(
+    "--batch-size",
+    default=8,
+    show_default=True,
+    help="Training batch size",
+)
+@click.option(
+    "--num-epochs",
+    default=1,
+    show_default=True,
+    help="Number of training epochs",
+)
+@click.option(
+    "--max-steps",
+    type=int,
+    default=None,
+    help="Optional max training steps per run",
+)
+@click.option(
+    "--learning-rate",
+    default=2e-5,
+    show_default=True,
+    help="AdamW learning rate",
+)
+@click.option(
+    "--use-affine-guard/--no-affine-guard",
+    default=True,
+    show_default=True,
+    help="Enable Affine Guard projection with Phase A matrix",
+)
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    help="Initialize model + tokenizer and exit without training",
+)
+def run_phase_d(
+    dataset: Path,
+    output_dir: Path,
+    artifacts_dir: Path,
+    model_name: str,
+    taxonomy_path: Path,
+    max_length: int,
+    batch_size: int,
+    num_epochs: int,
+    max_steps: int | None,
+    learning_rate: float,
+    use_affine_guard: bool,
+    dry_run: bool,
+):
+    """Train baseline vs constrained Phase D models."""
+    from .training.trainer import PhaseDTrainConfig, PhaseDTrainer
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    config = PhaseDTrainConfig(
+        dataset_path=dataset,
+        artifacts_dir=artifacts_dir,
+        output_dir=output_dir,
+        model_name=model_name,
+        taxonomy_path=taxonomy_path,
+        max_length=max_length,
+        batch_size=batch_size,
+        num_epochs=num_epochs,
+        max_steps=max_steps,
+        learning_rate=learning_rate,
     )
+
+    trainer = PhaseDTrainer(config)
+
+    if dry_run:
+        click.echo("Phase D dry run: training setup initialized.")
+        click.echo(f"Dataset: {dataset}")
+        click.echo(f"Artifacts dir: {artifacts_dir}")
+        click.echo(f"Output dir: {output_dir}")
+        click.echo(f"Model: {model_name}")
+        click.echo(f"Batch size: {batch_size}, epochs: {num_epochs}")
+        return
+
+    click.echo("Starting Phase D baseline vs constrained training...")
+    if not use_affine_guard:
+        click.echo("Warning: --no-affine-guard disables constrained training.")
+    trainer.train_baseline_and_constrained(use_affine_guard=use_affine_guard)
+    click.echo("Phase D training complete.")
 
 
 @cli.command("verify")
