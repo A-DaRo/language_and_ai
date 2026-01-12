@@ -48,7 +48,7 @@ from .base import (
 )
 from ..gliner_detector import GLiNERDetector, BatchInferenceConfig, InferenceResult
 from ..masker import SpanMasker
-from ..semantic_chunker import BudgetConfig
+from ..semantic_chunker import BudgetConfig, deduplicate_entities
 from ..explicit_recall import compute_explicit_recall
 from ..embedder import FrozenEmbedder
 from ..leace import LEACEComputer
@@ -1209,7 +1209,6 @@ class HPCFilterStrategy(PollutionFilterStrategy):
                     flat_results = async_storer.load_results_as_flat_list(flattened.num_chunks)
                     chunk_starts = flattened.chunk_starts if flattened.chunk_starts is not None else np.zeros(flattened.num_chunks, dtype=np.int32)
                     
-                    from ..semantic_chunker import deduplicate_entities
                     entities_batch = []
                     for doc_idx in range(flattened.num_docs):
                         doc_start = flattened.doc_offsets[doc_idx]
@@ -1221,9 +1220,9 @@ class HPCFilterStrategy(PollutionFilterStrategy):
                             for entity in chunk_entities:
                                 projected = dict(entity)
                                 projected["start"] = projected.get("start", 0) + chunk_offset
-                        projected["end"] = projected.get("end", 0) + chunk_offset
-                        projected_entities.append(projected)
-                entities_batch.append(deduplicate_entities(projected_entities))
+                                projected["end"] = projected.get("end", 0) + chunk_offset
+                                projected_entities.append(projected)
+                        entities_batch.append(deduplicate_entities(projected_entities))
             
             inference_ctx = InferenceContext(
                 entities_batch=entities_batch,
