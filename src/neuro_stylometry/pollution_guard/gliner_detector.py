@@ -82,12 +82,21 @@ class BatchInferenceConfig:
             If None or "auto", computed from available VRAM.
         min_bucket_size: Minimum samples per bucket before merging.
         enable_prompt_caching: Cache label embeddings for bi-encoder models.
+        strict_padding: If True, pad all sequences in a batch to the bucket
+            boundary (max length within the bucket) rather than just the
+            max length within the batch. This improves CUDA graph hit rate
+            by ensuring consistent tensor shapes across batches.
+        seq_len_buckets: Optional list of sequence length bucket boundaries.
+            If None, uses default buckets: [64, 128, 192, 256, 320, 384, 448, 512].
+            Only used when strict_padding is True.
     """
     enable_batching: bool = True
     batch_size: int = 32
     num_buckets: Optional[int] = None  # None = auto-compute from VRAM
     min_bucket_size: int = 4
     enable_prompt_caching: bool = True
+    strict_padding: bool = False
+    seq_len_buckets: Optional[List[int]] = None
 
 
 @dataclass
@@ -185,6 +194,65 @@ def compute_chunk_length_buckets(
         bucket_to_indices[bucket_id].append(idx)
     
     return boundaries, bucket_to_indices
+
+
+# Default sequence length buckets for strict padding (aligned to transformer block sizes)
+DEFAULT_SEQ_LEN_BUCKETS = [64, 128, 192, 256, 320, 384, 448, 512]
+
+
+def find_bucket_boundary(seq_len: int, buckets: List[int]) -> int:
+    """
+    Find the smallest bucket boundary that fits the given sequence length.
+    
+    Used for strict padding to ensure consistent tensor shapes across batches,
+    which improves CUDA graph hit rate.
+    
+    Args:
+        seq_len: Actual sequence length.
+        buckets: Sorted list of bucket boundaries.
+        
+    Returns:
+        The smallest bucket boundary >= seq_len, or seq_len if it exceeds
+        all bucket boundaries (fallback to exact length).
+    """
+    for boundary in buckets:
+        if boundary >= seq_len:
+            return boundary
+    # Exceeds all buckets, use exact length (graph cache will handle this)
+    return seq_len
+
+
+def compute_strict_batch_padding(
+    batch_lengths: List[int],
+    buckets: Optional[List[int]] = None,
+) -> Tuple[int, int]:
+    """
+    Compute padding target for a batch using strict bucket alignment.
+    
+    This ensures all sequences in a batch are padded to a consistent bucket
+    boundary rather than just the max length in the batch. This improves
+    CUDA graph cache hit rate by reducing the number of unique tensor shapes.
+    
+    Args:
+        batch_lengths: List of sequence lengths in the batch.
+        buckets: Optional list of bucket boundaries. If None, uses defaults.
+        
+    Returns:
+        Tuple of (target_pad_length, bucket_index) where bucket_index is
+        -1 if the max length exceeds all buckets.
+    """
+    if not batch_lengths:
+        return 0, -1
+    
+    buckets = buckets or DEFAULT_SEQ_LEN_BUCKETS
+    max_len = max(batch_lengths)
+    
+    for i, boundary in enumerate(buckets):
+        if boundary >= max_len:
+            return boundary, i
+    
+    # Exceeds all buckets
+    return max_len, -1
 
 
 # ---------------------------------------------------------------------------
@@ -1660,6 +1728,11 @@ class GLiNERDetector:
             
             Current optimization path: torch.compile on token_rep_layer provides
             similar benefits via Triton kernel fusion with less capture complexity.
+            
+        Strict Padding (CUDA Graph Optimization):
+            When batch_config.strict_padding is True, all sequences are padded to 
+            the nearest bucket boundary rather than just the max length in the batch.
+            This improves CUDA graph cache hit rate by reducing unique tensor shapes.
         
         Args:
             texts: List of chunk texts.
@@ -1672,68 +1745,97 @@ class GLiNERDetector:
         if not texts:
             return []
         
-        # Build inference kwargs
-        inference_kwargs: Dict[str, Any] = {
-            "flat_ner": True,
-            "threshold": self.confidence_threshold,
-            "batch_size": len(texts),  # Process entire batch at once
-        }
+        # Strict padding: compute bucket boundary for this batch
+        # and temporarily set data_processor.max_len to ensure consistent shapes
+        original_max_len = None
+        if self.batch_config.strict_padding:
+            # Get token lengths for this batch
+            batch_lengths = self._batched_token_lengths(texts)
+            seq_buckets = self.batch_config.seq_len_buckets or DEFAULT_SEQ_LEN_BUCKETS
+            target_len, bucket_idx = compute_strict_batch_padding(batch_lengths, seq_buckets)
+            
+            # Temporarily override data_processor.max_len for consistent padding
+            data_processor = getattr(self.model, "data_processor", None)
+            if data_processor is not None:
+                original_max_len = getattr(data_processor, "max_len", None)
+                # Only override if target is within our configured max
+                if target_len <= self.max_length:
+                    data_processor.max_len = target_len
+                    logger.debug(
+                        f"Strict padding: batch max_len={max(batch_lengths)}, "
+                        f"bucket boundary={target_len} (bucket {bucket_idx})"
+                    )
         
-        # Add prompt embeddings for bi-encoder models
-        if prompt_embeddings is not None:
-            inference_kwargs["labels_embeddings"] = prompt_embeddings
-        
-        # Run batched inference via GLiNER.inference()
-        # Note: CUDA graphs would apply at tensor level if we had direct access
-        # to the model's batch_forward method. Currently, torch.compile on
-        # token_rep_layer provides the primary compilation benefit.
-        inference_kwargs = self._filter_inference_kwargs(inference_kwargs)
         try:
-            all_entities = self.model.inference(
-                texts,
-                labels,
-                **inference_kwargs,
-            )
-        except TypeError as e:
-            if self._is_kwarg_typeerror(e):
-                # Fallback if inference() doesn't accept certain kwargs
-                logger.debug(
-                    f"Batch inference kwargs rejected, using minimal args: {e}"
-                )
+            # Build inference kwargs
+            inference_kwargs: Dict[str, Any] = {
+                "flat_ner": True,
+                "threshold": self.confidence_threshold,
+                "batch_size": len(texts),  # Process entire batch at once
+            }
+            
+            # Add prompt embeddings for bi-encoder models
+            if prompt_embeddings is not None:
+                inference_kwargs["labels_embeddings"] = prompt_embeddings
+            
+            # Run batched inference via GLiNER.inference()
+            # Note: CUDA graphs would apply at tensor level if we had direct access
+            # to the model's batch_forward method. Currently, torch.compile on
+            # token_rep_layer provides the primary compilation benefit.
+            inference_kwargs = self._filter_inference_kwargs(inference_kwargs)
+            try:
                 all_entities = self.model.inference(
                     texts,
                     labels,
-                    flat_ner=True,
-                    threshold=self.confidence_threshold,
+                    **inference_kwargs,
                 )
-            else:
-                raise
-        
-        # Post-process: filter distractors and apply width constraints
-        processed_results: List[List[Dict[str, Any]]] = []
-        
-        for entities in all_entities:
-            # Filter distractors
-            entities = self.taxonomy.filter_distractors(entities)
-            
-            # Apply width constraints
-            valid_entities = []
-            for entity in entities:
-                span_tokens = self.tokenizer.encode(entity["text"], add_special_tokens=False)
-                token_count = len(span_tokens)
-                max_width = self.constraints.get_max_width(entity["label"])
-
-                if token_count <= max_width:
-                    valid_entities.append(entity)
-                else:
+            except TypeError as e:
+                if self._is_kwarg_typeerror(e):
+                    # Fallback if inference() doesn't accept certain kwargs
                     logger.debug(
-                        f"Filtered span '{entity['text']}' ({entity['label']}): "
-                        f"{token_count} tokens > max {max_width}"
+                        f"Batch inference kwargs rejected, using minimal args: {e}"
                     )
+                    all_entities = self.model.inference(
+                        texts,
+                        labels,
+                        flat_ner=True,
+                        threshold=self.confidence_threshold,
+                    )
+                else:
+                    raise
             
-            processed_results.append(valid_entities)
+            # Post-process: filter distractors and apply width constraints
+            processed_results: List[List[Dict[str, Any]]] = []
+            
+            for entities in all_entities:
+                # Filter distractors
+                entities = self.taxonomy.filter_distractors(entities)
+                
+                # Apply width constraints
+                valid_entities = []
+                for entity in entities:
+                    span_tokens = self.tokenizer.encode(entity["text"], add_special_tokens=False)
+                    token_count = len(span_tokens)
+                    max_width = self.constraints.get_max_width(entity["label"])
+
+                    if token_count <= max_width:
+                        valid_entities.append(entity)
+                    else:
+                        logger.debug(
+                            f"Filtered span '{entity['text']}' ({entity['label']}): "
+                            f"{token_count} tokens > max {max_width}"
+                        )
+                
+                processed_results.append(valid_entities)
+            
+            return processed_results
         
-        return processed_results
+        finally:
+            # Restore original max_len if we modified it for strict padding
+            if original_max_len is not None:
+                data_processor = getattr(self.model, "data_processor", None)
+                if data_processor is not None:
+                    data_processor.max_len = original_max_len
 
     def _detect_in_chunk(
         self,

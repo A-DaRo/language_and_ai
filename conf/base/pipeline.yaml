@@ -52,6 +52,17 @@ gliner:
     # Enable prompt/label embedding caching for bi-encoder models
     # Saves redundant encoding when processing multiple texts with same labels
     enable_prompt_caching: true
+    
+    # Strict padding for CUDA graph optimization
+    # When true, pads all sequences to nearest bucket boundary (seq_len_buckets)
+    # instead of just max length in batch. Improves CUDA graph cache hit rate.
+    # Recommended: true for HPC (with CUDA graphs), false for laptop
+    strict_padding: false
+    
+    # Sequence length bucket boundaries for strict padding
+    # Should match cuda_graphs.seq_len_buckets if CUDA graphs are enabled
+    # null = use default [64, 128, 192, 256, 320, 384, 448, 512]
+    seq_len_buckets: null
   
   # Chunking strategy settings
   chunking:

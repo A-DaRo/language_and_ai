@@ -233,6 +233,8 @@ class HPCFilterStrategy(PollutionFilterStrategy):
             num_buckets=batch_inference_cfg.get("num_buckets"),
             min_bucket_size=batch_inference_cfg.get("min_bucket_size", 4),
             enable_prompt_caching=batch_inference_cfg.get("enable_prompt_caching", True),
+            strict_padding=batch_inference_cfg.get("strict_padding", False),
+            seq_len_buckets=batch_inference_cfg.get("seq_len_buckets"),
         )
         
         chunking_cfg = gliner_cfg.get("chunking", {})

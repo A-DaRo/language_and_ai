@@ -109,6 +109,7 @@ gliner:
     num_buckets: null
     min_bucket_size: 4
     enable_prompt_caching: true
+    strict_padding: false      # Disabled for laptop (reduces padding overhead)
   
   chunking:
     mode: "single_sentence"

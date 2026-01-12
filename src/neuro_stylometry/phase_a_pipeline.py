@@ -179,6 +179,8 @@ class PhaseAPipeline:
             num_buckets=batch_inference_cfg.get("num_buckets"),  # None = auto-compute
             min_bucket_size=batch_inference_cfg.get("min_bucket_size", 4),
             enable_prompt_caching=batch_inference_cfg.get("enable_prompt_caching", True),
+            strict_padding=batch_inference_cfg.get("strict_padding", False),
+            seq_len_buckets=batch_inference_cfg.get("seq_len_buckets"),
         )
         
         # Build chunking/budget config from YAML (includes word-aware budgeting)

@@ -22,6 +22,9 @@ from neuro_stylometry.pollution_guard.gliner_detector import (
     BatchInferenceConfig,
     auto_compute_bucket_count,
     compute_chunk_length_buckets,
+    find_bucket_boundary,
+    compute_strict_batch_padding,
+    DEFAULT_SEQ_LEN_BUCKETS,
 )
 from neuro_stylometry.pollution_guard.semantic_chunker import BudgetConfig
 from neuro_stylometry.pollution_guard.masker import SpanMasker
@@ -444,6 +447,8 @@ class TestBatchInferenceConfig:
         assert config.num_buckets is None  # Auto-compute
         assert config.min_bucket_size == 4
         assert config.enable_prompt_caching is True
+        assert config.strict_padding is False
+        assert config.seq_len_buckets is None
     
     def test_custom_values(self):
         """BatchInferenceConfig accepts custom values."""
@@ -458,6 +463,16 @@ class TestBatchInferenceConfig:
         assert config.enable_batching is False
         assert config.batch_size == 64
         assert config.num_buckets == 10
+    
+    def test_strict_padding_config(self):
+        """BatchInferenceConfig supports strict_padding for CUDA graph optimization."""
+        config = BatchInferenceConfig(
+            strict_padding=True,
+            seq_len_buckets=[64, 128, 256, 512],
+        )
+        
+        assert config.strict_padding is True
+        assert config.seq_len_buckets == [64, 128, 256, 512]
 
 
 class TestAutoComputeBucketCount:
@@ -529,6 +544,77 @@ class TestComputeChunkLengthBuckets:
         # All items should be assigned
         total_items = sum(len(indices) for indices in bucket_to_indices.values())
         assert total_items == len(lengths)
+
+
+class TestStrictPaddingHelpers:
+    """Test strict padding helper functions for CUDA graph optimization."""
+    
+    def test_find_bucket_boundary_exact_match(self):
+        """find_bucket_boundary returns exact match when available."""
+        buckets = [64, 128, 256, 512]
+        assert find_bucket_boundary(64, buckets) == 64
+        assert find_bucket_boundary(128, buckets) == 128
+    
+    def test_find_bucket_boundary_rounds_up(self):
+        """find_bucket_boundary rounds up to next bucket."""
+        buckets = [64, 128, 256, 512]
+        assert find_bucket_boundary(65, buckets) == 128
+        assert find_bucket_boundary(100, buckets) == 128
+        assert find_bucket_boundary(129, buckets) == 256
+    
+    def test_find_bucket_boundary_exceeds_max(self):
+        """find_bucket_boundary returns exact length if exceeds all buckets."""
+        buckets = [64, 128, 256, 512]
+        assert find_bucket_boundary(600, buckets) == 600
+        assert find_bucket_boundary(1024, buckets) == 1024
+    
+    def test_find_bucket_boundary_small_values(self):
+        """find_bucket_boundary handles small values."""
+        buckets = [64, 128, 256, 512]
+        assert find_bucket_boundary(1, buckets) == 64
+        assert find_bucket_boundary(32, buckets) == 64
+    
+    def test_compute_strict_batch_padding_basic(self):
+        """compute_strict_batch_padding returns correct bucket boundary."""
+        buckets = [64, 128, 256, 512]
+        
+        # Max length 100 -> bucket 128
+        target, idx = compute_strict_batch_padding([50, 80, 100], buckets)
+        assert target == 128
+        assert idx == 1
+        
+        # Max length 200 -> bucket 256
+        target, idx = compute_strict_batch_padding([150, 180, 200], buckets)
+        assert target == 256
+        assert idx == 2
+    
+    def test_compute_strict_batch_padding_empty(self):
+        """compute_strict_batch_padding handles empty batch."""
+        target, idx = compute_strict_batch_padding([], [64, 128, 256])
+        assert target == 0
+        assert idx == -1
+    
+    def test_compute_strict_batch_padding_exceeds_buckets(self):
+        """compute_strict_batch_padding handles lengths exceeding all buckets."""
+        buckets = [64, 128, 256]
+        target, idx = compute_strict_batch_padding([300, 400, 500], buckets)
+        assert target == 500  # Max of batch
+        assert idx == -1  # No bucket matched
+    
+    def test_compute_strict_batch_padding_default_buckets(self):
+        """compute_strict_batch_padding uses default buckets when None."""
+        target, idx = compute_strict_batch_padding([100, 150, 200], None)
+        # Should use DEFAULT_SEQ_LEN_BUCKETS which has 256 as a bucket
+        assert target == 256
+        assert idx >= 0
+    
+    def test_default_seq_len_buckets(self):
+        """DEFAULT_SEQ_LEN_BUCKETS has expected values."""
+        assert DEFAULT_SEQ_LEN_BUCKETS == [64, 128, 192, 256, 320, 384, 448, 512]
+        assert len(DEFAULT_SEQ_LEN_BUCKETS) == 8
+        # All values should be multiples of 64 (aligned to transformer block sizes)
+        for bucket in DEFAULT_SEQ_LEN_BUCKETS:
+            assert bucket % 64 == 0
 
 
 @pytest.mark.integration
