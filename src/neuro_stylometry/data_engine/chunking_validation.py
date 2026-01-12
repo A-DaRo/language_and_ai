@@ -197,14 +197,18 @@ def find_invalid_post_chunked_indices(
         return []
     
     # Fast path: detect null chunks via PyArrow compute
-    # This is much faster than Python iteration for large arrays
+    # Handle ChunkedArray without combine_chunks() to avoid offset overflow
+    # on large datasets with nested list structures
     if isinstance(post_chunked_column, pa.ChunkedArray):
-        # Combine chunks for is_null operation
-        combined = post_chunked_column.combine_chunks()
+        # Process chunks individually to avoid offset overflow
+        # pc.is_null returns small boolean arrays that can be safely concatenated
+        null_chunks = [pc.is_null(chunk) for chunk in post_chunked_column.chunks]
+        if null_chunks:
+            null_mask = np.concatenate([chunk.to_numpy() for chunk in null_chunks])
+        else:
+            null_mask = np.zeros(n_posts, dtype=bool)
     else:
-        combined = post_chunked_column
-    
-    null_mask = pc.is_null(combined).to_numpy()
+        null_mask = pc.is_null(post_chunked_column).to_numpy()
     
     # Pre-compute non-whitespace bounds for all posts we'll check
     # Only compute for indices we'll actually validate
@@ -301,12 +305,15 @@ def find_invalid_post_chunked_indices_parallel(
     # Pre-compute bounds for all posts
     first_non_ws, last_non_ws_end = _find_non_ws_bounds_vectorized(posts)
     
-    # Pre-compute null mask
+    # Pre-compute null mask without combine_chunks() to avoid offset overflow
     if isinstance(post_chunked_column, pa.ChunkedArray):
-        combined = post_chunked_column.combine_chunks()
+        null_chunks = [pc.is_null(chunk) for chunk in post_chunked_column.chunks]
+        if null_chunks:
+            null_mask = np.concatenate([chunk.to_numpy() for chunk in null_chunks])
+        else:
+            null_mask = np.zeros(len(posts), dtype=bool)
     else:
-        combined = post_chunked_column
-    null_mask = pc.is_null(combined).to_numpy()
+        null_mask = pc.is_null(post_chunked_column).to_numpy()
     
     all_invalid: List[int] = []
     
