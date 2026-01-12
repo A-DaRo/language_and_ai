@@ -164,9 +164,9 @@ class ProbeConfig:
             raise ConfigValidationError(
                 f"probe.backend must be 'auto', 'sklearn', 'cuml', or 'torch', got '{self.backend}'"
             )
-        if self.train_split <= 0 or self.train_split >= 1:
+        if not 0.0 < self.train_split < 1.0:
             raise ConfigValidationError(
-                f"probe.train_split must be between 0 and 1, got {self.train_split}"
+                f"probe.train_split must be in (0, 1), got {self.train_split}"
             )
         if self.n_folds < 2:
             raise ConfigValidationError(
@@ -175,12 +175,6 @@ class ProbeConfig:
         if self.max_samples is not None and self.max_samples <= 0:
             raise ConfigValidationError(
                 f"probe.max_samples must be positive, got {self.max_samples}"
-            )
-    
-    def __post_init__(self):
-        if not 0.0 < self.train_split < 1.0:
-            raise ConfigValidationError(
-                f"probe.train_split must be in (0, 1), got {self.train_split}"
             )
         if not 0.0 <= self.amnesic_drop_threshold <= 1.0:
             raise ConfigValidationError(
@@ -192,6 +186,57 @@ class ProbeConfig:
 class QualityConfig:
     """Quality enforcement configuration."""
     enforce_thresholds: bool = False
+
+
+@dataclass
+class PathsConfig:
+    """File path configuration."""
+    raw_data: str = "./datasets"
+    output: str = "./artifacts"
+
+
+@dataclass
+class DataLoaderConfig:
+    """DataLoader configuration."""
+    batch_size: int = 32
+    num_workers: int = 4
+    persistent_workers: bool = False
+    prefetch_factor: int = 2
+    pin_memory: bool = True
+
+
+@dataclass
+class ExecutionConfig:
+    """Advanced execution optimization configuration."""
+    enable_cuda_graphs: bool = False
+    cuda_graph_warmup: int = 3
+    cuda_graph_cache_size: int = 16
+    enable_torch_compile: bool = False
+    torch_compile_mode: str = "reduce-overhead"
+    torch_compile_fullgraph: bool = False
+    torch_compile_dynamic: bool = False
+    torch_compile_backend: str = "inductor"
+    sequence_packing: Dict[str, Any] = field(default_factory=dict)
+    numa_pinning: bool = False
+
+
+@dataclass
+class PrecisionConfig:
+    """Numerical precision configuration."""
+    dtype: str = "float32"
+    use_grad_scaler: bool = False
+
+
+@dataclass
+class VisualizationConfig:
+    """Visualization configuration."""
+    enabled: bool = True
+    pca_max_samples: int = 1000
+    embedding_batch_size: int = 32
+    figure_dpi: int = 150
+    figure_format: str = "png"
+    color_palette: str = "husl"
+    plots: Dict[str, bool] = field(default_factory=dict)
 
 
 @dataclass
@@ -259,6 +304,55 @@ def validate_pipeline_config(config: Dict[str, Any]) -> Dict[str, Any]:
         ProbeConfig(**probe_cfg)
     except (TypeError, ConfigValidationError) as e:
         errors.append(f"probe: {e}")
+    
+    # Validate paths config
+    try:
+        paths_cfg = config.get("paths", {})
+        PathsConfig(**paths_cfg)
+    except (TypeError, ConfigValidationError) as e:
+        errors.append(f"paths: {e}")
+    
+    # Validate dataloader config
+    try:
+        dataloader_cfg = config.get("dataloader", {})
+        DataLoaderConfig(**dataloader_cfg)
+    except (TypeError, ConfigValidationError) as e:
+        errors.append(f"dataloader: {e}")
+    
+    # Validate execution config
+    try:
+        execution_cfg = config.get("execution", {})
+        ExecutionConfig(**execution_cfg)
+    except (TypeError, ConfigValidationError) as e:
+        errors.append(f"execution: {e}")
+    
+    # Validate precision config
+    try:
+        precision_cfg = config.get("precision", {})
+        PrecisionConfig(**precision_cfg)
+    except (TypeError, ConfigValidationError) as e:
+        errors.append(f"precision: {e}")
+    
+    # Validate quality config
+    try:
+        quality_cfg = config.get("quality", {})
+        QualityConfig(**quality_cfg)
+    except (TypeError, ConfigValidationError) as e:
+        errors.append(f"quality: {e}")
+    
+    # Validate visualization config
+    try:
+        viz_cfg = config.get("visualization", {})
+        VisualizationConfig(**viz_cfg)
+    except (TypeError, ConfigValidationError) as e:
+        errors.append(f"visualization: {e}")
+    
+    # Validate logging config
+    try:
+        logging_cfg = config.get("logging", {})
+        LoggingConfig(**logging_cfg)
+    except (TypeError, ConfigValidationError) as e:
+        errors.append(f"logging: {e}")
     
     if errors:
         raise ConfigValidationError(
