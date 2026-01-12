@@ -60,6 +60,7 @@ from .semantic_chunker import (
 
 if TYPE_CHECKING:
     from ..hardware_ops.runtime import RuntimeController, RuntimeMetrics
+    from ..hardware_ops.cuda_graphs import GraphAwareInference
 
 logger = logging.getLogger(__name__)
 
@@ -504,6 +505,7 @@ class GLiNERDetector:
         batch_inference_config: Optional[BatchInferenceConfig] = None,
         require_bi_encoder: bool = False,
         chunk_cache_path: Optional[str] = None,
+        execution_config: Optional[Dict[str, Any]] = None,
         # Legacy parameters (ignored but accepted for backward compatibility)
         center_window_keep: int = 100,
     ):
@@ -524,6 +526,9 @@ class GLiNERDetector:
             require_bi_encoder: If True, raise error if loaded model is not bi-encoder.
                 Bi-encoder models support encode_labels() for prompt caching.
             chunk_cache_path: Optional path to store/load chunking checkpoint.
+            execution_config: Optional dict with torch.compile and CUDA graph settings.
+                Expected keys: enable_torch_compile, torch_compile_mode, torch_compile_backend,
+                torch_compile_fullgraph, torch_compile_dynamic, enable_cuda_graphs.
             center_window_keep: DEPRECATED - Ignored. Semantic chunking handles this.
         """
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
@@ -532,6 +537,7 @@ class GLiNERDetector:
         self.model_name = model_name
         self.require_bi_encoder = require_bi_encoder
         self.chunk_cache_path = Path(chunk_cache_path) if chunk_cache_path else None
+        self._torch_compiled = False  # Will be set by _apply_torch_compile()
 
         # Initialize taxonomy and constraints
         if taxonomy is None and taxonomy_config is not None:
@@ -550,9 +556,18 @@ class GLiNERDetector:
         # Batch inference configuration
         self.batch_config = batch_inference_config or BatchInferenceConfig()
         auto_bucket_count = self.batch_config.num_buckets is None
+        
+        # Store execution config for JIT compilation
+        self._execution_config = execution_config
 
         # Load GLiNER model
         self.model = self._load_model(model_name)
+        
+        # Apply torch.compile if enabled (Phase 1 optimization)
+        self._apply_torch_compile()
+        
+        # Initialize CUDA Graph acceleration (Phase 3 optimization)
+        self._graph_inference = self._init_cuda_graphs()
 
         # Auto-compute bucket count if not specified (after device fallback is resolved)
         if auto_bucket_count:
@@ -787,6 +802,177 @@ class GLiNERDetector:
         GLiNERDetector._MODEL_CACHE[cache_key] = model
 
         return model
+
+    def _apply_torch_compile(self) -> None:
+        """
+        Apply torch.compile to the model's transformer layers if enabled.
+        
+        Reads configuration from self._execution_config to determine:
+        - Whether to enable compilation
+        - Compilation mode (default, reduce-overhead, max-autotune)
+        - Backend (inductor, eager, etc.)
+        - Whether to use fullgraph mode
+        
+        For RTX 5090 (Blackwell), max-autotune mode with Triton backend
+        provides optimal kernel fusion and significant speedup.
+        
+        Note: torch.compile requires PyTorch 2.0+
+        """
+        if self._execution_config is None:
+            logger.debug("No execution_config provided - skipping torch.compile")
+            return
+        
+        if not self._execution_config.get("enable_torch_compile", False):
+            logger.debug("torch.compile disabled in config")
+            return
+        
+        # Check PyTorch version
+        try:
+            torch_version = tuple(int(x) for x in torch.__version__.split(".")[:2])
+            if torch_version < (2, 0):
+                logger.warning(
+                    f"torch.compile requires PyTorch 2.0+, got {torch.__version__}. "
+                    "Skipping compilation."
+                )
+                return
+        except Exception:
+            logger.warning("Could not parse PyTorch version, skipping torch.compile")
+            return
+        
+        # Extract compile parameters
+        mode = str(self._execution_config.get("torch_compile_mode", "reduce-overhead"))
+        backend = str(self._execution_config.get("torch_compile_backend", "inductor"))
+        fullgraph = bool(self._execution_config.get("torch_compile_fullgraph", False))
+        dynamic = bool(self._execution_config.get("torch_compile_dynamic", False))
+        
+        logger.info(
+            f"Applying torch.compile: mode={mode}, backend={backend}, "
+            f"fullgraph={fullgraph}, dynamic={dynamic}"
+        )
+        
+        # Find the token representation layer (the actual transformer)
+        # GLiNER models typically have: model.model.token_rep_layer
+        token_rep_layer = None
+        compile_target_name = "unknown"
+        
+        # Try common paths to the transformer encoder
+        for path, name in [
+            (lambda: self.model.model.token_rep_layer, "model.model.token_rep_layer"),
+            (lambda: self.model.token_rep_layer, "model.token_rep_layer"),
+            (lambda: self.model.model.encoder, "model.model.encoder"),
+            (lambda: self.model.encoder, "model.encoder"),
+        ]:
+            try:
+                candidate = path()
+                if candidate is not None and hasattr(candidate, "forward"):
+                    token_rep_layer = candidate
+                    compile_target_name = name
+                    break
+            except (AttributeError, TypeError):
+                continue
+        
+        if token_rep_layer is None:
+            logger.warning(
+                "Could not find suitable transformer layer for torch.compile. "
+                "Model structure may differ from expected GLiNER architecture."
+            )
+            return
+        
+        try:
+            compiled_layer = torch.compile(
+                token_rep_layer,
+                mode=mode,
+                backend=backend,
+                fullgraph=fullgraph,
+                dynamic=dynamic,
+            )
+            
+            # Replace the layer with the compiled version
+            # Navigate to parent and set attribute
+            if compile_target_name == "model.model.token_rep_layer":
+                self.model.model.token_rep_layer = compiled_layer
+            elif compile_target_name == "model.token_rep_layer":
+                self.model.token_rep_layer = compiled_layer
+            elif compile_target_name == "model.model.encoder":
+                self.model.model.encoder = compiled_layer
+            elif compile_target_name == "model.encoder":
+                self.model.encoder = compiled_layer
+            
+            self._torch_compiled = True
+            logger.info(f"Successfully compiled {compile_target_name} with torch.compile")
+            
+        except Exception as e:
+            logger.warning(f"torch.compile failed: {e}. Continuing without compilation.")
+            self._torch_compiled = False
+
+    def _init_cuda_graphs(self) -> Optional["GraphAwareInference"]:
+        """
+        Initialize CUDA Graph acceleration for inference if enabled.
+        
+        Reads configuration from self._execution_config to determine:
+        - Whether to enable CUDA graphs
+        - Shape bucketing configuration
+        - Graph cache size and warmup settings
+        
+        CUDA graphs eliminate kernel launch overhead by capturing and replaying
+        GPU operations. Combined with shape bucketing, this provides significant
+        speedup for repetitive inference patterns.
+        
+        Returns:
+            GraphAwareInference instance if enabled and on CUDA, None otherwise.
+        """
+        if self._execution_config is None:
+            logger.debug("No execution_config provided - skipping CUDA graphs")
+            return None
+        
+        if not self._execution_config.get("enable_cuda_graphs", False):
+            logger.debug("CUDA graphs disabled in config")
+            return None
+        
+        if self.device.type != "cuda":
+            logger.debug("CUDA graphs require CUDA device - skipping")
+            return None
+        
+        try:
+            from ..hardware_ops.cuda_graphs import (
+                create_graph_aware_inference_from_config,
+                GraphAwareInference,
+            )
+            
+            # Build config dict from execution_config
+            config = {"execution": self._execution_config}
+            graph_inference = create_graph_aware_inference_from_config(config)
+            
+            if graph_inference.is_enabled:
+                logger.info(
+                    f"CUDA Graph acceleration enabled: "
+                    f"cache_size={graph_inference.graph_cache.config.max_cached_graphs}, "
+                    f"warmup={graph_inference.graph_cache.config.warmup_iterations}"
+                )
+                return graph_inference
+            else:
+                logger.debug("GraphAwareInference created but not enabled")
+                return None
+                
+        except Exception as e:
+            logger.warning(f"Failed to initialize CUDA graphs: {e}. Continuing without graph acceleration.")
+            return None
+
+    @property
+    def is_cuda_graph_enabled(self) -> bool:
+        """Check if CUDA graph acceleration is active."""
+        return self._graph_inference is not None and self._graph_inference.is_enabled
+
+    def get_cuda_graph_stats(self) -> Optional[Dict[str, Any]]:
+        """
+        Get CUDA graph cache statistics.
+        
+        Returns:
+            Dict with cache hits, misses, bucket usage, or None if disabled.
+        """
+        if self._graph_inference is None:
+            return None
+        return self._graph_inference.get_stats()
 
     def _sync_processor_max_len(self) -> None:
         """
@@ -1466,6 +1652,15 @@ class GLiNERDetector:
         Uses GLiNER.inference() API with optional precomputed prompt embeddings
         for bi-encoder models.
         
+        Phase 3 Optimization Note:
+            CUDA graphs are initialized via _init_cuda_graphs() but GLiNER's high-level
+            inference() API performs Python-level data processing that prevents direct
+            graph capture. The GraphAwareInference infrastructure is ready for when
+            lower-level tensor hooks (e.g., batch_forward) become available.
+            
+            Current optimization path: torch.compile on token_rep_layer provides
+            similar benefits via Triton kernel fusion with less capture complexity.
+        
         Args:
             texts: List of chunk texts.
             labels: Inference labels (same for all texts in batch).
@@ -1489,6 +1684,9 @@ class GLiNERDetector:
             inference_kwargs["labels_embeddings"] = prompt_embeddings
         
         # Run batched inference via GLiNER.inference()
+        # Note: CUDA graphs would apply at tensor level if we had direct access
+        # to the model's batch_forward method. Currently, torch.compile on
+        # token_rep_layer provides the primary compilation benefit.
         inference_kwargs = self._filter_inference_kwargs(inference_kwargs)
         try:
             all_entities = self.model.inference(
@@ -1581,6 +1779,75 @@ class GLiNERDetector:
                 )
 
         return valid_entities
+
+    def _run_with_cuda_graphs(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        forward_fn: Optional[Any] = None,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Run tensor-level inference with optional CUDA graph acceleration.
+        
+        This method provides the low-level tensor interface for CUDA graphs.
+        Use this when you have direct tensor access (e.g., custom inference loops).
+        
+        Architecture:
+        1. If CUDA graphs enabled: bucket inputs → pad → graph replay → unpad
+        2. Otherwise: direct forward pass
+        
+        Args:
+            input_ids: Tokenized input IDs (batch, seq).
+            attention_mask: Attention mask (batch, seq).
+            forward_fn: Optional custom forward function. If None, uses
+                        model.model.token_rep_layer.forward.
+        
+        Returns:
+            Dict of output tensors (unpadded to original shape).
+        
+        Example:
+            # For custom low-level inference
+            outputs = detector._run_with_cuda_graphs(
+                input_ids=batch["input_ids"],
+                attention_mask=batch["attention_mask"],
+            )
+        """
+        # Determine forward function
+        if forward_fn is None:
+            # Try to find the token representation layer
+            for path in [
+                lambda: self.model.model.token_rep_layer,
+                lambda: self.model.token_rep_layer,
+                lambda: self.model.model.encoder,
+            ]:
+                try:
+                    layer = path()
+                    if layer is not None and hasattr(layer, "forward"):
+                        forward_fn = layer.forward
+                        break
+                except (AttributeError, TypeError):
+                    continue
+        
+        if forward_fn is None:
+            raise RuntimeError(
+                "Could not find suitable forward function for CUDA graph inference. "
+                "Provide forward_fn argument explicitly."
+            )
+        
+        # Use CUDA graphs if enabled
+        if self._graph_inference is not None and self._graph_inference.is_enabled:
+            # Get pad token ID from tokenizer
+            pad_token_id = getattr(self.tokenizer, "pad_token_id", 0) or 0
+            
+            return self._graph_inference.run(
+                forward_fn=forward_fn,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                pad_token_id=pad_token_id,
+            )
+        else:
+            # Direct execution
+            return forward_fn(input_ids=input_ids, attention_mask=attention_mask)
 
     def detect_spans_long(
         self,
@@ -2063,6 +2330,11 @@ class GLiNERDetector:
         """Check if model supports bi-encoder prompt embedding caching."""
         return self._is_bi_encoder
     
+    @property
+    def is_torch_compiled(self) -> bool:
+        """Check if torch.compile was successfully applied to the model."""
+        return self._torch_compiled
+    
     def get_cache_stats(self) -> Dict[str, Any]:
         """
         Get cache statistics for debugging/monitoring.
@@ -2077,4 +2349,5 @@ class GLiNERDetector:
             ],
             "is_bi_encoder": self._is_bi_encoder,
             "prompt_caching_enabled": self.batch_config.enable_prompt_caching,
+            "torch_compiled": self._torch_compiled,
         }

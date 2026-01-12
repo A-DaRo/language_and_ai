@@ -39,6 +39,8 @@ from ..embedder import FrozenEmbedder
 from ..leace import LEACEComputer
 from ..probe import compute_amnesic_drop
 from ..concept_encoding import DemographicEncoder, extract_probe_labels
+from ..async_result_storer import AsyncResultStorer, AsyncStorerConfig
+from ..global_sort import flatten_chunks, gather_results, DynamicBatchIterator
 from ...data_engine.dataset import SOBRDataset
 from ...data_engine.schemas import (
     SOBR_SCHEMA,
@@ -246,6 +248,9 @@ class HPCFilterStrategy(PollutionFilterStrategy):
         
         require_bi_encoder = bool(gliner_cfg.get("require_bi_encoder", False))
         
+        # Extract execution config for torch.compile and CUDA graphs (Phase 1 optimization)
+        execution_cfg = config.get("execution", {})
+        
         gliner = GLiNERDetector(
             model_name=str(self._cfg_get(config, "gliner.model")),
             device=device,
@@ -256,6 +261,7 @@ class HPCFilterStrategy(PollutionFilterStrategy):
             budget_config=budget_config,
             batch_inference_config=batch_config,
             require_bi_encoder=require_bi_encoder,
+            execution_config=execution_cfg,  # Pass execution config for torch.compile
         )
         
         # Hoist label embeddings to strategy level (bi-encoder optimization)
@@ -370,135 +376,251 @@ class HPCFilterStrategy(PollutionFilterStrategy):
                 torch.cuda.empty_cache()
         
         # =======================================================================
-        # Step 3: Stage 2 - GPU Saturated Global-Sorted Inference (with Autotuning)
+        # Step 3: Stage 2 - GPU Saturated Global-Sorted Inference (with Async Storage)
         # =======================================================================
-        logger.info("Stage 2/2: GPU-Saturated Global-Sorted Inference")
+        # Phase 2 Optimization: Scatter-Store-Gather pattern with crash recovery
+        # - Results persisted to Arrow IPC for constant memory footprint
+        # - Crash recovery: skip chunks already in IPC file
+        # - Async consumer thread for non-blocking result storage
+        # =======================================================================
+        logger.info("Stage 2/2: GPU-Saturated Global-Sorted Inference (Async Storage)")
         
         post_chunked_column = table_with_chunks["post_chunked"]
         
-        # Configure pin_memory for HPC
-        pin_memory = bool(self._cfg_get_optional(
-            config, "execution.async_prefetch.pin_memory", True
-        ))
+        # Flatten chunks to get total count for async storer
+        logger.info("Stage 2.1: Flattening post_chunked for lineage tracking")
+        flattened = flatten_chunks(
+            post_chunked_column,
+            extract_texts=True,
+            include_chunk_metadata=False,
+        )
         
-        # Create RuntimeController from config (autotuning)
-        runtime_controller = self._create_runtime_controller(config)
         logger.info(
-            f"Autotuning enabled: initial_budget={runtime_controller.current_budget:,}, "
-            f"warmup_batches={runtime_controller.config.warmup_batches}"
+            f"Flattened {flattened.num_docs} documents into {flattened.num_chunks} chunks"
         )
         
-        inference_result = gliner.inference_from_manifest(
-            post_chunked_column=post_chunked_column,
-            labels=inference_labels,
-            batch_size=gliner_batch_size,
-            cached_label_embeddings=cached_label_embeddings,
-            pin_memory=pin_memory,
-            show_progress=True,
-            runtime_controller=runtime_controller,  # Enable autotuning
+        # Configure async result storage path
+        inference_ipc_path = output_dataset_path.parent / "inference_results.arrow"
+        
+        # Initialize async storer with crash recovery
+        async_storage_cfg = config.get("execution", {}).get("async_storage", {})
+        storer_config = AsyncStorerConfig(
+            queue_size=int(async_storage_cfg.get("queue_size", 16)),
+            flush_every_n=int(async_storage_cfg.get("flush_every_n", 10)),
+            timeout_seconds=float(async_storage_cfg.get("timeout_seconds", 0.5)),
         )
         
-        entities_batch = inference_result.entities
+        async_storer = AsyncResultStorer(
+            output_path=inference_ipc_path,
+            num_chunks=flattened.num_chunks,
+            config=storer_config,
+        )
         
-        # =======================================================================
-        # Step 3b: Completeness Guard - Retry skipped documents
-        # =======================================================================
-        max_retry_rounds = int(self._cfg_get_optional(config, "execution.autotuning.max_retry_rounds", 3))
-        retry_round = 0
-        all_skipped_docs: Set[int] = set(inference_result.skipped_doc_indices)
+        # Check for crash recovery - get already-completed chunks
+        completed_chunk_ids = async_storer.get_completed_chunk_ids()
+        pending_chunk_ids = async_storer.get_pending_chunk_ids()
         
-        while inference_result.skipped_doc_indices and retry_round < max_retry_rounds:
-            retry_round += 1
-            skipped_count = len(inference_result.skipped_doc_indices)
-            logger.warning(
-                f"Completeness guard: {skipped_count} documents skipped due to OOM. "
-                f"Starting retry round {retry_round}/{max_retry_rounds}"
-            )
+        logger.info(
+            f"Crash recovery: {len(completed_chunk_ids)} chunks completed, "
+            f"{len(pending_chunk_ids)} chunks pending"
+        )
+        
+        # Track inference statistics
+        inference_oom_count = 0
+        inference_final_budget = gliner_batch_size
+        skipped_chunk_indices: Set[int] = set()
+        
+        if async_storer.is_complete:
+            # All chunks already processed - skip inference entirely
+            logger.info("All chunks already processed in previous run - skipping inference")
+            stage2_skipped = True
+        else:
+            stage2_skipped = False
             
-            # Create a conservative recovery controller at 80% of current ceiling
-            oom_ceiling = runtime_controller.oom_ceiling
-            recovery_budget = int(oom_ceiling * 0.8)
-            recovery_budget = max(recovery_budget, runtime_controller.config.min_token_budget)
+            # Configure pin_memory for HPC
+            pin_memory = bool(self._cfg_get_optional(
+                config, "execution.async_prefetch.pin_memory", True
+            ))
             
-            recovery_config = RuntimeConfig(
-                warmup_batches=2,  # Quick warmup
-                initial_token_budget=recovery_budget,
-                min_token_budget=runtime_controller.config.min_token_budget,
-                max_token_budget=recovery_budget,  # Cap at recovery budget
-                memory_headroom_mb=runtime_controller.config.memory_headroom_mb * 1.5,  # Extra headroom
-                scale_up_factor=1.05,  # Very conservative scaling
-                scale_down_factor=0.7,
-                oom_slash_factor=0.4,  # More aggressive slash on retry
-                stability_threshold=0.2,
-                history_window=5,
-                recovery_patience=2,
-            )
-            recovery_controller = RuntimeController(recovery_config)
-            
+            # Create RuntimeController from config (autotuning)
+            runtime_controller = self._create_runtime_controller(config)
             logger.info(
-                f"Retry controller: recovery_budget={recovery_budget:,} "
-                f"(80% of ceiling={oom_ceiling:,})"
+                f"Autotuning enabled: initial_budget={runtime_controller.current_budget:,}, "
+                f"warmup_batches={runtime_controller.config.warmup_batches}"
             )
             
-            # Build subset table for skipped documents only
-            skipped_indices = sorted(inference_result.skipped_doc_indices)
+            # Get prompt embeddings for bi-encoder efficiency
+            prompt_embeddings = cached_label_embeddings
+            if prompt_embeddings is None:
+                prompt_embeddings = gliner.get_cached_label_embeddings(inference_labels)
             
-            # Extract post_chunked for skipped docs
-            from ..global_sort import flatten_chunks
+            # Compute global sort permutation
+            logger.info("Stage 2.2: Computing global sort permutation by token_count")
+            sort_indices = flattened.compute_sort_indices()
             
-            # Re-run inference only on skipped documents
-            retry_result = gliner.inference_from_manifest(
-                post_chunked_column=post_chunked_column.take(pa.array(skipped_indices)),
-                labels=inference_labels,
-                batch_size=max(1, gliner_batch_size // 4),  # Smaller batches
-                cached_label_embeddings=cached_label_embeddings,
-                pin_memory=False,  # Disable pin_memory during recovery
-                show_progress=True,
-                runtime_controller=recovery_controller,
+            # Create dynamic batch iterator (respects RuntimeController budget)
+            batch_iterator = DynamicBatchIterator(
+                flattened=flattened,
+                controller=runtime_controller,
+                min_batch_size=1,
+                max_batch_size=gliner_batch_size * 4,
             )
             
-            # Merge retry results back into entities_batch
-            for local_idx, doc_idx in enumerate(skipped_indices):
-                if local_idx not in retry_result.skipped_doc_indices:
-                    # Successfully processed this document
-                    entities_batch[doc_idx] = retry_result.entities[local_idx]
+            # Import OOM protection
+            from ...hardware_ops.oom_guard import execute_with_oom_protection, OOMRecoveryError
+            from ...hardware_ops.runtime import RuntimeMetrics
+            from ...hardware_ops.telemetry import CUDATimer
             
-            # Update skipped set: only docs that still failed
-            new_skipped = {
-                skipped_indices[local_idx]
-                for local_idx in retry_result.skipped_doc_indices
-            }
+            # Start async storer consumer thread
+            async_storer.start()
             
-            # Update for next iteration
-            inference_result = InferenceResult(
-                entities=entities_batch,
-                skipped_doc_indices=new_skipped,
-                oom_count=inference_result.oom_count + retry_result.oom_count,
-                final_budget=retry_result.final_budget,
+            # Progress tracking
+            pbar = tqdm(
+                total=len(pending_chunk_ids),
+                desc="GLiNER inference (async)",
+                unit="chunk",
+                dynamic_ncols=True,
             )
             
-            # Force GC between retries
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            try:
+                for batch_indices in batch_iterator:
+                    # Filter out already-completed chunks (crash recovery)
+                    pending_in_batch = [
+                        idx for idx in batch_indices
+                        if idx not in completed_chunk_ids
+                    ]
+                    
+                    if not pending_in_batch:
+                        # Entire batch already completed - skip
+                        continue
+                    
+                    batch_texts = [flattened.texts[i] for i in pending_in_batch]
+                    batch_tokens = sum(int(flattened.token_counts[i]) for i in pending_in_batch)
+                    
+                    # Run batched inference with OOM protection
+                    with CUDATimer() as timer:
+                        try:
+                            batch_entities = execute_with_oom_protection(
+                                lambda bt=batch_texts: gliner._detect_batch(
+                                    bt,
+                                    inference_labels,
+                                    prompt_embeddings,
+                                ),
+                                controller=runtime_controller,
+                                retry_limit=3,
+                            )
+                        except OOMRecoveryError:
+                            logger.error(
+                                f"OOM recovery failed for batch of {len(pending_in_batch)} chunks; "
+                                "marking as skipped"
+                            )
+                            skipped_chunk_indices.update(pending_in_batch)
+                            pbar.update(len(pending_in_batch))
+                            inference_oom_count += 1
+                            continue
+                    
+                    # Report metrics to controller for feedback loop
+                    memory_mb = (
+                        torch.cuda.memory_allocated() / (1024 ** 2)
+                        if torch.cuda.is_available()
+                        else 0.0
+                    )
+                    runtime_controller.report_metrics(RuntimeMetrics(
+                        tokens_processed=batch_tokens,
+                        batch_time_ms=timer.elapsed_ms,
+                        memory_used_mb=memory_mb,
+                        batch_size=len(pending_in_batch),
+                    ))
+                    
+                    # Submit results to async storer (non-blocking)
+                    async_storer.submit(pending_in_batch, batch_entities)
+                    
+                    # Update progress
+                    pbar.update(len(pending_in_batch))
+                    
+            finally:
+                pbar.close()
+                
+                # Finalize async storer
+                async_storer.finish()
+                
+                # Get final stats
+                storer_stats = async_storer.get_stats()
+                snapshot = runtime_controller.get_snapshot()
+                inference_oom_count += snapshot.oom_count
+                inference_final_budget = snapshot.current_budget
+                
+                logger.info(
+                    f"Async storer stats: written={storer_stats.chunks_written}, "
+                    f"recovered={storer_stats.chunks_recovered}, errors={storer_stats.errors}"
+                )
+                logger.info(
+                    f"Autotuning summary: state={snapshot.state}, "
+                    f"final_budget={snapshot.current_budget:,}, "
+                    f"oom_count={snapshot.oom_count}"
+                )
+        
+        # =======================================================================
+        # Step 3b: Load Results and Reconstruct Document-Level Entities
+        # =======================================================================
+        logger.info("Stage 2.3: Loading results and reconstructing per-document entities")
+        
+        # Load all results from IPC file
+        flat_results = async_storer.load_results_as_flat_list(flattened.num_chunks)
+        
+        # Gather results back to document order with offset projection
+        chunk_starts = flattened.chunk_starts
+        if chunk_starts is None:
+            chunk_starts = np.zeros(flattened.num_chunks, dtype=np.int32)
+        
+        entities_batch: List[List[Dict[str, Any]]] = []
+        
+        from ..semantic_chunker import deduplicate_entities
+        
+        for doc_idx in range(flattened.num_docs):
+            doc_start = flattened.doc_offsets[doc_idx]
+            doc_end = flattened.doc_offsets[doc_idx + 1]
             
-            if not new_skipped:
-                logger.info(f"All documents processed after {retry_round} retry round(s)")
-                break
+            projected_entities: List[Dict[str, Any]] = []
+            
+            for flat_idx in range(doc_start, doc_end):
+                chunk_entities = flat_results[flat_idx]
+                chunk_offset = int(chunk_starts[flat_idx])
+                
+                for entity in chunk_entities:
+                    projected = dict(entity)
+                    projected["start"] = projected.get("start", 0) + chunk_offset
+                    projected["end"] = projected.get("end", 0) + chunk_offset
+                    projected_entities.append(projected)
+            
+            # Deduplicate entities from overlapping chunks
+            deduped = deduplicate_entities(projected_entities)
+            entities_batch.append(deduped)
+        
+        # Compute skipped document indices from skipped chunk indices
+        skipped_doc_indices: Set[int] = set()
+        for flat_idx in skipped_chunk_indices:
+            for doc_idx in range(flattened.num_docs):
+                doc_start = flattened.doc_offsets[doc_idx]
+                doc_end = flattened.doc_offsets[doc_idx + 1]
+                if doc_start <= flat_idx < doc_end:
+                    skipped_doc_indices.add(doc_idx)
+                    break
         
         # Final completeness check
-        final_skipped = inference_result.skipped_doc_indices
+        final_skipped = skipped_doc_indices
         if final_skipped:
             logger.error(
-                f"INCOMPLETE INFERENCE: {len(final_skipped)} documents could not be processed "
-                f"after {max_retry_rounds} retry rounds. Proceeding with partial results."
+                f"INCOMPLETE INFERENCE: {len(final_skipped)} documents had chunks "
+                f"that could not be processed. Proceeding with partial results."
             )
             # Save manifest of skipped documents for manual inspection
             skipped_manifest = {
                 "skipped_doc_indices": sorted(final_skipped),
                 "skipped_post_ids": [post_ids[i] for i in sorted(final_skipped)],
-                "total_oom_count": inference_result.oom_count,
-                "final_budget": inference_result.final_budget,
+                "skipped_chunk_count": len(skipped_chunk_indices),
+                "total_oom_count": inference_oom_count,
+                "final_budget": inference_final_budget,
             }
             skipped_manifest_path = output_dataset_path.parent / "skipped_documents_manifest.json"
             import json
@@ -506,7 +628,10 @@ class HPCFilterStrategy(PollutionFilterStrategy):
                 json.dump(skipped_manifest, f, indent=2)
             logger.warning(f"Saved skipped documents manifest: {skipped_manifest_path}")
         
-        logger.info("Stage 2 complete: inference finished")
+        logger.info(
+            f"Stage 2 complete: {flattened.num_docs} documents reconstructed "
+            f"({len(final_skipped)} with partial results)"
+        )
         
         # =======================================================================
         # Step 4: Masking & Pollution Logs
@@ -632,13 +757,19 @@ class HPCFilterStrategy(PollutionFilterStrategy):
             "use_bf16": self.use_bf16,
             "staged_execution": True,
             "stage1_skipped": stage1_skipped,
+            "stage2_skipped": stage2_skipped if 'stage2_skipped' in dir() else False,
             "inference_completeness": {
                 "total_docs": len(posts),
+                "total_chunks": flattened.num_chunks,
                 "processed_docs": len(posts) - len(final_skipped),
                 "skipped_docs": len(final_skipped),
-                "oom_count": inference_result.oom_count,
-                "final_budget": inference_result.final_budget,
-                "retry_rounds": retry_round,
+                "skipped_chunks": len(skipped_chunk_indices),
+                "oom_count": inference_oom_count,
+                "final_budget": inference_final_budget,
+            },
+            "async_storage": {
+                "ipc_path": str(inference_ipc_path),
+                "chunks_recovered": len(completed_chunk_ids),
             },
         }
         

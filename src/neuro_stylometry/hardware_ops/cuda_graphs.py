@@ -482,3 +482,436 @@ def create_compile_config_from_dict(config: Dict[str, Any]) -> CompileConfig:
         dynamic=bool(execution_cfg.get("torch_compile_dynamic", False)),
         backend=str(execution_cfg.get("torch_compile_backend", "inductor")),
     )
+
+
+# ---------------------------------------------------------------------------
+# Shape Bucketing for CUDA Graphs
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ShapeBucket:
+    """
+    A fixed-shape bucket for CUDA graph capture.
+    
+    Inputs are padded to the bucket's dimensions, enabling graph reuse.
+    
+    Attributes:
+        batch_size: Fixed batch dimension for this bucket.
+        seq_len: Fixed sequence length dimension for this bucket.
+        usage_count: Number of times this bucket has been used.
+    """
+    batch_size: int
+    seq_len: int
+    usage_count: int = 0
+    
+    @property
+    def shape_key(self) -> Tuple[int, int]:
+        """Return the (batch_size, seq_len) tuple for graph cache lookup."""
+        return (self.batch_size, self.seq_len)
+
+
+@dataclass
+class ShapeBucketConfig:
+    """
+    Configuration for shape bucketing.
+    
+    Attributes:
+        batch_buckets: Predefined batch size buckets (powers of 2 recommended).
+        seq_len_buckets: Predefined sequence length buckets.
+        max_batch_size: Maximum batch size (inputs exceeding this are processed in multiple rounds).
+        max_seq_len: Maximum sequence length (longer sequences are truncated).
+        adaptive_buckets: If True, create new buckets for unseen shapes.
+        min_bucket_usage: Minimum uses before capturing a graph for a bucket.
+    """
+    batch_buckets: List[int] = field(default_factory=lambda: [1, 2, 4, 8, 16, 32, 64])
+    seq_len_buckets: List[int] = field(default_factory=lambda: [128, 256, 384, 512, 768, 1024])
+    max_batch_size: int = 64
+    max_seq_len: int = 1024
+    adaptive_buckets: bool = False
+    min_bucket_usage: int = 2  # Capture graph after 2 uses (skip one-offs)
+
+
+class ShapeBucketer:
+    """
+    Maps variable-shaped inputs to fixed-shape buckets for CUDA graph reuse.
+    
+    CUDA graphs require static input shapes. This class handles:
+    1. Bucket assignment: Maps (actual_batch, actual_seq) -> (bucket_batch, bucket_seq)
+    2. Padding: Pads inputs to bucket dimensions
+    3. Unpadding: Extracts valid outputs after graph replay
+    
+    Architecture:
+    - Buckets are defined by quantized (batch_size, seq_len) pairs
+    - Inputs are padded to the smallest bucket that fits
+    - Graph cache stores one graph per bucket
+    
+    Example:
+        bucketer = ShapeBucketer(config)
+        
+        # Pad inputs to bucket shape
+        bucket, padded_inputs = bucketer.pad_to_bucket(input_ids, attention_mask)
+        
+        # Run through CUDA graph
+        outputs = graph_cache.run_with_graph(
+            bucket.shape_key, model.forward, **padded_inputs
+        )
+        
+        # Unpad outputs
+        valid_outputs = bucketer.unpad_outputs(outputs, original_batch_size, original_seq_len)
+    """
+    
+    def __init__(self, config: Optional[ShapeBucketConfig] = None):
+        """
+        Initialize shape bucketer.
+        
+        Args:
+            config: Bucket configuration. If None, uses defaults.
+        """
+        self.config = config or ShapeBucketConfig()
+        
+        # Pre-compute all valid bucket combinations
+        self._buckets: Dict[Tuple[int, int], ShapeBucket] = {}
+        for batch in self.config.batch_buckets:
+            for seq in self.config.seq_len_buckets:
+                key = (batch, seq)
+                self._buckets[key] = ShapeBucket(batch_size=batch, seq_len=seq)
+        
+        # Sorted bucket dimensions for fast lookup
+        self._sorted_batches = sorted(self.config.batch_buckets)
+        self._sorted_seqs = sorted(self.config.seq_len_buckets)
+        
+        # Statistics
+        self._total_padded_tokens = 0
+        self._total_actual_tokens = 0
+        self._bucket_hits: Dict[Tuple[int, int], int] = {}
+        
+        logger.info(
+            f"ShapeBucketer initialized: {len(self._sorted_batches)} batch buckets × "
+            f"{len(self._sorted_seqs)} seq buckets = {len(self._buckets)} total buckets"
+        )
+    
+    def find_bucket(self, batch_size: int, seq_len: int) -> Optional[ShapeBucket]:
+        """
+        Find the smallest bucket that fits the given dimensions.
+        
+        Args:
+            batch_size: Actual batch size.
+            seq_len: Actual sequence length.
+            
+        Returns:
+            ShapeBucket if one fits, None if dimensions exceed max buckets.
+        """
+        # Find smallest fitting batch bucket
+        target_batch = None
+        for b in self._sorted_batches:
+            if b >= batch_size:
+                target_batch = b
+                break
+        
+        if target_batch is None:
+            if batch_size <= self.config.max_batch_size:
+                target_batch = self.config.max_batch_size
+            else:
+                return None  # Batch too large
+        
+        # Find smallest fitting seq bucket
+        target_seq = None
+        for s in self._sorted_seqs:
+            if s >= seq_len:
+                target_seq = s
+                break
+        
+        if target_seq is None:
+            if seq_len <= self.config.max_seq_len:
+                target_seq = self.config.max_seq_len
+            else:
+                return None  # Sequence too long
+        
+        key = (target_batch, target_seq)
+        
+        # Create bucket if not exists (adaptive mode or within existing bounds)
+        if key not in self._buckets:
+            if self.config.adaptive_buckets or (
+                target_batch in self._sorted_batches and target_seq in self._sorted_seqs
+            ):
+                self._buckets[key] = ShapeBucket(batch_size=target_batch, seq_len=target_seq)
+                logger.debug(f"Created new bucket: {key}")
+            else:
+                return None
+        
+        bucket = self._buckets[key]
+        bucket.usage_count += 1
+        
+        # Track statistics
+        self._bucket_hits[key] = self._bucket_hits.get(key, 0) + 1
+        
+        return bucket
+    
+    def should_capture_graph(self, bucket: ShapeBucket) -> bool:
+        """
+        Determine if a graph should be captured for this bucket.
+        
+        Args:
+            bucket: The bucket to check.
+            
+        Returns:
+            True if bucket has been used enough times to warrant graph capture.
+        """
+        return bucket.usage_count >= self.config.min_bucket_usage
+    
+    def pad_tensors(
+        self,
+        bucket: ShapeBucket,
+        input_ids: Tensor,
+        attention_mask: Tensor,
+        pad_token_id: int = 0,
+    ) -> Tuple[Tensor, Tensor]:
+        """
+        Pad input tensors to bucket dimensions.
+        
+        Args:
+            bucket: Target bucket for padding.
+            input_ids: Original input IDs (batch, seq).
+            attention_mask: Original attention mask (batch, seq).
+            pad_token_id: Token ID for padding.
+            
+        Returns:
+            Tuple of (padded_input_ids, padded_attention_mask).
+        """
+        actual_batch, actual_seq = input_ids.shape
+        target_batch, target_seq = bucket.batch_size, bucket.seq_len
+        
+        # Track padding statistics
+        self._total_actual_tokens += actual_batch * actual_seq
+        self._total_padded_tokens += target_batch * target_seq
+        
+        # No padding needed if shapes match
+        if actual_batch == target_batch and actual_seq == target_seq:
+            return input_ids, attention_mask
+        
+        # Pad sequence dimension
+        if actual_seq < target_seq:
+            seq_pad = target_seq - actual_seq
+            input_ids = torch.nn.functional.pad(
+                input_ids, (0, seq_pad), value=pad_token_id
+            )
+            attention_mask = torch.nn.functional.pad(
+                attention_mask, (0, seq_pad), value=0
+            )
+        
+        # Pad batch dimension
+        if actual_batch < target_batch:
+            batch_pad = target_batch - actual_batch
+            # Pad with zeros (will be masked out)
+            input_ids = torch.nn.functional.pad(
+                input_ids, (0, 0, 0, batch_pad), value=pad_token_id
+            )
+            attention_mask = torch.nn.functional.pad(
+                attention_mask, (0, 0, 0, batch_pad), value=0
+            )
+        
+        return input_ids, attention_mask
+    
+    def unpad_outputs(
+        self,
+        outputs: Dict[str, Tensor],
+        original_batch: int,
+        original_seq: int,
+    ) -> Dict[str, Tensor]:
+        """
+        Remove padding from output tensors.
+        
+        Args:
+            outputs: Padded output tensors.
+            original_batch: Original batch size before padding.
+            original_seq: Original sequence length before padding.
+            
+        Returns:
+            Unpadded output tensors.
+        """
+        unpadded = {}
+        for name, tensor in outputs.items():
+            if tensor.dim() >= 2:
+                # Assume (batch, seq, ...) or (batch, ...)
+                if tensor.dim() >= 2 and tensor.shape[0] >= original_batch:
+                    tensor = tensor[:original_batch]
+                if tensor.dim() >= 2 and tensor.shape[1] >= original_seq:
+                    tensor = tensor[:, :original_seq]
+            unpadded[name] = tensor
+        return unpadded
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """
+        Get bucketing statistics.
+        
+        Returns:
+            Dict with padding efficiency and bucket usage.
+        """
+        efficiency = (
+            self._total_actual_tokens / max(self._total_padded_tokens, 1) * 100
+        )
+        
+        return {
+            "total_actual_tokens": self._total_actual_tokens,
+            "total_padded_tokens": self._total_padded_tokens,
+            "padding_efficiency_pct": efficiency,
+            "bucket_hits": dict(self._bucket_hits),
+            "num_active_buckets": len(self._bucket_hits),
+        }
+    
+    def reset_stats(self) -> None:
+        """Reset statistics counters."""
+        self._total_padded_tokens = 0
+        self._total_actual_tokens = 0
+        self._bucket_hits.clear()
+
+
+class GraphAwareInference:
+    """
+    High-level API for CUDA graph-accelerated inference with shape bucketing.
+    
+    Combines ShapeBucketer and GraphCache to provide a seamless interface
+    for graph-accelerated inference on variable-shaped inputs.
+    
+    Architecture:
+    1. Inputs arrive with variable (batch, seq) shapes
+    2. ShapeBucketer finds appropriate fixed-shape bucket
+    3. Inputs are padded to bucket dimensions
+    4. GraphCache captures or replays graph for bucket shape
+    5. Outputs are unpadded and returned
+    
+    This class handles the common case where graph capture is beneficial
+    (repeated inference with similar shapes) while gracefully falling back
+    to direct execution for one-off shapes.
+    """
+    
+    def __init__(
+        self,
+        graph_cache: GraphCache,
+        bucket_config: Optional[ShapeBucketConfig] = None,
+    ):
+        """
+        Initialize graph-aware inference.
+        
+        Args:
+            graph_cache: Configured GraphCache instance.
+            bucket_config: Shape bucketing configuration.
+        """
+        self.graph_cache = graph_cache
+        self.bucketer = ShapeBucketer(bucket_config)
+        
+        # Track fallback stats
+        self._direct_calls = 0
+        self._graph_calls = 0
+    
+    @property
+    def is_enabled(self) -> bool:
+        """Check if CUDA graphs are enabled."""
+        return self.graph_cache.is_enabled
+    
+    def run(
+        self,
+        forward_fn: Callable[..., Dict[str, Tensor]],
+        input_ids: Tensor,
+        attention_mask: Tensor,
+        pad_token_id: int = 0,
+        **extra_kwargs: Any,
+    ) -> Dict[str, Tensor]:
+        """
+        Run forward function with automatic graph caching.
+        
+        Args:
+            forward_fn: Model forward function.
+            input_ids: Input token IDs (batch, seq).
+            attention_mask: Attention mask (batch, seq).
+            pad_token_id: Token ID for padding.
+            **extra_kwargs: Additional arguments passed to forward_fn.
+            
+        Returns:
+            Output tensors with padding removed.
+        """
+        if not self.is_enabled:
+            self._direct_calls += 1
+            return forward_fn(input_ids=input_ids, attention_mask=attention_mask, **extra_kwargs)
+        
+        original_batch, original_seq = input_ids.shape
+        
+        # Find bucket
+        bucket = self.bucketer.find_bucket(original_batch, original_seq)
+        
+        if bucket is None:
+            # No suitable bucket - fall back to direct execution
+            self._direct_calls += 1
+            logger.debug(
+                f"No bucket for shape ({original_batch}, {original_seq}) - direct execution"
+            )
+            return forward_fn(input_ids=input_ids, attention_mask=attention_mask, **extra_kwargs)
+        
+        # Pad inputs to bucket shape
+        padded_ids, padded_mask = self.bucketer.pad_tensors(
+            bucket, input_ids, attention_mask, pad_token_id
+        )
+        
+        # Check if graph should be captured for this bucket
+        if not self.bucketer.should_capture_graph(bucket):
+            # Not enough uses yet - run directly to warm up
+            self._direct_calls += 1
+            outputs = forward_fn(input_ids=padded_ids, attention_mask=padded_mask, **extra_kwargs)
+        else:
+            # Use graph cache
+            self._graph_calls += 1
+            outputs = self.graph_cache.run_with_graph(
+                bucket.shape_key,
+                forward_fn,
+                input_ids=padded_ids,
+                attention_mask=padded_mask,
+                **extra_kwargs,
+            )
+        
+        # Unpad outputs
+        return self.bucketer.unpad_outputs(outputs, original_batch, original_seq)
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """Get combined statistics from graph cache and bucketer."""
+        return {
+            "graph_cache": self.graph_cache.get_stats(),
+            "bucketer": self.bucketer.get_stats(),
+            "direct_calls": self._direct_calls,
+            "graph_calls": self._graph_calls,
+            "graph_call_ratio": self._graph_calls / max(self._direct_calls + self._graph_calls, 1),
+        }
+
+
+def create_graph_aware_inference_from_config(config: Dict[str, Any]) -> GraphAwareInference:
+    """
+    Create GraphAwareInference from pipeline configuration.
+    
+    Args:
+        config: Pipeline config with execution.enable_cuda_graphs, cuda_graph_* settings.
+        
+    Returns:
+        Configured GraphAwareInference instance.
+    """
+    execution_cfg = config.get("execution", {})
+    
+    # Create graph cache
+    graph_cache = create_graph_cache_from_config(config)
+    
+    # Extract bucket config
+    cuda_graph_cfg = execution_cfg.get("cuda_graphs", {})
+    
+    bucket_config = ShapeBucketConfig(
+        batch_buckets=cuda_graph_cfg.get(
+            "batch_buckets", [1, 2, 4, 8, 16, 32, 64]
+        ),
+        seq_len_buckets=cuda_graph_cfg.get(
+            "seq_len_buckets", [128, 256, 384, 512, 768, 1024]
+        ),
+        max_batch_size=int(cuda_graph_cfg.get("max_batch_size", 64)),
+        max_seq_len=int(cuda_graph_cfg.get("max_seq_len", 1024)),
+        adaptive_buckets=bool(cuda_graph_cfg.get("adaptive_buckets", False)),
+        min_bucket_usage=int(cuda_graph_cfg.get("min_bucket_usage", 2)),
+    )
+    
+    return GraphAwareInference(graph_cache, bucket_config)
