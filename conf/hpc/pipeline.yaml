@@ -187,15 +187,15 @@ gliner:
 encoder:
   model: "princeton-nlp/sup-simcse-roberta-base"
   device: "cuda"
-  output_device: "cuda"            # Keep on GPU for HPC (fast LEACE accumulation)
+  output_device: "cpu"             # Move to CPU immediately (prevent VRAM exhaustion during accumulation)
   batch_size: 512                  # Large batch for embedding
   max_length: 512
 
 leace:
   regularization: 1.0e-4
-  force_cpu: false                 # GPU LEACE on HPC
+  force_cpu: true                  # Accumulate covariance stats in RAM (prevent VRAM exhaustion)
   batch_size: 20000                # Large LEACE batches (used for shard control)
-  device: "cuda"                   # Explicit GPU device for LEACE accumulation
+  device: "cuda"                   # Final projection computation on GPU (FP64 Cholesky/SVD)
   compute_dtype: "float64"         # float64 for numerical stability in Cholesky/SVD
 
 probe:
