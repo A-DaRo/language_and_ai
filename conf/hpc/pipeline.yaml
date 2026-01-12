@@ -194,7 +194,7 @@ encoder:
 leace:
   regularization: 1.0e-4
   force_cpu: false                 # GPU LEACE on HPC
-  batch_size: 50000                # Large LEACE batches (used for shard control)
+  batch_size: 20000                # Large LEACE batches (used for shard control)
   device: "cuda"                   # Explicit GPU device for LEACE accumulation
   compute_dtype: "float64"         # float64 for numerical stability in Cholesky/SVD
 
