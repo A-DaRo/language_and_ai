@@ -204,11 +204,12 @@ def find_invalid_post_chunked_indices(
         # pc.is_null returns small boolean arrays that can be safely concatenated
         null_chunks = [pc.is_null(chunk) for chunk in post_chunked_column.chunks]
         if null_chunks:
-            null_mask = np.concatenate([chunk.to_numpy() for chunk in null_chunks])
+            # Use zero_copy_only=False for boolean arrays (PyArrow doesn't support zero-copy for bools)
+            null_mask = np.concatenate([chunk.to_numpy(zero_copy_only=False) for chunk in null_chunks])
         else:
             null_mask = np.zeros(n_posts, dtype=bool)
     else:
-        null_mask = pc.is_null(post_chunked_column).to_numpy()
+        null_mask = pc.is_null(post_chunked_column).to_numpy(zero_copy_only=False)
     
     # Pre-compute non-whitespace bounds for all posts we'll check
     # Only compute for indices we'll actually validate
@@ -309,11 +310,12 @@ def find_invalid_post_chunked_indices_parallel(
     if isinstance(post_chunked_column, pa.ChunkedArray):
         null_chunks = [pc.is_null(chunk) for chunk in post_chunked_column.chunks]
         if null_chunks:
-            null_mask = np.concatenate([chunk.to_numpy() for chunk in null_chunks])
+            # Use zero_copy_only=False for boolean arrays
+            null_mask = np.concatenate([chunk.to_numpy(zero_copy_only=False) for chunk in null_chunks])
         else:
             null_mask = np.zeros(len(posts), dtype=bool)
     else:
-        null_mask = pc.is_null(post_chunked_column).to_numpy()
+        null_mask = pc.is_null(post_chunked_column).to_numpy(zero_copy_only=False)
     
     all_invalid: List[int] = []
     
