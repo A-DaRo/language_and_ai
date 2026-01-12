@@ -891,3 +891,488 @@ def plot_masking_coverage(
     fig.savefig(output_path, dpi=dpi, bbox_inches="tight")
     plt.close(fig)
     logger.info(f"Saved {output_path}")
+
+
+# =============================================================================
+# New Visualizations for Enhanced Phase A Metrics
+# =============================================================================
+
+def plot_amnesic_drop_with_ci(
+    per_column_results: Dict[str, Dict[str, Any]],
+    output_path: Path,
+    dpi: int = 150,
+    palette: str = "husl",
+) -> None:
+    """
+    Plot amnesic drop bar chart with 95% confidence interval error bars.
+    
+    Args:
+        per_column_results: Dict from compute_per_column_amnesic_drop()
+        output_path: Where to save the plot
+        dpi: Figure DPI
+        palette: Seaborn color palette
+    """
+    columns = [c for c in per_column_results if "error" not in per_column_results[c]]
+    if not columns:
+        logger.warning("No valid column results for amnesic drop plot")
+        return
+    
+    fig, ax = plt.subplots(figsize=(12, 6))
+    
+    x = np.arange(len(columns))
+    drops = []
+    ci_lowers = []
+    ci_uppers = []
+    
+    for col in columns:
+        result = per_column_results[col]
+        drop = result.get("amnesic_drop", 0)
+        drops.append(drop)
+        
+        # Extract CI from cross-validation results
+        cv_before = result.get("cv_before", {})
+        cv_after = result.get("cv_after", {})
+        
+        if cv_before and cv_after:
+            # Approximate CI for the drop
+            ci_before = cv_before.get("ci_95_upper", result.get("acc_before", 0.5)) - cv_before.get("ci_95_lower", result.get("acc_before", 0.5))
+            ci_after = cv_after.get("ci_95_upper", result.get("acc_after", 0.5)) - cv_after.get("ci_95_lower", result.get("acc_after", 0.5))
+            ci_drop = np.sqrt(ci_before**2 + ci_after**2) / 2
+        else:
+            ci_drop = 0
+        
+        ci_lowers.append(ci_drop)
+        ci_uppers.append(ci_drop)
+    
+    display_names = [DEMOGRAPHIC_DISPLAY_NAMES.get(c, c) for c in columns]
+    colors = sns.color_palette(palette, n_colors=len(columns))
+    
+    bars = ax.bar(x, drops, color=colors, edgecolor="black", linewidth=0.5)
+    ax.errorbar(x, drops, yerr=[ci_lowers, ci_uppers], fmt="none", color="black", capsize=5)
+    
+    # Threshold line
+    ax.axhline(y=0.3, color="red", linestyle="--", alpha=0.7, label="Target threshold (30%)")
+    
+    ax.set_xticks(x)
+    ax.set_xticklabels(display_names, rotation=45, ha="right")
+    ax.set_ylabel("Amnesic Drop")
+    ax.set_xlabel("Demographic Attribute")
+    ax.set_title("Amnesic Drop by Attribute with 95% Confidence Intervals")
+    ax.legend()
+    ax.grid(True, alpha=0.3, axis="y")
+    
+    # Add value labels
+    for bar, drop in zip(bars, drops):
+        height = bar.get_height()
+        ax.annotate(f"{drop:.1%}",
+            xy=(bar.get_x() + bar.get_width() / 2, height),
+            xytext=(0, 3), textcoords="offset points",
+            ha="center", va="bottom", fontsize=9)
+    
+    plt.tight_layout()
+    fig.savefig(output_path, dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+    logger.info(f"Saved {output_path}")
+
+
+def plot_embedding_separability(
+    separability_before: Dict[str, Any],
+    separability_after: Dict[str, Any],
+    output_path: Path,
+    dpi: int = 150,
+) -> None:
+    """
+    Plot embedding separability comparison (silhouette score) before/after LEACE.
+    
+    Args:
+        separability_before: Dict from compute_embedding_separability() before LEACE
+        separability_after: Dict from compute_embedding_separability() after LEACE
+        output_path: Where to save the plot
+        dpi: Figure DPI
+    """
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    
+    # Silhouette comparison
+    sil_before = separability_before.get("silhouette_score", 0)
+    sil_after = separability_after.get("silhouette_score", 0)
+    
+    bars = axes[0].bar(["Before LEACE", "After LEACE"], [sil_before, sil_after],
+                       color=["steelblue", "coral"], edgecolor="black")
+    axes[0].set_ylabel("Silhouette Score")
+    axes[0].set_title("Embedding Separability (Silhouette Score)")
+    axes[0].set_ylim(-1, 1)
+    axes[0].axhline(y=0, color="gray", linestyle="--", alpha=0.5)
+    axes[0].grid(True, alpha=0.3, axis="y")
+    
+    # Add value labels
+    for bar in bars:
+        height = bar.get_height()
+        axes[0].annotate(f"{height:.3f}",
+            xy=(bar.get_x() + bar.get_width() / 2, height),
+            xytext=(0, 3 if height >= 0 else -12),
+            textcoords="offset points",
+            ha="center", va="bottom" if height >= 0 else "top", fontsize=11)
+    
+    # Davies-Bouldin comparison (lower is better)
+    db_before = separability_before.get("davies_bouldin_index", 0)
+    db_after = separability_after.get("davies_bouldin_index", 0)
+    
+    bars = axes[1].bar(["Before LEACE", "After LEACE"], [db_before, db_after],
+                       color=["steelblue", "coral"], edgecolor="black")
+    axes[1].set_ylabel("Davies-Bouldin Index")
+    axes[1].set_title("Embedding Separability (Davies-Bouldin Index)\n(Lower = better separation)")
+    axes[1].grid(True, alpha=0.3, axis="y")
+    
+    # Add value labels
+    for bar in bars:
+        height = bar.get_height()
+        axes[1].annotate(f"{height:.3f}",
+            xy=(bar.get_x() + bar.get_width() / 2, height),
+            xytext=(0, 3), textcoords="offset points",
+            ha="center", va="bottom", fontsize=11)
+    
+    fig.suptitle("Embedding Separability Analysis", fontsize=14)
+    plt.tight_layout()
+    fig.savefig(output_path, dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+    logger.info(f"Saved {output_path}")
+
+
+def plot_probe_learning_curves(
+    learning_curve_before: List[float],
+    learning_curve_after: List[float],
+    output_path: Path,
+    dpi: int = 150,
+) -> None:
+    """
+    Plot training loss curves for torch probes before/after LEACE.
+    
+    Args:
+        learning_curve_before: Loss values per epoch for before-LEACE probe
+        learning_curve_after: Loss values per epoch for after-LEACE probe
+        output_path: Where to save the plot
+        dpi: Figure DPI
+    """
+    fig, ax = plt.subplots(figsize=(10, 6))
+    
+    epochs = np.arange(1, len(learning_curve_before) + 1)
+    
+    ax.plot(epochs, learning_curve_before, "b-", linewidth=2, label="Before LEACE", alpha=0.8)
+    ax.plot(epochs, learning_curve_after, "r-", linewidth=2, label="After LEACE", alpha=0.8)
+    
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Training Loss")
+    ax.set_title("Probe Training Loss Curves")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    
+    # Add final loss annotations
+    ax.annotate(f"Final: {learning_curve_before[-1]:.4f}",
+        xy=(epochs[-1], learning_curve_before[-1]),
+        xytext=(5, 5), textcoords="offset points",
+        fontsize=9, color="blue")
+    ax.annotate(f"Final: {learning_curve_after[-1]:.4f}",
+        xy=(epochs[-1], learning_curve_after[-1]),
+        xytext=(5, -10), textcoords="offset points",
+        fontsize=9, color="red")
+    
+    plt.tight_layout()
+    fig.savefig(output_path, dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+    logger.info(f"Saved {output_path}")
+
+
+def plot_solver_convergence_benchmark(
+    benchmark_results: Dict[str, Any],
+    learning_curve_torch: List[float],
+    output_path: Path,
+    dpi: int = 150,
+) -> None:
+    """
+    Plot PyTorch probe convergence vs exact solver accuracy.
+    
+    Shows validation accuracy over epochs with exact solver as horizontal baseline.
+    
+    Args:
+        benchmark_results: Dict from benchmark_solver_convergence()
+        learning_curve_torch: Validation accuracies per epoch from torch probe
+        output_path: Where to save the plot
+        dpi: Figure DPI
+    """
+    fig, ax = plt.subplots(figsize=(10, 6))
+    
+    exact_acc = benchmark_results.get("exact_accuracy", 0)
+    torch_acc = benchmark_results.get("torch_accuracy", 0)
+    
+    epochs = np.arange(1, len(learning_curve_torch) + 1)
+    
+    # Plot torch convergence
+    ax.plot(epochs, learning_curve_torch, "b-", linewidth=2, label="PyTorch SGD Probe", alpha=0.8)
+    
+    # Exact solver baseline
+    ax.axhline(y=exact_acc, color="red", linestyle="--", linewidth=2, 
+               label=f"Exact Solver (sklearn): {exact_acc:.3f}")
+    
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Validation Accuracy")
+    ax.set_title("Solver Convergence Benchmark: PyTorch SGD vs Exact Solution")
+    ax.legend(loc="lower right")
+    ax.grid(True, alpha=0.3)
+    
+    # Annotate delta
+    delta = benchmark_results.get("solver_accuracy_delta", 0)
+    ax.annotate(f"Δ = {delta:.3f}",
+        xy=(epochs[-1], torch_acc),
+        xytext=(10, 0), textcoords="offset points",
+        fontsize=10, ha="left")
+    
+    plt.tight_layout()
+    fig.savefig(output_path, dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+    logger.info(f"Saved {output_path}")
+
+
+def plot_weight_correlation_scatter(
+    weights_exact: np.ndarray,
+    weights_torch: np.ndarray,
+    output_path: Path,
+    dpi: int = 150,
+) -> None:
+    """
+    Scatter plot of exact vs torch probe weights to visualize alignment.
+    
+    Points on y=x diagonal indicate perfect agreement between solvers.
+    
+    Args:
+        weights_exact: Weight coefficients from exact solver
+        weights_torch: Weight coefficients from torch solver
+        output_path: Where to save the plot
+        dpi: Figure DPI
+    """
+    fig, ax = plt.subplots(figsize=(8, 8))
+    
+    # Flatten weights
+    w_exact = weights_exact.flatten()
+    w_torch = weights_torch.flatten()
+    
+    # Scatter plot
+    ax.scatter(w_exact, w_torch, alpha=0.5, s=10, c="blue")
+    
+    # Perfect alignment line
+    lims = [
+        min(w_exact.min(), w_torch.min()),
+        max(w_exact.max(), w_torch.max()),
+    ]
+    ax.plot(lims, lims, "r--", linewidth=2, label="Perfect alignment (y=x)")
+    
+    # Compute correlation
+    correlation = np.corrcoef(w_exact, w_torch)[0, 1]
+    
+    ax.set_xlabel("Exact Solver Weights")
+    ax.set_ylabel("PyTorch Solver Weights")
+    ax.set_title(f"Weight Correlation: r = {correlation:.4f}")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    ax.set_aspect("equal", adjustable="box")
+    
+    plt.tight_layout()
+    fig.savefig(output_path, dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+    logger.info(f"Saved {output_path}")
+
+
+def plot_stratified_confusion_matrices(
+    confusion_before: np.ndarray,
+    confusion_after: np.ndarray,
+    class_names: Optional[List[str]] = None,
+    output_path: Path = None,
+    dpi: int = 150,
+) -> None:
+    """
+    Plot 2x2 grid of confusion matrices before/after LEACE.
+    
+    Grid layout:
+    - Top-Left: Before (Standard counts)
+    - Top-Right: Before (Normalized by true label - shows Recall)
+    - Bottom-Left: After (Standard counts)
+    - Bottom-Right: After (Normalized by true label)
+    
+    Args:
+        confusion_before: Confusion matrix before LEACE
+        confusion_after: Confusion matrix after LEACE
+        class_names: Optional class label names
+        output_path: Where to save the plot
+        dpi: Figure DPI
+    """
+    fig, axes = plt.subplots(2, 2, figsize=(14, 12))
+    
+    # Normalize by row (true labels)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        norm_before = confusion_before / confusion_before.sum(axis=1, keepdims=True)
+        norm_before = np.nan_to_num(norm_before)
+        norm_after = confusion_after / confusion_after.sum(axis=1, keepdims=True)
+        norm_after = np.nan_to_num(norm_after)
+    
+    # Top-Left: Before (counts)
+    sns.heatmap(confusion_before, annot=True, fmt="d", cmap="Blues", ax=axes[0, 0],
+                xticklabels=class_names, yticklabels=class_names)
+    axes[0, 0].set_title("Before LEACE (Counts)")
+    axes[0, 0].set_xlabel("Predicted")
+    axes[0, 0].set_ylabel("True")
+    
+    # Top-Right: Before (normalized)
+    sns.heatmap(norm_before, annot=True, fmt=".2f", cmap="Blues", ax=axes[0, 1],
+                xticklabels=class_names, yticklabels=class_names, vmin=0, vmax=1)
+    axes[0, 1].set_title("Before LEACE (Recall per Class)")
+    axes[0, 1].set_xlabel("Predicted")
+    axes[0, 1].set_ylabel("True")
+    
+    # Bottom-Left: After (counts)
+    sns.heatmap(confusion_after, annot=True, fmt="d", cmap="Oranges", ax=axes[1, 0],
+                xticklabels=class_names, yticklabels=class_names)
+    axes[1, 0].set_title("After LEACE (Counts)")
+    axes[1, 0].set_xlabel("Predicted")
+    axes[1, 0].set_ylabel("True")
+    
+    # Bottom-Right: After (normalized)
+    sns.heatmap(norm_after, annot=True, fmt=".2f", cmap="Oranges", ax=axes[1, 1],
+                xticklabels=class_names, yticklabels=class_names, vmin=0, vmax=1)
+    axes[1, 1].set_title("After LEACE (Recall per Class)")
+    axes[1, 1].set_xlabel("Predicted")
+    axes[1, 1].set_ylabel("True")
+    
+    fig.suptitle("Stratified Confusion Matrices: Before vs After LEACE", fontsize=14)
+    plt.tight_layout()
+    
+    if output_path:
+        fig.savefig(output_path, dpi=dpi, bbox_inches="tight")
+        plt.close(fig)
+        logger.info(f"Saved {output_path}")
+    else:
+        plt.show()
+
+
+def plot_specificity_gap(
+    target_results: Dict[str, Any],
+    control_results: Dict[str, Any],
+    target_name: str = "Target (PII)",
+    control_name: str = "Control",
+    output_path: Path = None,
+    dpi: int = 150,
+    palette: str = "husl",
+) -> None:
+    """
+    Plot grouped bar chart showing accuracy drop for target vs control probes.
+    
+    Visual goal: Large drop for target, minimal drop for control.
+    
+    Args:
+        target_results: Dict with acc_before, acc_after for target attribute
+        control_results: Dict with acc_before, acc_after for control attribute
+        target_name: Display name for target attribute
+        control_name: Display name for control attribute
+        output_path: Where to save the plot
+        dpi: Figure DPI
+        palette: Color palette
+    """
+    fig, ax = plt.subplots(figsize=(10, 6))
+    
+    x = np.arange(2)
+    width = 0.35
+    
+    target_before = target_results.get("acc_before", 0.5)
+    target_after = target_results.get("acc_after", 0.5)
+    control_before = control_results.get("acc_before", 0.5)
+    control_after = control_results.get("acc_after", 0.5)
+    
+    # Before bars
+    bars1 = ax.bar(x - width/2, [target_before, control_before], width, 
+                   label="Before LEACE", color="steelblue", edgecolor="black")
+    # After bars
+    bars2 = ax.bar(x + width/2, [target_after, control_after], width,
+                   label="After LEACE", color="coral", edgecolor="black")
+    
+    ax.set_ylabel("Probe Accuracy")
+    ax.set_title("Specificity Check: Target vs Control Probe")
+    ax.set_xticks(x)
+    ax.set_xticklabels([target_name, control_name])
+    ax.legend()
+    ax.set_ylim(0, 1)
+    ax.axhline(y=0.5, color="gray", linestyle="--", alpha=0.5, label="Random baseline")
+    ax.grid(True, alpha=0.3, axis="y")
+    
+    # Add drop annotations
+    target_drop = target_before - target_after
+    control_drop = control_before - control_after
+    
+    ax.annotate(f"Drop: {target_drop:.1%}", xy=(0, max(target_before, target_after) + 0.05),
+                ha="center", fontsize=10, color="darkblue")
+    ax.annotate(f"Drop: {control_drop:.1%}", xy=(1, max(control_before, control_after) + 0.05),
+                ha="center", fontsize=10, color="darkred")
+    
+    plt.tight_layout()
+    
+    if output_path:
+        fig.savefig(output_path, dpi=dpi, bbox_inches="tight")
+        plt.close(fig)
+        logger.info(f"Saved {output_path}")
+    else:
+        plt.show()
+
+
+def plot_selectivity_frontier(
+    strategy_results: List[Dict[str, Any]],
+    strategy_names: List[str],
+    output_path: Path = None,
+    dpi: int = 150,
+) -> None:
+    """
+    Scatter plot of control task performance vs target task amnesia.
+    
+    Each point represents a different masking strategy or LEACE configuration.
+    Optimal strategies are in the top-right corner (high utility, high amnesia).
+    
+    Args:
+        strategy_results: List of dicts with 'control_accuracy' and 'target_amnesia'
+        strategy_names: Names for each strategy
+        output_path: Where to save the plot
+        dpi: Figure DPI
+    """
+    fig, ax = plt.subplots(figsize=(10, 8))
+    
+    control_accs = [r.get("control_accuracy", 0.5) for r in strategy_results]
+    target_amnesias = [r.get("target_amnesia", 0) for r in strategy_results]
+    
+    scatter = ax.scatter(control_accs, target_amnesias, s=100, c=np.arange(len(strategy_results)),
+                         cmap="viridis", edgecolor="black", linewidth=0.5)
+    
+    # Label points
+    for i, name in enumerate(strategy_names):
+        ax.annotate(name, (control_accs[i], target_amnesias[i]),
+                    xytext=(5, 5), textcoords="offset points", fontsize=9)
+    
+    ax.set_xlabel("Control Task Performance (General Utility)")
+    ax.set_ylabel("Target Task Amnesia (Privacy/Safety)")
+    ax.set_title("Selectivity Frontier: Utility vs Privacy Trade-off")
+    ax.grid(True, alpha=0.3)
+    
+    # Mark ideal region
+    ax.axhline(y=0.3, color="green", linestyle="--", alpha=0.5, label="Target amnesia threshold (0.3)")
+    ax.axvline(x=0.7, color="blue", linestyle="--", alpha=0.5, label="Utility threshold (0.7)")
+    
+    # Shade optimal quadrant
+    ax.fill_between([0.7, 1.0], 0.3, 1.0, alpha=0.1, color="green", label="Optimal region")
+    
+    ax.legend(loc="lower left")
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    
+    plt.tight_layout()
+    
+    if output_path:
+        fig.savefig(output_path, dpi=dpi, bbox_inches="tight")
+        plt.close(fig)
+        logger.info(f"Saved {output_path}")
+    else:
+        plt.show()
+

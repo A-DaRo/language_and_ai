@@ -7,6 +7,7 @@ Implements: FR-08 (Safe Masking), GLiNER_Implementation_Strategy.md Section 2.3
 """
 
 import logging
+from pathlib import Path
 from typing import List, Dict, Any, Tuple, Optional
 from dataclasses import dataclass
 
@@ -31,44 +32,17 @@ class SpanMasker:
     Token-aware span masker with typed mask tokens.
     
     Features:
+    - Config-driven: mask tokens extracted from gliner_taxonomy.yaml
     - Maps entity types (column names) to typed mask tokens
     - Applies masks in reverse order to preserve character offsets
     - Validates single-token encoding of masks
     - Emits structured mask logs for POLLUTION_LOG_SCHEMA
     
     Implements: FR-08
+    
+    Preferred construction:
+        >>> masker = SpanMasker.from_taxonomy(taxonomy_cfg, tokenizer=tokenizer)
     """
-    
-    # Default column -> Typed mask token mapping (SOBR schema columns)
-    COLUMN_TO_MASK = {
-        # Age/birth year columns
-        "birth_year": "[MASK:AGE]",
-        # Gender column
-        "female": "[MASK:GENDER]",
-        # Nationality column
-        "nationality": "[MASK:NATIONALITY]",
-        # Political leaning column
-        "political_leaning": "[MASK:POLITICAL]",
-        # MBTI personality columns (all share same mask)
-        "extrovert": "[MASK:MBTI]",
-        "sensing": "[MASK:MBTI]",
-        "feeling": "[MASK:MBTI]",
-        "judging": "[MASK:MBTI]",
-    }
-    
-    # Legacy mapping for backward compatibility
-    ENTITY_TO_MASK = {
-        "age_statement": "[MASK:AGE]",
-        "birth_year_statement": "[MASK:BIRTH_YEAR]",
-        "gender_indicator": "[MASK:GENDER]",
-        "nationality_statement": "[MASK:NATIONALITY]",
-        "country_of_origin": "[MASK:COUNTRY]",
-        "demonym": "[MASK:DEMONYM]",
-        "personality_type_identifier": "[MASK:PERSONALITY]",
-        "mbti_type": "[MASK:MBTI]",
-        "political_affiliation": "[MASK:POLITICAL]",
-        "ideology_self_id": "[MASK:IDEOLOGY]",
-    }
     
     def __init__(
         self,
@@ -80,18 +54,125 @@ class SpanMasker:
         
         Args:
             tokenizer: Optional HuggingFace tokenizer for validation.
-            entity_to_mask: Optional custom entity/column -> mask mapping.
-                Merged over defaults (COLUMN_TO_MASK + ENTITY_TO_MASK).
+            entity_to_mask: Entity/column -> mask mapping.
+                When using from_taxonomy(), this is populated from YAML.
         """
         self.tokenizer = tokenizer
-        # Merge defaults: column-based first, then legacy, then custom
-        self.entity_to_mask = {**self.COLUMN_TO_MASK, **self.ENTITY_TO_MASK}
-        if entity_to_mask:
-            self.entity_to_mask.update(entity_to_mask)
+        self.entity_to_mask = entity_to_mask if entity_to_mask else {}
         
         # Validate single-token encoding if tokenizer provided
-        if self.tokenizer:
+        if self.tokenizer and self.entity_to_mask:
             self._validate_mask_tokens()
+    
+    @classmethod
+    def from_taxonomy(
+        cls,
+        taxonomy_cfg: Dict[str, Any],
+        tokenizer=None,
+    ) -> "SpanMasker":
+        """
+        Create SpanMasker from taxonomy configuration (preferred factory).
+        
+        Extracts mask_token from each column definition in gliner_taxonomy.yaml.
+        Also maps GLiNER prompt labels to their corresponding mask tokens.
+        
+        Args:
+            taxonomy_cfg: Loaded taxonomy dict with 'column_prompts' section.
+                Expected structure:
+                    column_prompts:
+                      birth_year:
+                        prompts: ["age statement", ...]
+                        mask_token: "[MASK:AGE]"
+                      female:
+                        prompts: ["gender self-identification", ...]
+                        mask_token: "[MASK:GENDER]"
+                      ...
+            tokenizer: Optional HuggingFace tokenizer for single-token validation.
+            
+        Returns:
+            Configured SpanMasker instance.
+            
+        Raises:
+            ValueError: If taxonomy_cfg is missing required structure.
+        """
+        entity_to_mask: Dict[str, str] = {}
+        
+        column_prompts = taxonomy_cfg.get("column_prompts", {})
+        if not column_prompts:
+            logger.warning(
+                "No 'column_prompts' found in taxonomy_cfg; "
+                "SpanMasker will have empty entity_to_mask mapping"
+            )
+        
+        for column_name, column_config in column_prompts.items():
+            if not isinstance(column_config, dict):
+                logger.warning(f"Invalid config for column '{column_name}': expected dict")
+                continue
+            
+            mask_token = column_config.get("mask_token")
+            if not mask_token:
+                logger.warning(f"No mask_token defined for column '{column_name}'")
+                continue
+            
+            # Map column name to mask token
+            entity_to_mask[column_name] = mask_token
+            
+            # Also map each prompt label to the same mask token
+            # This handles GLiNER entity types like "age statement" -> "[MASK:AGE]"
+            prompts = column_config.get("prompts", [])
+            for prompt in prompts:
+                if isinstance(prompt, str):
+                    # Normalize prompt to entity label format (underscore-separated)
+                    entity_label = prompt.lower().replace(" ", "_")
+                    entity_to_mask[entity_label] = mask_token
+                    # Also keep the original prompt format
+                    entity_to_mask[prompt] = mask_token
+            
+            # Map distractors too (they might be detected)
+            distractors = column_config.get("distractors", [])
+            for distractor in distractors:
+                if isinstance(distractor, str):
+                    entity_label = distractor.lower().replace(" ", "_")
+                    entity_to_mask[entity_label] = mask_token
+                    entity_to_mask[distractor] = mask_token
+        
+        logger.info(
+            f"SpanMasker.from_taxonomy: loaded {len(entity_to_mask)} "
+            f"entity->mask mappings from {len(column_prompts)} columns"
+        )
+        
+        return cls(tokenizer=tokenizer, entity_to_mask=entity_to_mask)
+    
+    @classmethod
+    def from_taxonomy_path(
+        cls,
+        taxonomy_path: Path,
+        tokenizer=None,
+    ) -> "SpanMasker":
+        """
+        Create SpanMasker from taxonomy YAML file path.
+        
+        Convenience wrapper around from_taxonomy() that loads the YAML file.
+        
+        Args:
+            taxonomy_path: Path to gliner_taxonomy.yaml file.
+            tokenizer: Optional HuggingFace tokenizer for validation.
+            
+        Returns:
+            Configured SpanMasker instance.
+        """
+        from omegaconf import OmegaConf
+        
+        taxonomy_path = Path(taxonomy_path)
+        if not taxonomy_path.exists():
+            raise FileNotFoundError(f"Taxonomy config not found: {taxonomy_path}")
+        
+        cfg = OmegaConf.to_container(OmegaConf.load(taxonomy_path), resolve=True)
+        if not isinstance(cfg, dict):
+            raise TypeError("Taxonomy YAML did not resolve to a mapping")
+        
+        taxonomy_cfg = cfg.get("taxonomy", cfg)
+        return cls.from_taxonomy(taxonomy_cfg, tokenizer=tokenizer)
     
     def _validate_mask_tokens(self) -> None:
         """Validate that mask tokens are encoded as single tokens."""

@@ -59,7 +59,20 @@ notebooks = [
     "seaborn>=0.13.0",
 ]
 hpc = [
-    "nvidia-ml-py>=12.0.0",  # For detailed GPU monitoring
+    "cudf-cu13==25.12.*",
+    "dask-cudf-cu13==25.12.*",
+    "cuml-cu13==25.12.*",
+    "cugraph-cu13==25.12.*",
+    "nx-cugraph-cu13==25.12.*",
+    "cuxfilter-cu13==25.12.*",
+    "cucim-cu13==25.12.*",
+    "pylibraft-cu13==25.12.*",
+    "raft-dask-cu13==25.12.*",
+    "cuvs-cu13==25.12.*",
+]
+# Install all optional dependencies at once
+all = [
+    "neuro-stylometry[dev,notebooks,hpc]",
 ]
 
 [project.scripts]

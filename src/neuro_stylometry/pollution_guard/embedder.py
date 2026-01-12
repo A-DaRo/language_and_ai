@@ -204,11 +204,11 @@ class FrozenEmbedder(nn.Module):
             # Extract CLS embeddings (first token)
             cls_embeddings = outputs.last_hidden_state[:, 0, :]  # (batch_size, hidden_dim)
             
-            # Move to output device if specified
+            # Move to output device if specified, otherwise keep on model device
+            # (previous behavior defaulted to CPU, but GPU retention is better for HPC)
             if final_output_device:
                 cls_embeddings = cls_embeddings.to(final_output_device)
-            else:
-                cls_embeddings = cls_embeddings.cpu()
+            # else: keep on self.device (model device)
             
             all_embeddings.append(cls_embeddings)
         

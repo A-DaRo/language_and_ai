@@ -86,6 +86,7 @@ class LEACEComputer:
         regularization: float = 1e-5,
         device: str = "cuda",
         force_cpu: bool = False,
+        compute_dtype: str = "float64",
     ):
         """
         Initialize LEACE computer.
@@ -93,16 +94,24 @@ class LEACEComputer:
         Args:
             embedding_dim: Dimensionality of embeddings.
             regularization: Regularization strength for Cholesky (epsilon).
-            device: PyTorch device.
+            device: PyTorch device for accumulation and computation.
+            force_cpu: If True, always use CPU for accumulation (for VRAM-limited systems).
+            compute_dtype: Data type for LEACE math ("float64" recommended for stability,
+                           "float32" for speed on GPU with reduced precision).
         """
         self.embedding_dim = embedding_dim
         self.regularization = regularization
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
         self.force_cpu = force_cpu
+        self.compute_dtype = getattr(torch, compute_dtype, torch.float64)
+        
+        # Resolve accumulation device based on force_cpu flag
+        self._accum_device = torch.device("cpu") if self.force_cpu else self.device
         
         logger.info(
             f"LEACEComputer initialized: dim={embedding_dim}, "
-            f"reg={regularization}, device={self.device}, force_cpu={self.force_cpu}"
+            f"reg={regularization}, device={self.device}, force_cpu={self.force_cpu}, "
+            f"compute_dtype={compute_dtype}, accum_device={self._accum_device}"
         )
     
     def compute_projection(
@@ -192,8 +201,9 @@ class LEACEComputer:
     ) -> ConceptCovarianceStats:
         """Accumulate concept covariance stats from a batch.
 
-        Keeps computations on CPU for streaming stability/VRAM control.
-        Batch accumulation always transfers to CPU to prevent VRAM fragmentation.
+        Accumulation device is determined by force_cpu flag:
+        - force_cpu=True: CPU for streaming stability/VRAM control.
+        - force_cpu=False: Use self.device (GPU for HPC throughput).
         
         Note:
             If force_cpu is True and embeddings are on CUDA, a warning is logged
@@ -206,10 +216,11 @@ class LEACEComputer:
                 "Auto-moving to CPU for LEACE accumulation."
             )
 
-        X = embeddings_batch.detach().to("cpu", dtype=torch.float32)
-        Z = concepts_batch.detach().to("cpu", dtype=torch.float32)
+        # Use configured accumulation device (respects force_cpu)
+        X = embeddings_batch.detach().to(self._accum_device, dtype=torch.float32)
+        Z = concepts_batch.detach().to(self._accum_device, dtype=torch.float32)
 
-        batch_stats = self._compute_concept_stats(X, Z, device=torch.device("cpu"))
+        batch_stats = self._compute_concept_stats(X, Z, device=self._accum_device)
         if accumulated_stats is None:
             return batch_stats
 
@@ -245,6 +256,10 @@ class LEACEComputer:
         This method allows computing LEACE incrementally by accumulating statistics
         across multiple batches without loading all data into memory.
         
+        Accumulation device is determined by force_cpu flag:
+        - force_cpu=True: CPU for streaming stability/VRAM control.
+        - force_cpu=False: Use self.device (GPU for HPC throughput).
+        
         Args:
             embeddings_batch: Batch embeddings (batch_size, embedding_dim).
             labels_batch: Batch labels (batch_size,).
@@ -253,9 +268,9 @@ class LEACEComputer:
         Returns:
             Updated CovarianceStats.
         """
-        # Keep batch computations on CPU for stability/VRAM control.
-        embeddings_batch = embeddings_batch.detach().to("cpu")
-        labels_batch = labels_batch.detach().to("cpu")
+        # Use configured accumulation device (respects force_cpu)
+        embeddings_batch = embeddings_batch.detach().to(self._accum_device)
+        labels_batch = labels_batch.detach().to(self._accum_device)
         
         # Compute batch statistics
         batch_stats = self._compute_covariance_stats(embeddings_batch, labels_batch)

@@ -3,7 +3,8 @@
 Phase A Metrics Computation.
 
 Aggregates dataset statistics, GLiNER detection metrics, LEACE projection
-quality metrics, and probe accuracy into a unified JSON-serializable dict.
+quality metrics, probe accuracy, embedding separability, and class imbalance
+metrics into a unified JSON-serializable dict.
 
 Output: phase_a_metrics.json
 """
@@ -325,3 +326,311 @@ def save_metrics(metrics: Dict[str, Any], output_path: Path) -> None:
         json.dump(metrics, f, indent=2, default=str)
     
     logger.info(f"Saved Phase A metrics to {output_path}")
+
+
+# =============================================================================
+# Extended Phase A Metrics
+# =============================================================================
+
+def compute_masking_rate_histogram(
+    clean_table: pa.Table,
+    n_bins: int = 10,
+) -> Dict[str, Any]:
+    """
+    Compute per-document masking rate histogram.
+    
+    Masking rate = (number of mask tokens) / (original text length)
+    
+    Returns:
+        Dict with histogram bins, counts, and statistics.
+    """
+    import re
+    
+    if "post" not in clean_table.column_names or "post_masked" not in clean_table.column_names:
+        return {"error": "Missing post or post_masked columns"}
+    
+    post_col = clean_table["post"].to_pylist()
+    post_masked_col = clean_table["post_masked"].to_pylist()
+    
+    masking_rates = []
+    for orig, masked in zip(post_col, post_masked_col):
+        if not orig or not masked:
+            masking_rates.append(0.0)
+            continue
+        
+        # Count mask tokens
+        n_masks = len(re.findall(r"\[MASK:[A-Z_]+\]", masked))
+        # Masking rate as ratio of mask tokens to original words
+        orig_words = len(orig.split())
+        rate = n_masks / max(orig_words, 1)
+        masking_rates.append(rate)
+    
+    masking_rates = np.array(masking_rates)
+    
+    # Compute histogram
+    hist, bin_edges = np.histogram(masking_rates, bins=n_bins, range=(0, 1))
+    
+    return {
+        "histogram": {
+            "counts": hist.tolist(),
+            "bin_edges": bin_edges.tolist(),
+        },
+        "statistics": {
+            "mean": float(np.mean(masking_rates)),
+            "std": float(np.std(masking_rates)),
+            "median": float(np.median(masking_rates)),
+            "min": float(np.min(masking_rates)),
+            "max": float(np.max(masking_rates)),
+            "zero_mask_rate_pct": float((masking_rates == 0).sum() / len(masking_rates) * 100),
+        },
+    }
+
+
+def compute_embedding_separability(
+    embeddings: np.ndarray,
+    labels: np.ndarray,
+    sample_size: int = 5000,
+) -> Dict[str, Any]:
+    """
+    Compute embedding separability scores using clustering metrics.
+    
+    Metrics:
+    - Silhouette score: How similar each point is to its own cluster vs other clusters
+    - Davies-Bouldin index: Ratio of within-cluster to between-cluster distances
+    
+    Higher silhouette (closer to 1) = better separation
+    Lower Davies-Bouldin = better separation
+    
+    Args:
+        embeddings: Embedding matrix (n_samples, n_features)
+        labels: Class labels (n_samples,)
+        sample_size: Max samples for computation (performance)
+        
+    Returns:
+        Dict with separability metrics
+    """
+    from sklearn.metrics import silhouette_score, davies_bouldin_score
+    
+    # Filter out invalid labels
+    valid_mask = labels != -1
+    embeddings = embeddings[valid_mask]
+    labels = labels[valid_mask]
+    
+    if len(embeddings) == 0:
+        return {"error": "No valid samples"}
+    
+    # Sample if too large
+    if len(embeddings) > sample_size:
+        indices = np.random.choice(len(embeddings), sample_size, replace=False)
+        embeddings = embeddings[indices]
+        labels = labels[indices]
+    
+    unique_labels = np.unique(labels)
+    if len(unique_labels) < 2:
+        return {"error": "Need at least 2 classes for separability metrics"}
+    
+    try:
+        silhouette = silhouette_score(embeddings, labels)
+        davies_bouldin = davies_bouldin_score(embeddings, labels)
+    except Exception as e:
+        logger.warning(f"Separability computation failed: {e}")
+        return {"error": str(e)}
+    
+    return {
+        "silhouette_score": float(silhouette),
+        "davies_bouldin_index": float(davies_bouldin),
+        "n_samples": len(embeddings),
+        "n_classes": len(unique_labels),
+    }
+
+
+def compute_class_imbalance_metrics(
+    labels: np.ndarray,
+) -> Dict[str, Any]:
+    """
+    Compute class imbalance metrics for probe evaluation.
+    
+    Metrics:
+    - Class distribution
+    - Imbalance ratio (majority / minority)
+    - Majority baseline accuracy (ZeroR)
+    """
+    # Filter invalid
+    valid_labels = labels[labels != -1]
+    
+    if len(valid_labels) == 0:
+        return {"error": "No valid labels"}
+    
+    unique, counts = np.unique(valid_labels, return_counts=True)
+    total = len(valid_labels)
+    
+    # Class distribution
+    distribution = {int(label): int(count) for label, count in zip(unique, counts)}
+    proportions = {int(label): float(count / total) for label, count in zip(unique, counts)}
+    
+    # Imbalance metrics
+    majority_count = counts.max()
+    minority_count = counts.min()
+    imbalance_ratio = majority_count / max(minority_count, 1)
+    majority_baseline = majority_count / total
+    
+    return {
+        "distribution": distribution,
+        "proportions": proportions,
+        "imbalance_ratio": float(imbalance_ratio),
+        "majority_baseline": float(majority_baseline),
+        "majority_class": int(unique[np.argmax(counts)]),
+        "minority_class": int(unique[np.argmin(counts)]),
+        "n_classes": len(unique),
+    }
+
+
+def compute_control_probe_metrics(
+    embeddings_before: np.ndarray,
+    embeddings_after: np.ndarray,
+    target_labels: np.ndarray,
+    control_labels: np.ndarray,
+    control_name: str = "control",
+) -> Dict[str, Any]:
+    """
+    Compute control probe metrics to verify masking specificity.
+    
+    A control probe targets a feature that SHOULD NOT change after masking
+    (e.g., text length, sentiment). If both target and control drop significantly,
+    the masking is destroying general embedding quality rather than specifically
+    removing the target pollution.
+    
+    Metrics:
+    - Control stability score: 1 - (acc_before - acc_after) for control
+    - Specificity ratio: target_drop / (control_drop + epsilon)
+    
+    Args:
+        embeddings_before: Embeddings before masking/LEACE
+        embeddings_after: Embeddings after masking/LEACE
+        target_labels: Labels for the target attribute (what we want to remove)
+        control_labels: Labels for the control attribute (what should stay)
+        control_name: Name for logging
+        
+    Returns:
+        Dict with control probe metrics
+    """
+    from ..pollution_guard.probe import ProbeConfig, create_probe
+    
+    config = ProbeConfig(backend="sklearn", max_iter=1000)
+    
+    # Filter valid samples (both labels must be valid)
+    valid_mask = (target_labels != -1) & (control_labels != -1)
+    X_before = embeddings_before[valid_mask]
+    X_after = embeddings_after[valid_mask]
+    y_target = target_labels[valid_mask]
+    y_control = control_labels[valid_mask]
+    
+    if len(X_before) < 100:
+        return {"error": "Insufficient samples for control probe"}
+    
+    # Simple train/test split
+    n = len(X_before)
+    train_idx = np.arange(int(n * 0.8))
+    test_idx = np.arange(int(n * 0.8), n)
+    
+    results = {}
+    
+    # Target probe
+    target_probe_before = create_probe(config)
+    target_probe_before.fit(X_before[train_idx], y_target[train_idx])
+    target_acc_before = target_probe_before.evaluate(X_before[test_idx], y_target[test_idx]).accuracy
+    
+    target_probe_after = create_probe(config)
+    target_probe_after.fit(X_after[train_idx], y_target[train_idx])
+    target_acc_after = target_probe_after.evaluate(X_after[test_idx], y_target[test_idx]).accuracy
+    
+    target_drop = target_acc_before - target_acc_after
+    
+    # Control probe
+    control_probe_before = create_probe(config)
+    control_probe_before.fit(X_before[train_idx], y_control[train_idx])
+    control_acc_before = control_probe_before.evaluate(X_before[test_idx], y_control[test_idx]).accuracy
+    
+    control_probe_after = create_probe(config)
+    control_probe_after.fit(X_after[train_idx], y_control[train_idx])
+    control_acc_after = control_probe_after.evaluate(X_after[test_idx], y_control[test_idx]).accuracy
+    
+    control_drop = control_acc_before - control_acc_after
+    
+    # Metrics
+    control_stability = 1.0 - max(0, control_drop)
+    specificity_ratio = target_drop / (control_drop + 1e-6) if control_drop > 0 else float('inf')
+    
+    results = {
+        "target": {
+            "acc_before": float(target_acc_before),
+            "acc_after": float(target_acc_after),
+            "drop": float(target_drop),
+        },
+        f"control_{control_name}": {
+            "acc_before": float(control_acc_before),
+            "acc_after": float(control_acc_after),
+            "drop": float(control_drop),
+        },
+        "control_stability_score": float(control_stability),
+        "specificity_ratio": float(min(specificity_ratio, 100.0)),  # Cap for JSON
+        "is_specific": specificity_ratio > 1.5,  # Heuristic threshold
+    }
+    
+    return results
+
+
+def compute_per_column_amnesic_drop(
+    embeddings_before: np.ndarray,
+    embeddings_after: np.ndarray,
+    labels_dict: Dict[str, np.ndarray],
+    config: Optional[Any] = None,
+) -> Dict[str, Dict[str, Any]]:
+    """
+    Compute amnesic drop for each demographic column with cross-validation.
+    
+    Args:
+        embeddings_before: Embeddings before LEACE
+        embeddings_after: Embeddings after LEACE
+        labels_dict: Dict mapping column names to label arrays
+        config: Optional ProbeConfig
+        
+    Returns:
+        Dict mapping column names to amnesic drop results with CI
+    """
+    import torch
+    from ..pollution_guard.probe import compute_amnesic_drop_extended, ProbeConfig
+    
+    if config is None:
+        config = ProbeConfig(use_kfold=True, n_folds=5)
+    
+    results = {}
+    
+    for col_name, labels in labels_dict.items():
+        # Convert to torch if needed
+        if isinstance(embeddings_before, np.ndarray):
+            emb_before_t = torch.tensor(embeddings_before, dtype=torch.float32)
+            emb_after_t = torch.tensor(embeddings_after, dtype=torch.float32)
+        else:
+            emb_before_t = embeddings_before
+            emb_after_t = embeddings_after
+        
+        if isinstance(labels, np.ndarray):
+            labels_t = torch.tensor(labels, dtype=torch.long)
+        else:
+            labels_t = labels
+        
+        try:
+            result = compute_amnesic_drop_extended(
+                embeddings_before=emb_before_t,
+                embeddings_after=emb_after_t,
+                labels=labels_t,
+                config=config,
+                use_kfold=True,
+            )
+            results[col_name] = result.to_dict()
+        except Exception as e:
+            logger.warning(f"Amnesic drop computation failed for {col_name}: {e}")
+            results[col_name] = {"error": str(e)}
+    
+    return results

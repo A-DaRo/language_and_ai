@@ -117,6 +117,13 @@ class PhaseAPipeline:
             cur = cur[part]
         return cur
 
+    def _cfg_get_optional(self, path: str, default: Any = None) -> Any:
+        """Get a nested config value by dot-path, returning default if not found."""
+        try:
+            return self._cfg_get(path)
+        except KeyError:
+            return default
+
     def _resolve_device(self, device_spec: str) -> str:
         """Resolve an explicit device spec from YAML."""
         import torch
@@ -219,14 +226,19 @@ class PhaseAPipeline:
         return self._detector
 
     def get_masker(self) -> SpanMasker:
-        """Return a configured SpanMasker tied to the detector tokenizer."""
+        """Return a configured SpanMasker tied to the detector tokenizer.
+        
+        Uses config-driven factory: extracts mask_token from taxonomy YAML.
+        """
         if self._masker is not None:
             return self._masker
 
         detector = self.get_detector()
-        self._masker = SpanMasker(
+        taxonomy_cfg, _ = self._load_taxonomy_bundle()
+        
+        self._masker = SpanMasker.from_taxonomy(
+            taxonomy_cfg=taxonomy_cfg,
             tokenizer=detector.model.data_processor.transformer_tokenizer,
-            entity_to_mask=detector.get_mask_tokens(),
         )
         return self._masker
 
@@ -246,10 +258,14 @@ class PhaseAPipeline:
         mask_tokens = list(dict.fromkeys(detector.get_mask_tokens().values()))
 
         device = self._resolve_device(self._cfg_get("encoder.device"))
+        # Read output_device from config (None = keep on model device)
+        output_device = self._cfg_get_optional("encoder.output_device", None)
+        
         self._embedder = FrozenEmbedder(
             model_name=self._cfg_get("encoder.model"),
             device=device,
             max_length=int(self._cfg_get("encoder.max_length")),
+            output_device=output_device,
             special_tokens=mask_tokens,  # Critical for tokenizer alignment
         )
         return self._embedder
@@ -259,12 +275,21 @@ class PhaseAPipeline:
         if self._leace is not None:
             return self._leace
 
-        device = self._resolve_device(self._cfg_get("encoder.device"))
+        # Use leace.device if specified, otherwise fallback to encoder.device
+        leace_device_spec = self._cfg_get_optional("leace.device", None)
+        if leace_device_spec is None:
+            leace_device_spec = self._cfg_get("encoder.device")
+        device = self._resolve_device(leace_device_spec)
+        
+        # Compute dtype for LEACE math (float64 recommended for stability)
+        compute_dtype = self._cfg_get_optional("leace.compute_dtype", "float64")
+        
         self._leace = LEACEComputer(
             embedding_dim=int(self._cfg_get("encoder.hidden_dim")),
             regularization=float(self._cfg_get("leace.regularization")),
             device=device,
             force_cpu=bool(self._cfg_get("leace.force_cpu")),
+            compute_dtype=compute_dtype,
         )
         return self._leace
     

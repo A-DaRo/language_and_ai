@@ -37,7 +37,11 @@ from ..semantic_chunker import BudgetConfig
 from ..explicit_recall import compute_explicit_recall
 from ..embedder import FrozenEmbedder
 from ..leace import LEACEComputer
-from ..probe import compute_amnesic_drop
+from ..probe import (
+    compute_amnesic_drop,
+    compute_amnesic_drop_extended,
+    ProbeConfig,
+)
 from ..concept_encoding import DemographicEncoder, extract_probe_labels
 from ...data_engine.dataset import SOBRDataset
 from ...data_engine.schemas import (
@@ -52,6 +56,10 @@ from ...data_engine.schemas import (
 from ...data_engine.chunking_writer import ChunkingArtifactWriter, save_chunked_table_atomic
 from ...data_engine.chunking_validation import find_invalid_post_chunked_indices
 from ...hardware_ops.runtime import RuntimeController, RuntimeConfig
+from ...evaluation.metrics import (
+    compute_embedding_separability,
+    compute_class_imbalance_metrics,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -512,9 +520,10 @@ class LaptopFilterStrategy(PollutionFilterStrategy):
         # =======================================================================
         logger.info("Applying typed masks")
         
-        masker = SpanMasker(
+        # Config-driven masker: extract mask_token from taxonomy YAML
+        masker = SpanMasker.from_taxonomy(
+            taxonomy_cfg=taxonomy_config,
             tokenizer=gliner.model.data_processor.transformer_tokenizer,
-            entity_to_mask=gliner.get_mask_tokens(),
         )
         
         masked_texts, pollution_logs = masker.mask_batch(posts, entities_batch, post_ids)
@@ -549,17 +558,30 @@ class LaptopFilterStrategy(PollutionFilterStrategy):
         if leace_force_cpu:
             logger.info("LEACE computation forced to CPU for numerical stability")
         
+        # Read LEACE config: device (with fallback to encoder.device), compute_dtype
+        leace_device_spec = self._cfg_get_optional(config, "leace.device", None)
+        if leace_device_spec is None:
+            leace_device_spec = self._cfg_get(config, "encoder.device")
+        # If force_cpu is enabled, override to CPU regardless of config
+        leace_device = "cpu" if leace_force_cpu else self._resolve_device(leace_device_spec)
+        leace_compute_dtype = self._cfg_get_optional(config, "leace.compute_dtype", "float64")
+        leace_batch_size = int(self._cfg_get_optional(config, "leace.batch_size", 50))
+        
         leace = LEACEComputer(
             embedding_dim=embedder.get_embedding_dim(),
             regularization=float(self._cfg_get(config, "leace.regularization")),
-            device="cpu" if leace_force_cpu else self._resolve_device(self._cfg_get(config, "encoder.device")),
+            device=leace_device,
             force_cpu=leace_force_cpu,
+            compute_dtype=leace_compute_dtype,
         )
         
         # Laptop mode: smaller shards for embedding + LEACE accumulation
-        shard_size = int(chunking_cfg.get("shard_size", 0) or 512)  # Smaller default for laptop
+        # Priority: chunking.shard_size > leace.batch_size > default (512)
+        shard_size = int(chunking_cfg.get("shard_size", 0))
         if shard_size <= 0:
-            shard_size = 512
+            shard_size = leace_batch_size
+        if shard_size <= 0:
+            shard_size = 512  # Laptop default
         
         total_shards = max(1, (len(masked_texts) + shard_size - 1) // shard_size)
         
@@ -666,50 +688,117 @@ class LaptopFilterStrategy(PollutionFilterStrategy):
             )
             metadata["explicit_recall"] = recall
         
-        # Amnesic drop probe
+        # Amnesic drop probe with extended metrics
         if probe_enabled and probe_embeddings:
+            logger.info("Computing probe metrics (Laptop Mode)...")
+            
             embeddings_before = torch.cat(probe_embeddings, dim=0)[:max_probe_samples]
             probe_table = table_with_chunks.slice(0, len(embeddings_before))
             
             P_cpu = projection_matrix.detach().to("cpu", dtype=torch.float32)
             embeddings_after = embeddings_before @ P_cpu.T
             
+            # Convert to numpy for metrics
+            X_before_np = embeddings_before.numpy()
+            X_after_np = embeddings_after.numpy()
+            
+            # Build ProbeConfig from YAML (laptop uses sklearn by default)
+            probe_cfg = config.get("probe", {})
+            probe_config = ProbeConfig(
+                backend=probe_cfg.get("backend", "sklearn"),  # Default sklearn for laptop
+                max_iter=int(probe_cfg.get("max_iter", 1000)),
+                random_state=int(self._cfg_get(config, "seed")),
+                n_folds=int(probe_cfg.get("n_folds", 5)),
+                pvalue_threshold=float(probe_cfg.get("pvalue_threshold", 0.05)),
+                use_class_weights=bool(probe_cfg.get("use_class_weights", True)),
+            )
+            use_kfold = bool(probe_cfg.get("use_kfold", True))
+            
             by_column: Dict[str, Any] = {}
+            by_column_extended: Dict[str, Any] = {}
             drops: List[float] = []
+            separability_before: Dict[str, Any] = {}
+            separability_after: Dict[str, Any] = {}
+            class_imbalance: Dict[str, Any] = {}
             
             for col in get_demographic_columns():
                 labels_np = extract_probe_labels(probe_table, col)
                 labels_t = torch.tensor(labels_np, dtype=torch.long)
+                
                 try:
-                    acc_before, acc_after, amnesic_drop = compute_amnesic_drop(
+                    # Extended amnesic drop with CV
+                    result = compute_amnesic_drop_extended(
                         embeddings_before,
                         embeddings_after,
                         labels_t,
                         train_split=float(self._cfg_get(config, "probe.train_split")),
                         random_state=int(self._cfg_get(config, "seed")),
+                        config=probe_config,
+                        use_kfold=use_kfold,
+                        device="cpu",  # Laptop mode uses CPU
                     )
+                    
+                    by_column[col] = {
+                        "accuracy_before": result.acc_before,
+                        "accuracy_after": result.acc_after,
+                        "amnesic_drop": result.amnesic_drop,
+                    }
+                    by_column_extended[col] = result.to_dict()
+                    drops.append(float(result.amnesic_drop))
+                    
+                    # Embedding separability (silhouette, Davies-Bouldin)
+                    separability_before[col] = compute_embedding_separability(
+                        X_before_np, labels_np, sample_size=2000  # Smaller for laptop
+                    )
+                    separability_after[col] = compute_embedding_separability(
+                        X_after_np, labels_np, sample_size=2000
+                    )
+                    
+                    # Class imbalance metrics
+                    class_imbalance[col] = compute_class_imbalance_metrics(labels_np)
+                    
                 except ValueError as exc:
-                    # Laptop mode can hit one-class slices with tiny samples; bypass to allow Phase D testing.
+                    # Laptop mode can hit one-class slices with tiny samples
                     logger.warning(
                         "Probe skipped for column %s due to training error: %s",
                         col,
                         exc,
                     )
-                    acc_before, acc_after, amnesic_drop = 0.0, 0.0, 0.0
-                by_column[col] = {
-                    "accuracy_before": acc_before,
-                    "accuracy_after": acc_after,
-                    "amnesic_drop": amnesic_drop,
-                }
-                drops.append(float(amnesic_drop))
+                    by_column[col] = {
+                        "accuracy_before": 0.0,
+                        "accuracy_after": 0.0,
+                        "amnesic_drop": 0.0,
+                    }
+                    by_column_extended[col] = {"error": str(exc)}
+                    drops.append(0.0)
             
             min_drop = float(min(drops)) if drops else 0.0
+            mean_drop = float(np.mean(drops)) if drops else 0.0
+            
             metadata["probe"] = {
                 "by_column": by_column,
+                "by_column_extended": by_column_extended,
                 "min_amnesic_drop": min_drop,
+                "mean_amnesic_drop": mean_drop,
                 "threshold": float(self._cfg_get(config, "probe.amnesic_drop_threshold")),
                 "max_samples": len(embeddings_before),
+                "config": {
+                    "backend": probe_config.backend,
+                    "use_kfold": use_kfold,
+                    "n_folds": probe_config.n_folds,
+                },
             }
+            
+            # Add separability metrics
+            metadata["separability"] = {
+                "before": separability_before,
+                "after": separability_after,
+            }
+            
+            # Add class imbalance metrics
+            metadata["class_imbalance"] = class_imbalance
+            
+            logger.info(f"Probe metrics complete: min_drop={min_drop:.2%}, mean_drop={mean_drop:.2%}")
             
             if bool(self._cfg_get(config, "quality.enforce_thresholds")):
                 threshold = float(self._cfg_get(config, "probe.amnesic_drop_threshold"))

@@ -20,9 +20,14 @@ For development:
 pip install -e ".[dev]"
 ```
 
-For HPC features:
+For HPC features (cuml):
 ```bash
-pip install -e ".[hpc]"
+pip install ".[hpc]" --extra-index-url=https://pypi.nvidia.com
+```
+
+To install all (BEWARE cuml is Linux only)
+```bash
+pip install ".[all]" --extra-index-url=https://pypi.nvidia.com
 ```
 
 ## To begin
@@ -41,13 +46,6 @@ python scripts/convert_pandas_to_arrow.py
 ```bash
 # Create laptop arrow partition from unified table
 python scripts/create_laptop_dataset.py
-```
-
-4. Create finalized dataset for golden tests
-
-```bash
-# Run phase_A pipeline for golden fixtures
-python scrips/generate_golden_fixtures.py
 ```
 
 ## Documentation

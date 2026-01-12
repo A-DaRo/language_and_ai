@@ -194,13 +194,12 @@ encoder:
 leace:
   regularization: 1.0e-4
   force_cpu: false                 # GPU LEACE on HPC
-  batch_size: 10000                # Large LEACE batches
+  batch_size: 50000                # Large LEACE batches (used for shard control)
+  device: "cuda"                   # Explicit GPU device for LEACE accumulation
+  compute_dtype: "float64"         # float64 for numerical stability in Cholesky/SVD
 
 probe:
-  compute_amnesic_drop: true
-  max_samples: 10000
-  train_split: 0.8
-  amnesic_drop_threshold: 0.05
+  benchmark_solvers: true          # Benchmark HPC solver
 
 quality:
   enforce_thresholds: true

@@ -85,6 +85,10 @@ encoder:
   max_length: 512
   batch_size: 32
   device: "auto"  # "auto" | "cpu" | "cuda"
+  # output_device: Device to move embeddings to after extraction.
+  # null = keep on model device (recommended for HPC).
+  # "cpu" = move to CPU after extraction (recommended for laptop VRAM management).
+  output_device: null
 
 paths:
   raw_data: "${oc.env:SOBR_DATA_PATH,./datasets}"
@@ -158,11 +162,36 @@ probe:
   amnesic_drop_threshold: 0.30
   train_split: 0.8
   max_samples: 20000
+  # Backend selection: "auto" | "sklearn" | "cuml" | "torch"
+  # "auto" detects GPU and uses cuml > torch > sklearn
+  backend: "auto"
+  # K-fold cross-validation settings
+  use_kfold: true
+  n_folds: 5
+  # Statistical significance threshold for paired t-test
+  pvalue_threshold: 0.05
+  # Torch backend hyperparameters (used when backend="torch" or auto-selected)
+  torch_lr: 0.01
+  torch_epochs: 100
+  torch_batch_size: 256
+  torch_weight_decay: 0.0001
+  # Class imbalance handling
+  use_class_weights: true
+  # Benchmark exact vs approximate solvers (for validation)
+  benchmark_solvers: false
 
 leace:
   force_cpu: false
   regularization: 1e-5
   batch_size: 100
+  # device: Device for LEACE accumulation and computation.
+  # null = fallback to encoder.device.
+  # "cuda" = GPU LEACE (HPC), "cpu" = CPU LEACE (laptop/VRAM-limited).
+  device: null
+  # compute_dtype: Precision for LEACE matrix math.
+  # "float64" (default): Numerical stability for Cholesky/SVD.
+  # "float32": Faster on GPU but may have reduced precision.
+  compute_dtype: "float64"
 
 quality:
   enforce_thresholds: false
