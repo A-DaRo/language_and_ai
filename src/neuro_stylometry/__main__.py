@@ -346,6 +346,12 @@ def validate_handover(artifacts_dir: Path):
     help="Checkpoint cadence in epochs (optional)",
 )
 @click.option(
+    "--split-ratios",
+    default="0.8,0.1,0.1",
+    show_default=True,
+    help="Train/val/test ratios for author-stratified split when split column missing",
+)
+@click.option(
     "--use-affine-guard/--no-affine-guard",
     default=True,
     show_default=True,
@@ -369,6 +375,7 @@ def run_phase_d(
     learning_rate: float,
     save_every_steps: int | None,
     save_every_epochs: int | None,
+    split_ratios: str,
     use_affine_guard: bool,
     dry_run: bool,
 ):
@@ -376,6 +383,14 @@ def run_phase_d(
     from .training.trainer import PhaseDTrainConfig, PhaseDTrainer
 
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    ratio_parts = [p.strip() for p in split_ratios.split(",") if p.strip()]
+    if len(ratio_parts) != 3:
+        raise click.ClickException("--split-ratios must have three comma-separated values")
+    try:
+        train_ratio, val_ratio, test_ratio = (float(part) for part in ratio_parts)
+    except ValueError as exc:
+        raise click.ClickException("--split-ratios must be numeric values") from exc
 
     config = PhaseDTrainConfig(
         dataset_path=dataset,
@@ -390,6 +405,7 @@ def run_phase_d(
         learning_rate=learning_rate,
         save_every_steps=save_every_steps,
         save_every_epochs=save_every_epochs,
+        split_ratios={"train": train_ratio, "val": val_ratio, "test": test_ratio},
     )
 
     trainer = PhaseDTrainer(config)
@@ -411,12 +427,130 @@ def run_phase_d(
 
 
 @cli.command("verify")
-def verify():
-    """Causal Head Gating verification - Not yet implemented."""
-    raise click.ClickException(
-        "Verification (Causal Head Gating) is not yet implemented.\n"
-        "This command will compare dirty vs clean models after Phase D is complete."
+@click.option(
+    "--dataset",
+    type=click.Path(exists=True, path_type=Path),
+    required=True,
+    help="Phase D dataset path (clean_dataset.arrow)",
+)
+@click.option(
+    "--phase-d-dir",
+    type=click.Path(exists=True, path_type=Path),
+    default=Path("artifacts/phase_d"),
+    show_default=True,
+    help="Phase D artifacts directory with baseline/constrained runs",
+)
+@click.option(
+    "--artifacts-dir",
+    type=click.Path(exists=True, path_type=Path),
+    default=Path("artifacts/phase_a"),
+    show_default=True,
+    help="Phase A artifacts directory (projection matrix)",
+)
+@click.option(
+    "--output-dir",
+    type=click.Path(path_type=Path),
+    default=Path("artifacts/phase_d/chg"),
+    show_default=True,
+    help="Output directory for CHG + SVS artifacts",
+)
+@click.option(
+    "--model-name",
+    default="roberta-base",
+    show_default=True,
+    help="Base Hugging Face model name",
+)
+@click.option(
+    "--taxonomy-path",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=Path("conf/base/gliner_taxonomy.yaml"),
+    show_default=True,
+    help="GLiNER taxonomy path for mask-token alignment",
+)
+@click.option(
+    "--max-length",
+    default=512,
+    show_default=True,
+    help="Tokenizer max length for Phase D",
+)
+@click.option(
+    "--batch-size",
+    default=8,
+    show_default=True,
+    help="Batch size for verification",
+)
+@click.option(
+    "--chg-epochs",
+    default=5,
+    show_default=True,
+    help="CHG gate training epochs",
+)
+@click.option(
+    "--chg-lr",
+    default=1e-3,
+    show_default=True,
+    help="CHG gate learning rate",
+)
+@click.option(
+    "--chg-regularization",
+    default=0.01,
+    show_default=True,
+    help="CHG gate L1 regularization",
+)
+@click.option(
+    "--facilitating-threshold",
+    default=0.7,
+    show_default=True,
+    help="Gate threshold for facilitating heads",
+)
+@click.option(
+    "--irrelevant-threshold",
+    default=0.3,
+    show_default=True,
+    help="Gate threshold for irrelevant heads",
+)
+@click.option(
+    "--svs-max-batches",
+    default=5,
+    show_default=True,
+    help="Max batches for SVS calculation",
+)
+def verify(
+    dataset: Path,
+    phase_d_dir: Path,
+    artifacts_dir: Path,
+    output_dir: Path,
+    model_name: str,
+    taxonomy_path: Path,
+    max_length: int,
+    batch_size: int,
+    chg_epochs: int,
+    chg_lr: float,
+    chg_regularization: float,
+    facilitating_threshold: float,
+    irrelevant_threshold: float,
+    svs_max_batches: int,
+):
+    """Run CHG + SVS verification for baseline vs constrained models."""
+    from .stylometry_net.verification import run_verification
+
+    run_verification(
+        dataset_path=dataset,
+        artifacts_dir=artifacts_dir,
+        phase_d_dir=phase_d_dir,
+        output_dir=output_dir,
+        model_name=model_name,
+        taxonomy_path=taxonomy_path,
+        max_length=max_length,
+        batch_size=batch_size,
+        chg_epochs=chg_epochs,
+        chg_lr=chg_lr,
+        chg_regularization=chg_regularization,
+        facilitating_threshold=facilitating_threshold,
+        irrelevant_threshold=irrelevant_threshold,
+        svs_max_batches=svs_max_batches,
     )
+    click.echo(f"Verification complete. Outputs in: {output_dir}")
 
 
 @cli.command("hardware-info")

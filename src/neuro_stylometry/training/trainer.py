@@ -14,7 +14,12 @@ from tqdm import tqdm
 
 from ..data_engine.schemas import get_demographic_columns
 from ..stylometry_net.classification_head import MultiTaskHead
-from ..stylometry_net.phase_d_dataset import PhaseDCollator, PhaseDDataset, PhaseDLabelMaps
+from ..stylometry_net.phase_d_dataset import (
+    PhaseDCollator,
+    PhaseDDataset,
+    PhaseDLabelMaps,
+    load_label_maps,
+)
 from ..stylometry_net.transformer import AffineGuardTransformer
 from ..stylometry_net.tokenizer import PhaseDTokenizer
 from .checkpointing import config_to_metadata, save_checkpoint, save_metadata
@@ -35,6 +40,7 @@ class PhaseDTrainConfig:
     learning_rate: float = 2e-5
     save_every_steps: Optional[int] = None
     save_every_epochs: Optional[int] = None
+    split_ratios: Dict[str, float] = None
 
 
 class PhaseDTrainer:
@@ -49,12 +55,15 @@ class PhaseDTrainer:
         *,
         text_field: str,
         label_maps: Optional[PhaseDLabelMaps] = None,
+        split: Optional[str] = None,
     ) -> tuple[DataLoader, PhaseDLabelMaps]:
         dataset = PhaseDDataset(
             self.config.dataset_path,
             text_field=text_field,
             label_fields=get_demographic_columns(),
             label_maps=label_maps,
+            split=split,
+            split_ratios=self.config.split_ratios,
         )
         collator = PhaseDCollator(
             PhaseDTokenizer(
@@ -148,6 +157,7 @@ class PhaseDTrainer:
         model: AffineGuardTransformer,
         head: MultiTaskHead,
         loader: DataLoader,
+        eval_loader: Optional[DataLoader],
         run_dir: Path,
     ) -> None:
         optimizer = torch.optim.AdamW(
@@ -227,7 +237,7 @@ class PhaseDTrainer:
         metrics = self._evaluate(
             model=model,
             head=head,
-            loader=loader,
+            loader=eval_loader or loader,
             num_classes=self.label_maps.num_classes(),
         )
         save_metadata(metrics_path, metrics)
@@ -244,25 +254,43 @@ class PhaseDTrainer:
         )
 
     def train_baseline_and_constrained(self, *, use_affine_guard: bool = True) -> None:
-        baseline_loader, label_maps = self._build_loader(text_field="post")
+        label_maps = load_label_maps(self.config.dataset_path, get_demographic_columns())
         self.label_maps = label_maps
+        baseline_loader, _ = self._build_loader(
+            text_field="post",
+            label_maps=label_maps,
+            split="train",
+        )
+        baseline_eval_loader, _ = self._build_loader(
+            text_field="post",
+            label_maps=label_maps,
+            split="val",
+        )
         baseline_model, baseline_head = self._build_model(use_affine_guard=False)
 
         self._train(
             model=baseline_model,
             head=baseline_head,
             loader=baseline_loader,
+            eval_loader=baseline_eval_loader,
             run_dir=self.config.output_dir / "baseline",
         )
         if use_affine_guard:
             constrained_loader, _ = self._build_loader(
                 text_field="post_masked",
                 label_maps=label_maps,
+                split="train",
+            )
+            constrained_eval_loader, _ = self._build_loader(
+                text_field="post_masked",
+                label_maps=label_maps,
+                split="val",
             )
             constrained_model, constrained_head = self._build_model(use_affine_guard=True)
             self._train(
                 model=constrained_model,
                 head=constrained_head,
                 loader=constrained_loader,
+                eval_loader=constrained_eval_loader,
                 run_dir=self.config.output_dir / "constrained",
             )

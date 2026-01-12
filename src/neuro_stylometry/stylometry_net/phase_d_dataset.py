@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 
@@ -53,15 +54,26 @@ class PhaseDDataset(Dataset):
         label_fields: Optional[Iterable[str]] = None,
         split: Optional[str] = None,
         label_maps: Optional[PhaseDLabelMaps] = None,
+        split_seed: int = 42,
+        split_ratios: Optional[Dict[str, float]] = None,
     ) -> None:
         self.arrow_path = Path(arrow_path)
         self.text_field = text_field
         self.label_fields = list(label_fields or get_demographic_columns())
 
         table = feather.read_table(self.arrow_path, memory_map=True)
-        if split is not None and "split" in table.column_names:
-            mask = pc.equal(table["split"], split)
-            table = table.filter(mask)
+        if split is not None:
+            if "split" in table.column_names:
+                mask = pc.equal(table["split"], split)
+                table = table.filter(mask)
+            elif "author_id" in table.column_names:
+                ratios = split_ratios or {"train": 0.8, "val": 0.1, "test": 0.1}
+                table = _filter_by_author_split(
+                    table,
+                    split=split,
+                    seed=split_seed,
+                    ratios=ratios,
+                )
         self.table = table
 
         if self.text_field not in self.table.column_names:
@@ -72,10 +84,7 @@ class PhaseDDataset(Dataset):
                 raise ValueError(f"Missing label field '{field}' in dataset")
 
         if label_maps is None:
-            maps: Dict[str, Dict] = {}
-            for field in self.label_fields:
-                maps[field] = _build_label_map(self.table[field])
-            self.label_maps = PhaseDLabelMaps(maps=maps)
+            self.label_maps = load_label_maps(self.table, self.label_fields)
         else:
             self.label_maps = label_maps
 
@@ -127,3 +136,49 @@ class PhaseDCollator:
             "labels": labels,
             "post_id": [sample.get("post_id") for sample in batch],
         }
+
+
+def load_label_maps(
+    table_or_path: pa.Table | str | Path,
+    label_fields: Iterable[str],
+) -> PhaseDLabelMaps:
+    if isinstance(table_or_path, pa.Table):
+        table = table_or_path
+    else:
+        table = feather.read_table(Path(table_or_path), memory_map=True)
+    maps: Dict[str, Dict] = {}
+    for field in label_fields:
+        maps[field] = _build_label_map(table[field])
+    return PhaseDLabelMaps(maps=maps)
+
+
+def _author_bucket(author_id: str, seed: int) -> int:
+    payload = f"{seed}:{author_id}".encode("utf-8")
+    digest = hashlib.md5(payload).hexdigest()
+    return int(digest, 16) % 100
+
+
+def _filter_by_author_split(
+    table: pa.Table,
+    *,
+    split: str,
+    seed: int,
+    ratios: Dict[str, float],
+) -> pa.Table:
+    if split not in ratios:
+        raise ValueError(f"Unknown split '{split}' for ratios {ratios}")
+
+    train_cut = int(ratios.get("train", 0.8) * 100)
+    val_cut = train_cut + int(ratios.get("val", 0.1) * 100)
+
+    author_ids = table["author_id"].to_pylist()
+    buckets = [_author_bucket(str(author_id), seed) for author_id in author_ids]
+
+    if split == "train":
+        mask = [bucket < train_cut for bucket in buckets]
+    elif split == "val":
+        mask = [train_cut <= bucket < val_cut for bucket in buckets]
+    else:
+        mask = [bucket >= val_cut for bucket in buckets]
+
+    return table.filter(pa.array(mask))
