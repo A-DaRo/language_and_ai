@@ -89,6 +89,24 @@ class BatchInferenceConfig:
     enable_prompt_caching: bool = True
 
 
+@dataclass
+class InferenceResult:
+    """
+    Result from inference_from_manifest with completeness tracking.
+    
+    Attributes:
+        entities: List of entity lists per document (nested, document-order).
+        skipped_doc_indices: Set of document indices that were skipped due to OOM.
+            Empty if all documents were processed successfully.
+        oom_count: Number of OOM events encountered during inference.
+        final_budget: Final token budget after all adjustments.
+    """
+    entities: List[List[Dict[str, Any]]]
+    skipped_doc_indices: Set[int] = field(default_factory=set)
+    oom_count: int = 0
+    final_budget: int = 0
+
+
 def auto_compute_bucket_count(vram_gb: Optional[float] = None) -> int:
     """
     Auto-compute optimal bucket count based on available VRAM.
@@ -1667,7 +1685,7 @@ class GLiNERDetector:
         pin_memory: bool = False,
         show_progress: bool = True,
         runtime_controller: Optional["RuntimeController"] = None,
-    ) -> List[List[Dict[str, Any]]]:
+    ) -> InferenceResult:
         """
         Run inference from pre-computed chunks (Stage 2 of staged execution).
         
@@ -1692,7 +1710,11 @@ class GLiNERDetector:
                 and OOM protection. If None, uses fixed batch_size batching.
             
         Returns:
-            List of entity lists per document (nested, document-order).
+            InferenceResult containing:
+            - entities: List of entity lists per document (nested, document-order).
+            - skipped_doc_indices: Set of doc indices skipped due to OOM failures.
+            - oom_count: Number of OOM events during inference.
+            - final_budget: Final token budget after adjustments.
         """
         import pyarrow as pa
         from .global_sort import flatten_chunks, gather_results, create_sorted_batches, DynamicBatchIterator
@@ -1757,6 +1779,9 @@ class GLiNERDetector:
         # Pre-allocate results in sorted order
         flat_results_sorted: List[List[Dict[str, Any]]] = [[] for _ in range(flattened.num_chunks)]
         
+        # Track which chunks were skipped due to unrecoverable OOM
+        skipped_chunk_indices: Set[int] = set()
+        
         pbar = None
         if show_progress:
             pbar = tqdm(
@@ -1793,10 +1818,11 @@ class GLiNERDetector:
                             )
                         except OOMRecoveryError:
                             logger.error(
-                                f"OOM recovery failed for batch of {len(batch_indices)} chunks; skipping"
+                                f"OOM recovery failed for batch of {len(batch_indices)} chunks; marking as skipped"
                             )
-                            # Store empty results for this batch
+                            # Track skipped chunks for retry
                             for flat_idx in batch_indices:
+                                skipped_chunk_indices.add(flat_idx)
                                 flat_results_sorted[flat_idx] = []
                             if pbar is not None:
                                 pbar.update(len(batch_indices))
@@ -1835,12 +1861,18 @@ class GLiNERDetector:
                 pbar.close()
         
         # Log autotuning summary if used
+        oom_count = 0
+        final_budget = batch_size or self.batch_config.batch_size
         if use_autotuning:
             snapshot = runtime_controller.get_snapshot()
+            oom_count = snapshot.oom_count
+            final_budget = snapshot.current_budget
             logger.info(
                 f"Autotuning summary: state={snapshot.state}, "
                 f"final_budget={snapshot.current_budget:,}, "
-                f"oom_count={snapshot.oom_count}"
+                f"oom_count={snapshot.oom_count}, "
+                f"oom_ceiling={snapshot.oom_ceiling:,}, "
+                f"skipped_chunks={len(skipped_chunk_indices)}"
             )
         
         # Step 5: Gather results back to document order
@@ -1884,7 +1916,29 @@ class GLiNERDetector:
             deduped = deduplicate_entities(projected_entities)
             all_results.append(deduped)
         
-        return all_results
+        # Compute skipped document indices from skipped chunk indices
+        skipped_doc_indices: Set[int] = set()
+        for flat_idx in skipped_chunk_indices:
+            # Find which document this chunk belongs to
+            for doc_idx in range(flattened.num_docs):
+                doc_start = flattened.doc_offsets[doc_idx]
+                doc_end = flattened.doc_offsets[doc_idx + 1]
+                if doc_start <= flat_idx < doc_end:
+                    skipped_doc_indices.add(doc_idx)
+                    break
+        
+        if skipped_doc_indices:
+            logger.warning(
+                f"Inference incomplete: {len(skipped_doc_indices)} documents had chunks "
+                f"skipped due to OOM ({len(skipped_chunk_indices)} total chunks)"
+            )
+        
+        return InferenceResult(
+            entities=all_results,
+            skipped_doc_indices=skipped_doc_indices,
+            oom_count=oom_count,
+            final_budget=final_budget,
+        )
 
     def get_cached_label_embeddings(
         self,

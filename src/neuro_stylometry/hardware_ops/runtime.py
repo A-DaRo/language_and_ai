@@ -127,6 +127,9 @@ class RuntimeSnapshot:
     throughput_variance: float
     memory_pressure: float
     batches_processed: int
+    oom_count: int = 0
+    oom_ceiling: int = 0
+    successful_budget: int = 0
 
 
 class RuntimeController:
@@ -171,6 +174,12 @@ class RuntimeController:
         self._batches_since_oom = 0
         self._pre_oom_budget = config.initial_token_budget
         
+        # OOM ceiling: caps budget scaling to prevent repeated OOM cycles
+        # Starts at max_token_budget and is lowered each time OOM occurs
+        self._oom_ceiling = config.max_token_budget
+        # Track highest budget that completed successfully (no OOM)
+        self._successful_budget = config.initial_token_budget
+        
         # GPU memory info (cached)
         self._total_memory_mb: Optional[float] = None
         self._detect_gpu_memory()
@@ -214,6 +223,21 @@ class RuntimeController:
         """Number of batches processed."""
         return self._batches_processed
     
+    @property
+    def oom_ceiling(self) -> int:
+        """Current OOM ceiling - maximum allowed budget to prevent OOM cycles."""
+        return self._oom_ceiling
+    
+    @property
+    def successful_budget(self) -> int:
+        """Highest budget that completed without OOM."""
+        return self._successful_budget
+    
+    @property
+    def oom_count(self) -> int:
+        """Total number of OOM events encountered."""
+        return self._oom_count
+    
     def get_next_budget(self) -> int:
         """
         Get the token budget for the next batch.
@@ -239,6 +263,10 @@ class RuntimeController:
         self._batches_processed += 1
         self._batches_since_oom += 1
         
+        # Track successful budget (batch completed without OOM)
+        if self._current_budget > self._successful_budget:
+            self._successful_budget = self._current_budget
+        
         # Record history
         throughput = metrics.throughput_tokens_per_sec
         self._throughput_history.append(throughput)
@@ -260,12 +288,17 @@ class RuntimeController:
     
     def handle_oom(self) -> int:
         """
-        Handle an OOM event by aggressively reducing budget.
+        Handle an OOM event by aggressively reducing budget and lowering ceiling.
         
         Call this when a CUDA OOM error is caught. The controller will:
-        1. Slash the budget by oom_slash_factor.
-        2. Transition to RECOVERY state.
-        3. Clear CUDA cache.
+        1. Lower the OOM ceiling to prevent future scaling beyond safe levels.
+        2. Slash the budget by oom_slash_factor.
+        3. Transition to RECOVERY state.
+        4. Clear CUDA cache.
+        
+        The ceiling mechanism prevents repeated OOM cycles: once OOM occurs at
+        budget B, the ceiling is set to 0.9*B (slightly below to allow near-max
+        performance). Future budget adjustments cannot exceed this ceiling.
         
         Returns:
             New (reduced) token budget.
@@ -274,13 +307,20 @@ class RuntimeController:
         self._pre_oom_budget = self._current_budget
         self._batches_since_oom = 0
         
+        # Lower the OOM ceiling: set to 90% of the budget that caused OOM
+        # This prevents future scaling from reaching the problematic level
+        new_ceiling = int(self._current_budget * 0.9)
+        new_ceiling = max(new_ceiling, self.config.min_token_budget)
+        self._oom_ceiling = min(self._oom_ceiling, new_ceiling)
+        
         # Aggressive budget slash
         new_budget = int(self._current_budget * self.config.oom_slash_factor)
         new_budget = max(new_budget, self.config.min_token_budget)
         
         logger.warning(
             f"OOM detected (count={self._oom_count}): "
-            f"slashing budget {self._current_budget} -> {new_budget}"
+            f"slashing budget {self._current_budget} -> {new_budget}, "
+            f"ceiling lowered to {self._oom_ceiling}"
         )
         
         self._current_budget = new_budget
@@ -356,16 +396,19 @@ class RuntimeController:
             return
         
         elif self._state == RuntimeState.RECOVERY:
-            # Very cautious scaling in recovery
+            # Very cautious scaling in recovery, respecting OOM ceiling
             if self._batches_since_oom > 2:
                 # Small increase after a few successful batches
                 new_budget = int(self._current_budget * 1.05)
-                self._current_budget = min(new_budget, self._pre_oom_budget)
+                # Cap at 80% of ceiling during recovery for safety margin
+                recovery_cap = int(self._oom_ceiling * 0.8)
+                self._current_budget = min(new_budget, recovery_cap, self._pre_oom_budget)
         
         elif self._state == RuntimeState.SCALING_UP:
-            # Aggressive scaling
+            # Aggressive scaling, but respect OOM ceiling
             new_budget = int(self._current_budget * self.config.scale_up_factor)
-            self._current_budget = min(new_budget, self.config.max_token_budget)
+            # Never exceed OOM ceiling (prevents repeated OOM cycles)
+            self._current_budget = min(new_budget, self.config.max_token_budget, self._oom_ceiling)
         
         elif self._state == RuntimeState.THROTTLING:
             # Scale down
@@ -447,6 +490,9 @@ class RuntimeController:
             memory_pressure=self._memory_history[-1] / self._total_memory_mb
                            if self._memory_history and self._total_memory_mb else 0.0,
             batches_processed=self._batches_processed,
+            oom_count=self._oom_count,
+            oom_ceiling=self._oom_ceiling,
+            successful_budget=self._successful_budget,
         )
     
     def reset(self) -> None:
@@ -459,6 +505,8 @@ class RuntimeController:
         self._budget_history.clear()
         self._oom_count = 0
         self._batches_since_oom = 0
+        self._oom_ceiling = self.config.max_token_budget
+        self._successful_budget = self.config.initial_token_budget
         logger.info("RuntimeController reset to initial state")
 
 

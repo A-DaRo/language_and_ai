@@ -22,7 +22,7 @@ import gc
 import logging
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 import numpy as np
 import pyarrow as pa
@@ -31,7 +31,7 @@ import torch
 from tqdm import tqdm
 
 from .base import PollutionFilterStrategy
-from ..gliner_detector import GLiNERDetector, BatchInferenceConfig
+from ..gliner_detector import GLiNERDetector, BatchInferenceConfig, InferenceResult
 from ..masker import SpanMasker
 from ..semantic_chunker import BudgetConfig
 from ..explicit_recall import compute_explicit_recall
@@ -388,7 +388,7 @@ class HPCFilterStrategy(PollutionFilterStrategy):
             f"warmup_batches={runtime_controller.config.warmup_batches}"
         )
         
-        entities_batch = gliner.inference_from_manifest(
+        inference_result = gliner.inference_from_manifest(
             post_chunked_column=post_chunked_column,
             labels=inference_labels,
             batch_size=gliner_batch_size,
@@ -397,6 +397,114 @@ class HPCFilterStrategy(PollutionFilterStrategy):
             show_progress=True,
             runtime_controller=runtime_controller,  # Enable autotuning
         )
+        
+        entities_batch = inference_result.entities
+        
+        # =======================================================================
+        # Step 3b: Completeness Guard - Retry skipped documents
+        # =======================================================================
+        max_retry_rounds = int(self._cfg_get_optional(config, "execution.autotuning.max_retry_rounds", 3))
+        retry_round = 0
+        all_skipped_docs: Set[int] = set(inference_result.skipped_doc_indices)
+        
+        while inference_result.skipped_doc_indices and retry_round < max_retry_rounds:
+            retry_round += 1
+            skipped_count = len(inference_result.skipped_doc_indices)
+            logger.warning(
+                f"Completeness guard: {skipped_count} documents skipped due to OOM. "
+                f"Starting retry round {retry_round}/{max_retry_rounds}"
+            )
+            
+            # Create a conservative recovery controller at 80% of current ceiling
+            oom_ceiling = runtime_controller.oom_ceiling
+            recovery_budget = int(oom_ceiling * 0.8)
+            recovery_budget = max(recovery_budget, runtime_controller.config.min_token_budget)
+            
+            recovery_config = RuntimeConfig(
+                warmup_batches=2,  # Quick warmup
+                initial_token_budget=recovery_budget,
+                min_token_budget=runtime_controller.config.min_token_budget,
+                max_token_budget=recovery_budget,  # Cap at recovery budget
+                memory_headroom_mb=runtime_controller.config.memory_headroom_mb * 1.5,  # Extra headroom
+                scale_up_factor=1.05,  # Very conservative scaling
+                scale_down_factor=0.7,
+                oom_slash_factor=0.4,  # More aggressive slash on retry
+                stability_threshold=0.2,
+                history_window=5,
+                recovery_patience=2,
+            )
+            recovery_controller = RuntimeController(recovery_config)
+            
+            logger.info(
+                f"Retry controller: recovery_budget={recovery_budget:,} "
+                f"(80% of ceiling={oom_ceiling:,})"
+            )
+            
+            # Build subset table for skipped documents only
+            skipped_indices = sorted(inference_result.skipped_doc_indices)
+            
+            # Extract post_chunked for skipped docs
+            from ..global_sort import flatten_chunks
+            
+            # Re-run inference only on skipped documents
+            retry_result = gliner.inference_from_manifest(
+                post_chunked_column=post_chunked_column.take(pa.array(skipped_indices)),
+                labels=inference_labels,
+                batch_size=max(1, gliner_batch_size // 4),  # Smaller batches
+                cached_label_embeddings=cached_label_embeddings,
+                pin_memory=False,  # Disable pin_memory during recovery
+                show_progress=True,
+                runtime_controller=recovery_controller,
+            )
+            
+            # Merge retry results back into entities_batch
+            for local_idx, doc_idx in enumerate(skipped_indices):
+                if local_idx not in retry_result.skipped_doc_indices:
+                    # Successfully processed this document
+                    entities_batch[doc_idx] = retry_result.entities[local_idx]
+            
+            # Update skipped set: only docs that still failed
+            new_skipped = {
+                skipped_indices[local_idx]
+                for local_idx in retry_result.skipped_doc_indices
+            }
+            
+            # Update for next iteration
+            inference_result = InferenceResult(
+                entities=entities_batch,
+                skipped_doc_indices=new_skipped,
+                oom_count=inference_result.oom_count + retry_result.oom_count,
+                final_budget=retry_result.final_budget,
+            )
+            
+            # Force GC between retries
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            
+            if not new_skipped:
+                logger.info(f"All documents processed after {retry_round} retry round(s)")
+                break
+        
+        # Final completeness check
+        final_skipped = inference_result.skipped_doc_indices
+        if final_skipped:
+            logger.error(
+                f"INCOMPLETE INFERENCE: {len(final_skipped)} documents could not be processed "
+                f"after {max_retry_rounds} retry rounds. Proceeding with partial results."
+            )
+            # Save manifest of skipped documents for manual inspection
+            skipped_manifest = {
+                "skipped_doc_indices": sorted(final_skipped),
+                "skipped_post_ids": [post_ids[i] for i in sorted(final_skipped)],
+                "total_oom_count": inference_result.oom_count,
+                "final_budget": inference_result.final_budget,
+            }
+            skipped_manifest_path = output_dataset_path.parent / "skipped_documents_manifest.json"
+            import json
+            with open(skipped_manifest_path, "w") as f:
+                json.dump(skipped_manifest, f, indent=2)
+            logger.warning(f"Saved skipped documents manifest: {skipped_manifest_path}")
         
         logger.info("Stage 2 complete: inference finished")
         
@@ -524,6 +632,14 @@ class HPCFilterStrategy(PollutionFilterStrategy):
             "use_bf16": self.use_bf16,
             "staged_execution": True,
             "stage1_skipped": stage1_skipped,
+            "inference_completeness": {
+                "total_docs": len(posts),
+                "processed_docs": len(posts) - len(final_skipped),
+                "skipped_docs": len(final_skipped),
+                "oom_count": inference_result.oom_count,
+                "final_budget": inference_result.final_budget,
+                "retry_rounds": retry_round,
+            },
         }
         
         # Explicit recall
