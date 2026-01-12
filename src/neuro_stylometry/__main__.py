@@ -334,6 +334,18 @@ def validate_handover(artifacts_dir: Path):
     help="AdamW learning rate",
 )
 @click.option(
+    "--save-every-steps",
+    type=int,
+    default=None,
+    help="Checkpoint cadence in steps (optional)",
+)
+@click.option(
+    "--save-every-epochs",
+    type=int,
+    default=None,
+    help="Checkpoint cadence in epochs (optional)",
+)
+@click.option(
     "--use-affine-guard/--no-affine-guard",
     default=True,
     show_default=True,
@@ -355,6 +367,8 @@ def run_phase_d(
     num_epochs: int,
     max_steps: int | None,
     learning_rate: float,
+    save_every_steps: int | None,
+    save_every_epochs: int | None,
     use_affine_guard: bool,
     dry_run: bool,
 ):
@@ -374,6 +388,8 @@ def run_phase_d(
         num_epochs=num_epochs,
         max_steps=max_steps,
         learning_rate=learning_rate,
+        save_every_steps=save_every_steps,
+        save_every_epochs=save_every_epochs,
     )
 
     trainer = PhaseDTrainer(config)

@@ -3,17 +3,22 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
+import json
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, Any
 
 import torch
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 from ..data_engine.schemas import get_demographic_columns
 from ..stylometry_net.classification_head import MultiTaskHead
 from ..stylometry_net.phase_d_dataset import PhaseDCollator, PhaseDDataset, PhaseDLabelMaps
 from ..stylometry_net.transformer import AffineGuardTransformer
 from ..stylometry_net.tokenizer import PhaseDTokenizer
+from .checkpointing import config_to_metadata, save_checkpoint, save_metadata
+from .metrics import compute_task_metrics
 
 
 @dataclass
@@ -28,6 +33,8 @@ class PhaseDTrainConfig:
     num_epochs: int = 1
     max_steps: Optional[int] = None
     learning_rate: float = 2e-5
+    save_every_steps: Optional[int] = None
+    save_every_epochs: Optional[int] = None
 
 
 class PhaseDTrainer:
@@ -87,6 +94,54 @@ class PhaseDTrainer:
         ).to(self.device)
         return model, head
 
+    def _log_jsonl(self, path: Path, payload: Dict[str, Any]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload) + "\n")
+
+    @torch.no_grad()
+    def _evaluate(
+        self,
+        *,
+        model: AffineGuardTransformer,
+        head: MultiTaskHead,
+        loader: DataLoader,
+        num_classes: Dict[str, int],
+    ) -> Dict[str, Dict[str, float]]:
+        model.eval()
+        head.eval()
+        metrics: Dict[str, Dict[str, float]] = {}
+
+        task_logits: Dict[str, list[torch.Tensor]] = {k: [] for k in num_classes}
+        task_labels: Dict[str, list[torch.Tensor]] = {k: [] for k in num_classes}
+
+        for batch in loader:
+            input_ids = batch["input_ids"].to(self.device)
+            attention_mask = batch["attention_mask"].to(self.device)
+            labels = {k: v.to(self.device) for k, v in batch["labels"].items()}
+
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+            logits = head(outputs["cls_embedding"])
+
+            for task, task_logits_batch in logits.items():
+                task_logits[task].append(task_logits_batch.detach().cpu())
+                task_labels[task].append(labels[task].detach().cpu())
+
+        for task in num_classes:
+            if not task_logits[task]:
+                continue
+            logits_cat = torch.cat(task_logits[task], dim=0)
+            labels_cat = torch.cat(task_labels[task], dim=0)
+            metrics[task] = compute_task_metrics(
+                logits_cat,
+                labels_cat,
+                num_classes=num_classes[task],
+            )
+
+        model.train()
+        head.train()
+        return metrics
+
     def _train(
         self,
         *,
@@ -101,12 +156,18 @@ class PhaseDTrainer:
         )
 
         run_dir.mkdir(parents=True, exist_ok=True)
+        checkpoint_dir = run_dir / "checkpoints"
+        log_path = run_dir / "training_log.jsonl"
+        metrics_path = run_dir / "phase_d_metrics.json"
+        checkpoint_path = run_dir / "checkpoint.pt"
         model.train()
         head.train()
 
         step = 0
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
         for epoch in range(self.config.num_epochs):
-            for batch in loader:
+            progress = tqdm(loader, desc=f"Epoch {epoch + 1}", leave=False)
+            for batch in progress:
                 input_ids = batch["input_ids"].to(self.device)
                 attention_mask = batch["attention_mask"].to(self.device)
                 labels = {k: v.to(self.device) for k, v in batch["labels"].items()}
@@ -122,14 +183,65 @@ class PhaseDTrainer:
                 loss.backward()
                 optimizer.step()
 
+                step_metrics = {
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "epoch": epoch + 1,
+                    "step": step,
+                    "loss": float(loss.item()),
+                }
+                self._log_jsonl(log_path, step_metrics)
+                progress.set_postfix({"loss": f"{loss.item():.4f}"})
+
                 step += 1
+                if self.config.save_every_steps and step % self.config.save_every_steps == 0:
+                    save_checkpoint(
+                        checkpoint_dir / f"checkpoint_step_{step}.pt",
+                        model_state=model.state_dict(),
+                        head_state=head.state_dict(),
+                        optimizer_state=optimizer.state_dict(),
+                        metadata={
+                            "config": config_to_metadata(self.config),
+                            "label_maps": self.label_maps.maps,
+                            "checkpoint": {"epoch": epoch + 1, "step": step},
+                        },
+                    )
                 if self.config.max_steps and step >= self.config.max_steps:
                     break
+            if self.config.save_every_epochs and (epoch + 1) % self.config.save_every_epochs == 0:
+                save_checkpoint(
+                    checkpoint_dir / f"checkpoint_epoch_{epoch + 1}.pt",
+                    model_state=model.state_dict(),
+                    head_state=head.state_dict(),
+                    optimizer_state=optimizer.state_dict(),
+                    metadata={
+                        "config": config_to_metadata(self.config),
+                        "label_maps": self.label_maps.maps,
+                        "checkpoint": {"epoch": epoch + 1, "step": step},
+                    },
+                )
             if self.config.max_steps and step >= self.config.max_steps:
                 break
 
         torch.save(model.state_dict(), run_dir / "model.pt")
         torch.save(head.state_dict(), run_dir / "head.pt")
+        metrics = self._evaluate(
+            model=model,
+            head=head,
+            loader=loader,
+            num_classes=self.label_maps.num_classes(),
+        )
+        save_metadata(metrics_path, metrics)
+        save_checkpoint(
+            checkpoint_path,
+            model_state=model.state_dict(),
+            head_state=head.state_dict(),
+            optimizer_state=optimizer.state_dict(),
+            metadata={
+                "config": config_to_metadata(self.config),
+                "label_maps": self.label_maps.maps,
+                "metrics": metrics,
+            },
+        )
 
     def train_baseline_and_constrained(self, *, use_affine_guard: bool = True) -> None:
         baseline_loader, label_maps = self._build_loader(text_field="post")
