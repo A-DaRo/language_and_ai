@@ -31,7 +31,7 @@ execution:
     warmup_batches: 5              # Reduced warmup to get to peak speed faster
     initial_token_budget: 65536    # Aggressive start for 5090
     min_token_budget: 4096
-    max_token_budget: 262144       # Tuned for ~24-32GB VRAM usage (Safety cap)
+    max_token_budget: 393216       # Tuned for ~24-32GB VRAM usage (Safety cap)
     memory_headroom_mb: 4096       # Larger headroom for 5090 burst allocations
     scale_up_factor: 1.25          # 25% increase when scaling up
     scale_down_factor: 0.85        # 15% decrease when throttling
@@ -50,7 +50,7 @@ execution:
   # Note: CUDA graphs work best with torch.compile. The GraphAwareInference
   # infrastructure handles shape bucketing and padding automatically.
   # ---------------------------------------------------------------------------
-  enable_cuda_graphs: true
+  enable_cuda_graphs: false
   cuda_graph_warmup: 3             # Warmup iterations before graph capture
   cuda_graph_cache_size: 128        # Max cached graphs (LRU eviction)
   
@@ -77,7 +77,7 @@ execution:
   # WARNING: max-autotune causes massive slowdown during first run due to
   # kernel autotuning. Use reduce-overhead for production.
   # ---------------------------------------------------------------------------
-  enable_torch_compile: true      
+  enable_torch_compile: false      
   torch_compile_mode: "reduce-overhead"
   torch_compile_fullgraph: false
   torch_compile_dynamic: false      # DISABLED to force static kernels (faster execution)
@@ -117,7 +117,7 @@ execution:
 
   # GPU span filtering
   gpu_span_filter:
-    enabled: true
+    enabled: false
     max_spans_per_sequence: 512
     use_topk: false
     topk_k: 256
@@ -157,7 +157,7 @@ gliner:
     num_buckets: 16                # More buckets for finer length grouping
     min_bucket_size: 32            # Larger min size for GPU efficiency
     enable_prompt_caching: true
-    strict_padding: true           # Enforce exact padding within buckets for CUDA graph hit rate
+    strict_padding: false           # Enforce exact padding within buckets for CUDA graph hit rate
     # Sequence length buckets aligned to CUDA graph shape buckets (must match cuda_graphs.seq_len_buckets)
     seq_len_buckets: [64, 128, 192, 256, 320, 384, 448, 512]
 
