@@ -193,6 +193,7 @@ class PathsConfig:
     """File path configuration."""
     raw_data: str = "./datasets"
     output: str = "./artifacts"
+    phase_a: Dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -208,6 +209,13 @@ class DataLoaderConfig:
 @dataclass
 class ExecutionConfig:
     """Advanced execution optimization configuration."""
+    staged_execution: Dict[str, Any] = field(default_factory=dict)
+    autotuning: Dict[str, Any] = field(default_factory=dict)
+    cuda_graphs: Dict[str, Any] = field(default_factory=dict)
+    async_storage: Dict[str, Any] = field(default_factory=dict)
+    async_prefetch: Dict[str, Any] = field(default_factory=dict)
+    gpu_span_filter: Dict[str, Any] = field(default_factory=dict)
+    memory: Dict[str, Any] = field(default_factory=dict)
     enable_cuda_graphs: bool = False
     cuda_graph_warmup: int = 3
     cuda_graph_cache_size: int = 16
@@ -244,6 +252,8 @@ class LoggingConfig:
     """Logging configuration."""
     level: str = "INFO"
     wandb_enabled: bool = False
+    log_gpu_memory: bool = False
+    log_batch_timing: bool = False
 
 
 # ==============================================================================
