@@ -150,6 +150,19 @@ class LaptopFilterStrategy(PollutionFilterStrategy):
             return spec
         raise ValueError(f"Unsupported device spec '{device_spec}'")
     
+    def _cleanup_memory(self) -> None:
+        """
+        Force garbage collection and clear CUDA cache.
+        
+        Should be called after each stage to ensure memory is freed
+        before the next stage begins. Critical for laptop mode with limited RAM.
+        """
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+        logger.debug("Memory cleanup completed")
+    
     def _create_runtime_controller(self, config: Dict[str, Any]) -> RuntimeController:
         """
         Create RuntimeController from config for autotuning.
@@ -316,9 +329,7 @@ class LaptopFilterStrategy(PollutionFilterStrategy):
             raise RuntimeError("Stage 1 finished but post_chunked still contains NULLs")
         
         # Cleanup between stages (critical for low RAM)
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        self._cleanup_memory()
         
         return ChunkingContext(
             table_with_chunks=table_with_chunks,
@@ -472,9 +483,7 @@ class LaptopFilterStrategy(PollutionFilterStrategy):
                 final_budget=retry_result.final_budget,
             )
             
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            self._cleanup_memory()
             
             if not new_skipped:
                 logger.info(f"All documents processed after {retry_round} retry round(s)")
@@ -504,6 +513,9 @@ class LaptopFilterStrategy(PollutionFilterStrategy):
         )
         
         logger.info("Stage 2 complete: inference finished")
+        
+        # Cleanup after inference stage
+        self._cleanup_memory()
         
         return InferenceContext(
             entities_batch=entities_batch,
@@ -737,7 +749,7 @@ class LaptopFilterStrategy(PollutionFilterStrategy):
         finally:
             embed_pbar.close()
         
-        gc.collect()
+        self._cleanup_memory()
         
         if concept_stats is None:
             raise RuntimeError("LEACE accumulation failed: no concept statistics computed")
@@ -753,6 +765,9 @@ class LaptopFilterStrategy(PollutionFilterStrategy):
         self._save_pollution_logs(pollution_logs, pollution_logs_path)
         
         logger.info("Stage 3 complete: LEACE projection computed")
+        
+        # Cleanup after LEACE stage
+        self._cleanup_memory()
         
         return LEACEContext(
             projection_matrix=projection_matrix,
@@ -938,6 +953,9 @@ class LaptopFilterStrategy(PollutionFilterStrategy):
         logger.info(f"Saved probe results: {probe_results_path}")
         
         logger.info("Stage 4 complete: probing finished")
+        
+        # Cleanup after probing stage
+        self._cleanup_memory()
         
         return ProbingContext(
             by_column=by_column,

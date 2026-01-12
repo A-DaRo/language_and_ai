@@ -155,6 +155,19 @@ class HPCFilterStrategy(PollutionFilterStrategy):
             return spec
         raise ValueError(f"Unsupported device spec '{device_spec}'")
     
+    def _cleanup_memory(self) -> None:
+        """
+        Force garbage collection and clear CUDA cache.
+        
+        Should be called after each stage to ensure memory is freed
+        before the next stage begins. Synchronizes CUDA for accurate timing.
+        """
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+        logger.debug("Memory cleanup completed")
+    
     def _create_runtime_controller(self, config: Dict[str, Any]) -> RuntimeController:
         """
         Create RuntimeController from config for autotuning.
@@ -345,9 +358,7 @@ class HPCFilterStrategy(PollutionFilterStrategy):
             raise RuntimeError("Stage 1 finished but post_chunked still contains NULLs")
         
         # Cleanup between stages
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        self._cleanup_memory()
         
         return ChunkingContext(
             table_with_chunks=table_with_chunks,
@@ -572,6 +583,9 @@ class HPCFilterStrategy(PollutionFilterStrategy):
         
         logger.info(f"Stage 2 complete: {flattened.num_docs} documents reconstructed")
         
+        # Cleanup after inference stage
+        self._cleanup_memory()
+        
         return InferenceContext(
             entities_batch=entities_batch,
             skipped_doc_indices=skipped_doc_indices,
@@ -720,6 +734,9 @@ class HPCFilterStrategy(PollutionFilterStrategy):
         self._save_pollution_logs(pollution_logs, pollution_logs_path)
         
         logger.info("Stage 3 complete")
+        
+        # Cleanup after LEACE stage
+        self._cleanup_memory()
         
         return LEACEContext(
             projection_matrix=projection_matrix,
@@ -886,6 +903,9 @@ class HPCFilterStrategy(PollutionFilterStrategy):
             )
         
         logger.info("Stage 4 complete")
+        
+        # Cleanup after probing stage
+        self._cleanup_memory()
         
         return ProbingContext(
             by_column=by_column,

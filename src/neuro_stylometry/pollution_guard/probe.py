@@ -20,6 +20,7 @@ Implements: phaseA-D_implementation_plan.md Section 9.2
 
 from __future__ import annotations
 
+import gc
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -43,6 +44,21 @@ class ProbeBackend(Enum):
     SKLEARN = "sklearn"
     CUML = "cuml"
     TORCH = "torch"
+
+
+def _cleanup_gpu_memory() -> None:
+    """
+    Force garbage collection and clear CUDA cache.
+    
+    Should be called after GPU-intensive probe operations to free VRAM
+    before the next probe training begins. This prevents memory accumulation
+    when probing multiple demographic columns sequentially.
+    """
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+    logger.debug("Probe GPU memory cleanup completed")
 
 
 @dataclass
@@ -928,6 +944,9 @@ def compute_amnesic_drop_extended(
     else:
         logger.warning(f"⚠ Amnesic drop {amnesic_drop:.2%} < 30% (target not met)")
     
+    # Cleanup GPU memory to prevent VRAM saturation across demographic columns
+    _cleanup_gpu_memory()
+    
     return AmnesicDropResult(
         acc_before=acc_before,
         acc_after=acc_after,
@@ -1031,5 +1050,8 @@ def benchmark_solver_convergence(
             f"Solver accuracy delta {results['solver_accuracy_delta']:.2%} > 1%: "
             "torch probe may not have converged properly"
         )
+    
+    # Cleanup GPU memory after benchmarking
+    _cleanup_gpu_memory()
     
     return results
