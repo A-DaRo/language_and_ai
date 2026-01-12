@@ -103,16 +103,20 @@ class SkipStagesConfig:
     skip_inference: bool = False
     skip_leace: bool = False
     skip_probing: bool = False
+    # When True, missing prerequisites will be bypassed with warnings instead of errors
+    force_skip: bool = False
     
     @classmethod
     def from_config(cls, config: Dict[str, Any]) -> "SkipStagesConfig":
-        """Create from execution.skip_stages config dict."""
-        skip_stages = config.get("execution", {}).get("skip_stages", {})
+        """Create from execution.skip_stages config dict and top-level flag."""
+        exec_cfg = config.get("execution", {})
+        skip_stages = exec_cfg.get("skip_stages", {})
         return cls(
             skip_chunking=bool(skip_stages.get("skip_chunking", False)),
             skip_inference=bool(skip_stages.get("skip_inference", False)),
             skip_leace=bool(skip_stages.get("skip_leace", False)),
             skip_probing=bool(skip_stages.get("skip_probing", False)),
+            force_skip=bool(exec_cfg.get("force_skip", False))
         )
     
     def validate_for_entry(self) -> None:

@@ -78,6 +78,11 @@ def cli(verbose):
     is_flag=True,
     help="Skip probing stage (exit after LEACE completion)"
 )
+@click.option(
+    "--force-skip",
+    is_flag=True,
+    help="Force-skip missing prerequisites (injects execution.force_skip=True in config)"
+)
 def run_phase_a(
     dataset: Path, 
     output_dir: Path, 
@@ -88,6 +93,7 @@ def run_phase_a(
     skip_inference: bool,
     skip_leace: bool,
     skip_probing: bool,
+    force_skip: bool,
 ):
     """Execute Phase A pollution detection and mitigation pipeline."""
     from .phase_a_pipeline import PhaseAPipeline
@@ -113,17 +119,21 @@ def run_phase_a(
         )
         
         # Inject skip flags into config (CLI overrides YAML)
-        if any([skip_chunking, skip_inference, skip_leace, skip_probing]):
+        if any([skip_chunking, skip_inference, skip_leace, skip_probing]) or force_skip:
             if "execution" not in config:
                 config["execution"] = {}
-            config["execution"]["skip_stages"] = {
-                "skip_chunking": skip_chunking,
-                "skip_inference": skip_inference,
-                "skip_leace": skip_leace,
-                "skip_probing": skip_probing,
-            }
-            logger.info(f"Skip flags enabled: chunking={skip_chunking}, inference={skip_inference}, "
-                       f"leace={skip_leace}, probing={skip_probing}")
+            if any([skip_chunking, skip_inference, skip_leace, skip_probing]):
+                config["execution"]["skip_stages"] = {
+                    "skip_chunking": skip_chunking,
+                    "skip_inference": skip_inference,
+                    "skip_leace": skip_leace,
+                    "skip_probing": skip_probing,
+                }
+                logger.info(f"Skip flags enabled: chunking={skip_chunking}, inference={skip_inference}, "
+                           f"leace={skip_leace}, probing={skip_probing}")
+            if force_skip:
+                config["execution"]["force_skip"] = True
+                logger.warning("Force-skip enabled via CLI: missing prerequisites will be bypassed (warnings only)")
         
         # Dry run: print config and exit
         if dry_run:

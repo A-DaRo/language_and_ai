@@ -261,14 +261,17 @@ class ExecutionConfig:
     numa_pinning: bool = False
     # Stage skip configuration for modular execution
     skip_stages: Dict[str, bool] = field(default_factory=dict)
+    # When True, missing prerequisites will be bypassed with warnings instead of errors
+    force_skip: bool = False
     
     def get_skip_stages_config(self) -> SkipStagesConfig:
-        """Get validated SkipStagesConfig from skip_stages dict."""
+        """Get validated SkipStagesConfig from skip_stages dict and top-level flag."""
         return SkipStagesConfig(
             skip_chunking=self.skip_stages.get("skip_chunking", False),
             skip_inference=self.skip_stages.get("skip_inference", False),
             skip_leace=self.skip_stages.get("skip_leace", False),
             skip_probing=self.skip_stages.get("skip_probing", False),
+            force_skip=self.skip_stages.get("force_skip", self.force_skip),
         )
 
 

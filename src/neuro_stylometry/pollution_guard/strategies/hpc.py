@@ -354,8 +354,12 @@ class HPCFilterStrategy(PollutionFilterStrategy):
         save_chunked_table_atomic(table_with_chunks, input_dataset_path)
         
         # Safety check
+        force_skip = bool(self._cfg_get_optional(config, "execution.force_skip", False))
         if not is_post_chunked_fully_populated(table_with_chunks):
-            raise RuntimeError("Stage 1 finished but post_chunked still contains NULLs")
+            if not force_skip:
+                raise RuntimeError("Stage 1 finished but post_chunked still contains NULLs")
+            else:
+                logger.warning("Stage 1 finished but post_chunked contains NULLs; continuing due to execution.force_skip=True")
         
         # Cleanup between stages
         self._cleanup_memory()
@@ -1132,7 +1136,10 @@ class HPCFilterStrategy(PollutionFilterStrategy):
         if skip_cfg.skip_chunking:
             logger.info("Skipping Stage 1 (Chunking) - validating prerequisites")
             if not is_post_chunked_fully_populated(table):
-                raise RuntimeError("--skip-chunking requires post_chunked column to be fully populated")
+                if not skip_cfg.force_skip:
+                    raise RuntimeError("--skip-chunking requires post_chunked column to be fully populated")
+                else:
+                    logger.warning("--skip-chunking requested but post_chunked is not fully populated; continuing due to force_skip=True")
             chunking_ctx = ChunkingContext(
                 table_with_chunks=table,
                 posts=posts,
@@ -1157,37 +1164,63 @@ class HPCFilterStrategy(PollutionFilterStrategy):
             logger.info("Skipping Stage 2 (Inference) - loading from disk")
             inference_ipc_path = output_dir / "inference_results.arrow"
             if not inference_ipc_path.exists():
-                raise RuntimeError(f"--skip-inference requires {inference_ipc_path} to exist")
-            
-            # Load inference results from disk
-            flattened = flatten_chunks(
-                chunking_ctx.table_with_chunks["post_chunked"],
-                extract_texts=True,
-                include_chunk_metadata=False,
-            )
-            async_storer = AsyncResultStorer(
-                output_path=inference_ipc_path,
-                num_chunks=flattened.num_chunks,
-            )
-            
-            if not async_storer.is_complete:
-                raise RuntimeError("--skip-inference requires complete inference_results.arrow")
-            
-            flat_results = async_storer.load_results_as_flat_list(flattened.num_chunks)
-            chunk_starts = flattened.chunk_starts if flattened.chunk_starts is not None else np.zeros(flattened.num_chunks, dtype=np.int32)
-            
-            from ..semantic_chunker import deduplicate_entities
-            entities_batch = []
-            for doc_idx in range(flattened.num_docs):
-                doc_start = flattened.doc_offsets[doc_idx]
-                doc_end = flattened.doc_offsets[doc_idx + 1]
-                projected_entities = []
-                for flat_idx in range(doc_start, doc_end):
-                    chunk_entities = flat_results[flat_idx]
-                    chunk_offset = int(chunk_starts[flat_idx])
-                    for entity in chunk_entities:
-                        projected = dict(entity)
-                        projected["start"] = projected.get("start", 0) + chunk_offset
+                if not skip_cfg.force_skip:
+                    raise RuntimeError(f"--skip-inference requires {inference_ipc_path} to exist")
+                else:
+                    logger.warning("--skip-inference requested but inference_results.arrow not found; continuing due to force_skip=True")
+                    entities_batch = [[] for _ in posts]
+                    inference_ctx = InferenceContext(
+                        entities_batch=entities_batch,
+                        skipped_doc_indices=set(range(len(posts))),
+                        oom_count=0,
+                        final_budget=0,
+                        stage_skipped=True,
+                        inference_results_path=None,
+                    )
+            else:
+                # Load inference results from disk
+                flattened = flatten_chunks(
+                    chunking_ctx.table_with_chunks["post_chunked"],
+                    extract_texts=True,
+                    include_chunk_metadata=False,
+                )
+                async_storer = AsyncResultStorer(
+                    output_path=inference_ipc_path,
+                    num_chunks=flattened.num_chunks,
+                )
+                
+                if not async_storer.is_complete:
+                    if not skip_cfg.force_skip:
+                        raise RuntimeError("--skip-inference requires complete inference_results.arrow")
+                    else:
+                        logger.warning("--skip-inference requested but inference_results.arrow is incomplete; continuing due to force_skip=True")
+                        flat_results = []
+                        chunk_starts = np.zeros(0, dtype=np.int32)
+                        entities_batch = [[] for _ in range(flattened.num_docs)]
+                        inference_ctx = InferenceContext(
+                            entities_batch=entities_batch,
+                            skipped_doc_indices=set(range(flattened.num_docs)),
+                            oom_count=0,
+                            final_budget=0,
+                            stage_skipped=True,
+                            inference_results_path=inference_ipc_path,
+                        )
+                else:
+                    flat_results = async_storer.load_results_as_flat_list(flattened.num_chunks)
+                    chunk_starts = flattened.chunk_starts if flattened.chunk_starts is not None else np.zeros(flattened.num_chunks, dtype=np.int32)
+                    
+                    from ..semantic_chunker import deduplicate_entities
+                    entities_batch = []
+                    for doc_idx in range(flattened.num_docs):
+                        doc_start = flattened.doc_offsets[doc_idx]
+                        doc_end = flattened.doc_offsets[doc_idx + 1]
+                        projected_entities = []
+                        for flat_idx in range(doc_start, doc_end):
+                            chunk_entities = flat_results[flat_idx]
+                            chunk_offset = int(chunk_starts[flat_idx])
+                            for entity in chunk_entities:
+                                projected = dict(entity)
+                                projected["start"] = projected.get("start", 0) + chunk_offset
                         projected["end"] = projected.get("end", 0) + chunk_offset
                         projected_entities.append(projected)
                 entities_batch.append(deduplicate_entities(projected_entities))
@@ -1213,9 +1246,13 @@ class HPCFilterStrategy(PollutionFilterStrategy):
         if skip_cfg.skip_leace:
             logger.info("Skipping Stage 3 (LEACE) - loading projection matrix")
             if not projection_matrix_path.exists():
-                raise RuntimeError(f"--skip-leace requires {projection_matrix_path} to exist")
-            
-            projection_matrix = torch.load(projection_matrix_path, map_location="cpu")
+                if not skip_cfg.force_skip:
+                    raise RuntimeError(f"--skip-leace requires {projection_matrix_path} to exist")
+                else:
+                    logger.warning("--skip-leace requested but projection_matrix.pt not found; continuing due to force_skip=True")
+                    projection_matrix = None
+            else:
+                projection_matrix = torch.load(projection_matrix_path, map_location="cpu")
             
             # Load clean dataset if probing is needed
             probe_embeddings = None

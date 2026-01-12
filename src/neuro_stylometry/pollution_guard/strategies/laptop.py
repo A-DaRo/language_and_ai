@@ -325,8 +325,12 @@ class LaptopFilterStrategy(PollutionFilterStrategy):
         save_chunked_table_atomic(table_with_chunks, input_dataset_path)
         
         # Safety check
+        force_skip = bool(self._cfg_get_optional(config, "execution.force_skip", False))
         if not is_post_chunked_fully_populated(table_with_chunks):
-            raise RuntimeError("Stage 1 finished but post_chunked still contains NULLs")
+            if not force_skip:
+                raise RuntimeError("Stage 1 finished but post_chunked still contains NULLs")
+            else:
+                logger.warning("Stage 1 finished but post_chunked contains NULLs; continuing due to execution.force_skip=True")
         
         # Cleanup between stages (critical for low RAM)
         self._cleanup_memory()
@@ -1096,10 +1100,13 @@ class LaptopFilterStrategy(PollutionFilterStrategy):
             logger.info("Skipping Stage 1 (chunking) per skip flags")
             # Validate prerequisite: post_chunked must exist
             if not is_post_chunked_fully_populated(table):
-                raise RuntimeError(
-                    "Skip chunking requested but post_chunked column is not fully populated. "
-                    "Run without --skip-chunking first."
-                )
+                if not skip_cfg.force_skip:
+                    raise RuntimeError(
+                        "Skip chunking requested but post_chunked column is not fully populated. "
+                        "Run without --skip-chunking first."
+                    )
+                else:
+                    logger.warning("Skip chunking requested but post_chunked not fully populated; continuing due to force_skip=True")
             chunking_ctx = ChunkingContext(
                 table_with_chunks=table,
                 posts=posts,
@@ -1125,18 +1132,29 @@ class LaptopFilterStrategy(PollutionFilterStrategy):
             # Validate prerequisite: inference_results.arrow must exist
             inference_results_path = output_dir / "inference_results.arrow"
             if not inference_results_path.exists():
-                raise RuntimeError(
-                    f"Skip inference requested but {inference_results_path} not found. "
-                    "Run without --skip-inference first."
+                if not skip_cfg.force_skip:
+                    raise RuntimeError(
+                        f"Skip inference requested but {inference_results_path} not found. "
+                        "Run without --skip-inference first."
+                    )
+                else:
+                    logger.warning("Skip inference requested but inference_results.arrow not found; continuing due to force_skip=True")
+                    entities_batch = [[] for _ in chunking_ctx.posts]
+                    inference_ctx = InferenceContext(
+                        entities_batch=entities_batch,
+                        skipped_doc_indices=set(range(len(chunking_ctx.posts))),
+                        inference_results_path=None,
+                        stage_skipped=True,
+                    )
+            else:
+                cached_table = feather.read_table(inference_results_path)
+                entities_batch = self._load_cached_inference(cached_table, len(chunking_ctx.posts))
+                inference_ctx = InferenceContext(
+                    entities_batch=entities_batch,
+                    skipped_doc_indices=set(),
+                    inference_results_path=inference_results_path,
+                    stage_skipped=True,
                 )
-            cached_table = feather.read_table(inference_results_path)
-            entities_batch = self._load_cached_inference(cached_table, len(chunking_ctx.posts))
-            inference_ctx = InferenceContext(
-                entities_batch=entities_batch,
-                skipped_doc_indices=set(),
-                inference_results_path=inference_results_path,
-                stage_skipped=True,
-            )
         else:
             inference_ctx = self._run_inference_stage(
                 chunking_ctx=chunking_ctx,
@@ -1154,11 +1172,16 @@ class LaptopFilterStrategy(PollutionFilterStrategy):
             logger.info("Skipping Stage 3 (LEACE) per skip flags")
             # Validate prerequisite: projection_matrix.pt must exist
             if not projection_matrix_path.exists():
-                raise RuntimeError(
-                    f"Skip LEACE requested but {projection_matrix_path} not found. "
-                    "Run without --skip-leace first."
-                )
-            projection_matrix = torch.load(projection_matrix_path, map_location="cpu")
+                if not skip_cfg.force_skip:
+                    raise RuntimeError(
+                        f"Skip LEACE requested but {projection_matrix_path} not found. "
+                        "Run without --skip-leace first."
+                    )
+                else:
+                    logger.warning("Skip LEACE requested but projection_matrix.pt not found; continuing due to force_skip=True")
+                    projection_matrix = None
+            else:
+                projection_matrix = torch.load(projection_matrix_path, map_location="cpu")
             # Regenerate masked_texts and pollution_logs (needed for probing)
             masker = SpanMasker.from_taxonomy(
                 taxonomy_cfg=taxonomy_config,

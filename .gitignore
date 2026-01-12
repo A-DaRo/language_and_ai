@@ -50,6 +50,10 @@ artifacts/reports/*.md
 artifacts/reports/*.html
 artifacts/phase_a_notebook/*.pt
 artifacts/phase_a_notebook/*.json
+artifacts/phase_a/*.arrow
+artifacts/phase_a/*.pt
+artifacts/phase_a/*.json
+
 
 # Phase D artifacts (large model files)
 artifacts/phase_d/**/*.pt
