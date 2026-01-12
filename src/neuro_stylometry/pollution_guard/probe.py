@@ -14,6 +14,7 @@ Implements: phaseA-D_implementation_plan.md Section 9.2
 import logging
 import torch
 import numpy as np
+from inspect import signature
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score
 from typing import Tuple
@@ -84,12 +85,20 @@ class LinearProbe:
                 self.classifier.fit(X_dummy, y_dummy)
             return 0.0
 
-        # Train logistic regression
-        self.classifier = LogisticRegression(
-            max_iter=self.max_iter,
-            random_state=self.random_state,
-            multi_class='multinomial' if len(unique_labels) > 2 else 'ovr',
-        )
+        # Train logistic regression with compatibility across sklearn versions.
+        logreg_kwargs = {
+            "max_iter": self.max_iter,
+            "random_state": self.random_state,
+        }
+        logreg_params = signature(LogisticRegression).parameters
+        if "multi_class" in logreg_params:
+            logreg_kwargs["multi_class"] = (
+                "multinomial" if len(unique_labels) > 2 else "ovr"
+            )
+            if len(unique_labels) > 2 and "solver" in logreg_params:
+                logreg_kwargs["solver"] = "lbfgs"
+
+        self.classifier = LogisticRegression(**logreg_kwargs)
 
         self.classifier.fit(X, y)
         
