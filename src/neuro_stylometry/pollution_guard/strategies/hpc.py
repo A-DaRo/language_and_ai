@@ -295,7 +295,32 @@ class HPCFilterStrategy(PollutionFilterStrategy):
         invalid_chunk_rows: List[int] = []
         stage1_skipped = False
 
-        if is_post_chunked_fully_populated(table):
+        # Optimization: Check if inference is already complete to skip Stage 1 validation
+        inference_ipc_path = output_dataset_path.parent / "inference_results.arrow"
+        if has_post_chunked_column(table) and inference_ipc_path.exists():
+            try:
+                # Need total chunk count to verify completeness
+                logger.info("Checking async storage to potentially skip Stage 1 validation...")
+                temp_flattened = flatten_chunks(
+                    table["post_chunked"],
+                    extract_texts=False,
+                    include_chunk_metadata=False,
+                )
+                
+                # Check storer state
+                temp_storer = AsyncResultStorer(
+                    output_path=inference_ipc_path,
+                    num_chunks=temp_flattened.num_chunks,
+                )
+                
+                if temp_storer.is_complete:
+                    logger.info("Async storage complete: skipping Stage 1 chunk validation")
+                    stage1_skipped = True
+                    table_with_chunks = table
+            except Exception as e:
+                logger.warning(f"Failed to check async storage for skip: {e}")
+
+        if not stage1_skipped and is_post_chunked_fully_populated(table):
             logger.info("Resume candidate detected: validating post_chunked against raw posts")
             invalid_chunk_rows = find_invalid_post_chunked_indices(
                 posts=posts,
