@@ -58,7 +58,37 @@ def cli(verbose):
     is_flag=True, 
     help="Print resolved config without execution"
 )
-def run_phase_a(dataset: Path, output_dir: Path, mode: str, config_path: Path | None, dry_run: bool):
+@click.option(
+    "--skip-chunking",
+    is_flag=True,
+    help="Skip chunking stage (requires post_chunked column in dataset)"
+)
+@click.option(
+    "--skip-inference",
+    is_flag=True,
+    help="Skip inference stage (requires inference_results.arrow artifact)"
+)
+@click.option(
+    "--skip-leace",
+    is_flag=True,
+    help="Skip LEACE stage (requires projection_matrix.pt artifact)"
+)
+@click.option(
+    "--skip-probing",
+    is_flag=True,
+    help="Skip probing stage (exit after LEACE completion)"
+)
+def run_phase_a(
+    dataset: Path, 
+    output_dir: Path, 
+    mode: str, 
+    config_path: Path | None, 
+    dry_run: bool,
+    skip_chunking: bool,
+    skip_inference: bool,
+    skip_leace: bool,
+    skip_probing: bool,
+):
     """Execute Phase A pollution detection and mitigation pipeline."""
     from .phase_a_pipeline import PhaseAPipeline
     from .factories.strategy_factory import StrategyFactory
@@ -81,6 +111,19 @@ def run_phase_a(dataset: Path, output_dir: Path, mode: str, config_path: Path | 
             mode=mode, 
             experiment_config_path=config_path
         )
+        
+        # Inject skip flags into config (CLI overrides YAML)
+        if any([skip_chunking, skip_inference, skip_leace, skip_probing]):
+            if "execution" not in config:
+                config["execution"] = {}
+            config["execution"]["skip_stages"] = {
+                "skip_chunking": skip_chunking,
+                "skip_inference": skip_inference,
+                "skip_leace": skip_leace,
+                "skip_probing": skip_probing,
+            }
+            logger.info(f"Skip flags enabled: chunking={skip_chunking}, inference={skip_inference}, "
+                       f"leace={skip_leace}, probing={skip_probing}")
         
         # Dry run: print config and exit
         if dry_run:

@@ -207,6 +207,39 @@ class DataLoaderConfig:
 
 
 @dataclass
+class SkipStagesConfig:
+    """
+    Stage skip configuration for Phase A pipeline.
+    
+    Enables entry-point and early-exit execution:
+    - skip_chunking: Start at inference (assumes post_chunked exists)
+    - skip_inference: Start at LEACE (assumes inference results exist)
+    - skip_leace: Start at probing (assumes projection_matrix.pt exists)
+    - skip_probing: Exit after LEACE (skip metrics/visualizations)
+    
+    Sequential dependency: Chunking → Inference → LEACE → Probing
+    Skipping a later stage implies prerequisites are on disk.
+    """
+    skip_chunking: bool = False
+    skip_inference: bool = False
+    skip_leace: bool = False
+    skip_probing: bool = False
+    
+    def __post_init__(self):
+        # Validate logical consistency: can't skip LEACE but run probing without projection
+        if self.skip_leace and not self.skip_probing:
+            # This is allowed - probing can load existing projection matrix
+            pass
+        # If skipping inference, must also skip chunking (inference depends on chunks)
+        if self.skip_inference and not self.skip_chunking:
+            self.skip_chunking = True
+        # If skipping LEACE, must also skip chunking and inference
+        if self.skip_leace:
+            self.skip_chunking = True
+            self.skip_inference = True
+
+
+@dataclass
 class ExecutionConfig:
     """Advanced execution optimization configuration."""
     staged_execution: Dict[str, Any] = field(default_factory=dict)
@@ -226,6 +259,17 @@ class ExecutionConfig:
     torch_compile_backend: str = "inductor"
     sequence_packing: Dict[str, Any] = field(default_factory=dict)
     numa_pinning: bool = False
+    # Stage skip configuration for modular execution
+    skip_stages: Dict[str, bool] = field(default_factory=dict)
+    
+    def get_skip_stages_config(self) -> SkipStagesConfig:
+        """Get validated SkipStagesConfig from skip_stages dict."""
+        return SkipStagesConfig(
+            skip_chunking=self.skip_stages.get("skip_chunking", False),
+            skip_inference=self.skip_stages.get("skip_inference", False),
+            skip_leace=self.skip_stages.get("skip_leace", False),
+            skip_probing=self.skip_stages.get("skip_probing", False),
+        )
 
 
 @dataclass

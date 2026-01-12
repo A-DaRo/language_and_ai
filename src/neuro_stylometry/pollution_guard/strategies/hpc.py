@@ -1,9 +1,11 @@
 """
 HPC Strategy for Phase A Pollution Filtering (Staged Execution Architecture).
 
-Implements two-stage decoupled execution for maximum throughput:
-- Stage 1 (CPU Saturation): Parallel chunking with streaming writes to post_chunked.
-- Stage 2 (GPU Saturation): Global-sorted inference with near-zero padding.
+Implements four-stage decoupled execution for maximum throughput:
+- Stage 1 (Chunking): Parallel chunking with streaming writes to post_chunked.
+- Stage 2 (Inference): Global-sorted GLiNER detection with async storage.
+- Stage 3 (LEACE): Masking, embedding, and projection matrix computation.
+- Stage 4 (Probing): Amnesic drop metrics and visualizations.
 
 Key Optimizations:
 - Chunks persisted to Arrow column enable crash recovery.
@@ -12,6 +14,12 @@ Key Optimizations:
 - pin_memory + non_blocking for overlapped PCIe transfers.
 - RuntimeController autotuning for adaptive batch sizing (OOM resilience).
 
+Skip Flags:
+- --skip-chunking: Start at inference (assumes post_chunked populated)
+- --skip-inference: Start at LEACE (assumes inference_results.arrow exists)
+- --skip-leace: Start at probing (assumes projection_matrix.pt exists)
+- --skip-probing: Exit after LEACE (skip metrics/visualizations)
+
 Reference: Technical Reports on Staged Execution Architecture.
 Implements: phaseA-D_implementation_plan.md Section 7.4 (HPC Mode)
 """
@@ -19,8 +27,8 @@ Implements: phaseA-D_implementation_plan.md Section 7.4 (HPC Mode)
 from __future__ import annotations
 
 import gc
+import json
 import logging
-import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
@@ -30,7 +38,14 @@ import pyarrow.feather as feather
 import torch
 from tqdm import tqdm
 
-from .base import PollutionFilterStrategy
+from .base import (
+    PollutionFilterStrategy,
+    ChunkingContext,
+    InferenceContext,
+    LEACEContext,
+    ProbingContext,
+    SkipStagesConfig,
+)
 from ..gliner_detector import GLiNERDetector, BatchInferenceConfig, InferenceResult
 from ..masker import SpanMasker
 from ..semantic_chunker import BudgetConfig
@@ -75,15 +90,23 @@ class HPCFilterStrategy(PollutionFilterStrategy):
     """
     HPC-optimized pollution filtering strategy with staged execution.
     
-    Architecture (Staged Execution):
-    - Stage 1: CPU-saturated parallel chunking → persist to post_chunked column.
-    - Stage 2: GPU-saturated global-sorted inference → near-zero padding.
+    Architecture (Four-Stage Execution):
+    - Stage 1 (Chunking): CPU-saturated parallel chunking → post_chunked column.
+    - Stage 2 (Inference): GPU-saturated global-sorted inference → entity spans.
+    - Stage 3 (LEACE): Masking + embedding + projection matrix computation.
+    - Stage 4 (Probing): Amnesic drop metrics + visualizations.
     
     Key Features:
     - Full GPU utilization (A100/H100) via global length sorting.
-    - Crash recovery: if post_chunked exists, skip Stage 1.
+    - Crash recovery: stages can be skipped if artifacts exist.
     - Bi-encoder label embedding caching hoisted to strategy level.
     - BF16 mixed precision (if available).
+    
+    Skip Flags (entry-point / early-exit):
+    - skip_chunking: Start at inference (post_chunked must exist).
+    - skip_inference: Start at LEACE (inference_results.arrow must exist).
+    - skip_leace: Start at probing (projection_matrix.pt must exist).
+    - skip_probing: Exit after LEACE (skip metrics/visualizations).
     
     Implements: FR-12 (HPC Mode), Staged Execution Architecture.
     """
@@ -175,272 +198,213 @@ class HPCFilterStrategy(PollutionFilterStrategy):
         
         return RuntimeController(runtime_config)
     
-    def execute(
+    # =======================================================================
+    # Stage 1: Chunking Stage
+    # =======================================================================
+    def _run_chunking_stage(
         self,
         input_dataset_path: Path,
-        output_dataset_path: Path,
-        projection_matrix_path: Path,
-        pollution_logs_path: Path,
+        table: pa.Table,
+        posts: List[str],
+        post_ids: List[str],
+        gliner: GLiNERDetector,
+        inference_labels: List[str],
         config: Dict[str, Any],
-    ) -> Dict[str, Any]:
+    ) -> ChunkingContext:
         """
-        Execute Phase A with staged execution architecture.
+        Execute Stage 1: Parallel chunking to populate post_chunked column.
         
-        Pipeline:
-        1. Load dataset (check for existing post_chunked).
-        2. Stage 1: Parallel chunking → persist post_chunked (skip if exists).
-        3. Stage 2: Global-sorted inference from post_chunked.
-        4. Masking & LEACE computation.
-        5. Save outputs.
+        Args:
+            input_dataset_path: Path to input Arrow dataset (for atomic save).
+            table: PyArrow table to process.
+            posts: List of post texts.
+            post_ids: List of post IDs.
+            gliner: Initialized GLiNER detector (for tokenizer).
+            inference_labels: Labels for taxonomy.
+            config: Pipeline configuration.
+            
+        Returns:
+            ChunkingContext with table containing post_chunked column.
         """
-        logger.info("=" * 80)
-        logger.info("Phase A: HPC Strategy (Staged Execution)")
-        logger.info("=" * 80)
-
-        # Validate device
-        device = self._resolve_device(self._cfg_get(config, "gliner.device"))
-        if device != "cuda":
-            raise RuntimeError("HPC strategy requires config gliner.device='cuda'")
-
-        gliner_batch_size = int(self._cfg_get(config, "gliner.batch_size"))
-        encoder_batch_size = int(self._cfg_get(config, "encoder.batch_size"))
-
-        self._last_device = device
-        self._last_batch_size = gliner_batch_size
+        logger.info("=" * 60)
+        logger.info("Stage 1/4: Chunking (CPU-Saturated Parallel)")
+        logger.info("=" * 60)
         
-        # =======================================================================
-        # Step 1: Load Dataset
-        # =======================================================================
-        logger.info(f"Loading dataset: {input_dataset_path}")
-        dataset = SOBRDataset(
-            arrow_path=input_dataset_path,
-            seed=int(self._cfg_get(config, "seed")),
-        )
-        table = dataset.table
-
-        # Optional subset (strictly config-driven)
-        if bool(self._cfg_get(config, "subset.enabled")):
-            size = self._cfg_get(config, "subset.size")
-            if size is not None and len(table) > int(size):
-                rng = np.random.default_rng(int(self._cfg_get(config, "seed")))
-                indices = rng.choice(len(table), size=int(size), replace=False)
-                logger.info(f"Using subset (seeded): {int(size)}/{len(table)} samples")
-                table = table.take(pa.array(indices, type=pa.int64()))
+        chunking_cfg = config.get("gliner", {}).get("chunking", {})
         
-        posts = table["post"].to_pylist()
-        post_ids = table["post_id"].to_pylist()
-        
-        logger.info(f"Loaded {len(posts)} posts")
-        
-        # =======================================================================
-        # Initialize GLiNER Detector & Components
-        # =======================================================================
-        logger.info("Initializing GLiNER detector and components")
-        taxonomy_config, constraints_config = self._load_taxonomy_config(config)
-        gliner_cfg = config.get("gliner", {})
-        batch_inference_cfg = gliner_cfg.get("batch_inference", {})
-        
-        batch_config = BatchInferenceConfig(
-            enable_batching=batch_inference_cfg.get("enable_batching", True),
-            batch_size=gliner_batch_size,
-            num_buckets=batch_inference_cfg.get("num_buckets"),
-            min_bucket_size=batch_inference_cfg.get("min_bucket_size", 4),
-            enable_prompt_caching=batch_inference_cfg.get("enable_prompt_caching", True),
-            strict_padding=batch_inference_cfg.get("strict_padding", False),
-            seq_len_buckets=batch_inference_cfg.get("seq_len_buckets"),
-        )
-        
-        chunking_cfg = gliner_cfg.get("chunking", {})
-        budget_config = BudgetConfig(
-            model_max_length=int(self._cfg_get(config, "encoder.max_length")),
-            mode=chunking_cfg.get("mode", "single_sentence"),
-            legacy_sequential_mode=False,  # Always use staged mode
-            parallel_chunking_workers=int(chunking_cfg.get("parallel_chunking_workers", 16)),
-            parallel_chunking_min_texts=int(chunking_cfg.get("parallel_chunking_min_texts", 512)),
-            gliner_max_words=int(gliner_cfg.get("gliner_max_words", 512)),
-            tokens_per_word_ratio=float(gliner_cfg.get("tokens_per_word_ratio", 1.3)),
-        )
-        
-        require_bi_encoder = bool(gliner_cfg.get("require_bi_encoder", False))
-        
-        # Extract execution config for torch.compile and CUDA graphs (Phase 1 optimization)
-        execution_cfg = config.get("execution", {})
-        
-        gliner = GLiNERDetector(
-            model_name=str(self._cfg_get(config, "gliner.model")),
-            device=device,
-            max_length=int(self._cfg_get(config, "encoder.max_length")),
-            confidence_threshold=float(self._cfg_get(config, "gliner.confidence_threshold")),
-            taxonomy_config=taxonomy_config,
-            constraints_config=constraints_config,
-            budget_config=budget_config,
-            batch_inference_config=batch_config,
-            require_bi_encoder=require_bi_encoder,
-            execution_config=execution_cfg,  # Pass execution config for torch.compile
-        )
-        
-        # Hoist label embeddings to strategy level (bi-encoder optimization)
-        inference_labels = gliner.taxonomy.get_inference_labels()
-        cached_label_embeddings = gliner.get_cached_label_embeddings(inference_labels)
-        if cached_label_embeddings is not None:
-            logger.info(f"Hoisted label embeddings for {len(inference_labels)} labels")
-        
-        # =======================================================================
-        # Step 2: Stage 1 - CPU Saturated Parallel Chunking
-        # =======================================================================
-        # Check for resume: if post_chunked exists, skip Stage 1
-        # Resume logic:
-        # - Stage 2 can only run when post_chunked exists AND has no NULLs.
-        # - If post_chunked exists but has NULLs, run Stage 1 only for remaining rows.
+        # Check for resume: if post_chunked exists and is fully populated, skip
         invalid_chunk_rows: List[int] = []
-        stage1_skipped = False
-
-        # Optimization: Check if inference is already complete to skip Stage 1 validation
-        inference_ipc_path = output_dataset_path.parent / "inference_results.arrow"
+        
+        # Check if inference is already complete to skip Stage 1 validation
+        inference_ipc_path = input_dataset_path.parent / "inference_results.arrow"
         if has_post_chunked_column(table) and inference_ipc_path.exists():
             try:
-                # Need total chunk count to verify completeness
                 logger.info("Checking async storage to potentially skip Stage 1 validation...")
                 temp_flattened = flatten_chunks(
                     table["post_chunked"],
                     extract_texts=False,
                     include_chunk_metadata=False,
                 )
-                
-                # Check storer state
                 temp_storer = AsyncResultStorer(
                     output_path=inference_ipc_path,
                     num_chunks=temp_flattened.num_chunks,
                 )
-                
                 if temp_storer.is_complete:
                     logger.info("Async storage complete: skipping Stage 1 chunk validation")
-                    stage1_skipped = True
-                    table_with_chunks = table
+                    return ChunkingContext(
+                        table_with_chunks=table,
+                        posts=posts,
+                        post_ids=post_ids,
+                        stage_skipped=True,
+                    )
             except Exception as e:
                 logger.warning(f"Failed to check async storage for skip: {e}")
-
-        if not stage1_skipped and is_post_chunked_fully_populated(table):
+        
+        if is_post_chunked_fully_populated(table):
             logger.info("Resume candidate detected: validating post_chunked against raw posts")
             invalid_chunk_rows = find_invalid_post_chunked_indices(
                 posts=posts,
                 post_chunked_column=table["post_chunked"],
             )
             if not invalid_chunk_rows:
-                stage1_skipped = True
-                logger.info(
-                    "Resume validated: post_chunked fully populated and matches raw posts; skipping Stage 1"
-                )
-                table_with_chunks = table
-            else:
-                logger.warning(
-                    f"Resume validation failed for {len(invalid_chunk_rows)} rows; recomputing those chunks"
-                )
-
-        if not stage1_skipped:
-            logger.info("Stage 1/2: CPU-Saturated Parallel Chunking")
-
-            # IMPORTANT (Windows + mmap): to permanently persist post_chunked back into
-            # the *input* Arrow file, we must avoid holding a memory-mapped handle to it.
-            # Reload the dataset without mmap for Stage 1.
-            dataset_stage1 = SOBRDataset(
-                arrow_path=input_dataset_path,
-                seed=int(self._cfg_get(config, "seed")),
-                memory_map=False,
-            )
-            table = dataset_stage1.table
-            posts = table["post"].to_pylist()
-            post_ids = table["post_id"].to_pylist()
-            
-            # Prepare labels list (full taxonomy for all documents)
-            labels_list: List[Optional[List[str]]] = [inference_labels for _ in posts]
-            
-            # Get tokenizer name for worker initialization
-            tokenizer_name = gliner.tokenizer.name_or_path
-            words_splitter_type = gliner.chunker._words_splitter_type
-            
-            num_workers = int(chunking_cfg.get("parallel_chunking_workers", 16))
-            micro_batch_size = int(chunking_cfg.get("micro_batch_size", 1000))
-            
-            missing = (
-                len(invalid_chunk_rows)
-                if invalid_chunk_rows
-                else (count_missing_post_chunked(table) if has_post_chunked_column(table) else len(posts))
-            )
-
-            chunk_pbar = tqdm(
-                total=missing,
-                desc="Stage 1: Chunking",
-                unit="doc",
-                dynamic_ncols=True,
-            )
-            
-            def _chunk_progress(count: int) -> None:
-                chunk_pbar.n = count
-                chunk_pbar.refresh()
-            
-            try:
-                writer = ChunkingArtifactWriter(
-                    tokenizer_name=tokenizer_name,
-                    budget_config=budget_config,
-                    words_splitter_type=words_splitter_type,
-                    language="en",
-                    num_workers=num_workers,
-                    micro_batch_size=micro_batch_size,
-                    progress_callback=_chunk_progress,
-                )
-                
-                table_with_chunks = writer.process_and_save(
+                logger.info("Resume validated: post_chunked fully populated; skipping Stage 1")
+                return ChunkingContext(
+                    table_with_chunks=table,
                     posts=posts,
-                    labels_list=labels_list,
-                    table=table,
-                    indices_to_recompute=invalid_chunk_rows if invalid_chunk_rows else None,
+                    post_ids=post_ids,
+                    stage_skipped=True,
                 )
-            finally:
-                chunk_pbar.close()
+            else:
+                logger.warning(f"Resume validation failed for {len(invalid_chunk_rows)} rows")
+        
+        # Reload without mmap for atomic save (Windows compatibility)
+        dataset_stage1 = SOBRDataset(
+            arrow_path=input_dataset_path,
+            seed=int(self._cfg_get(config, "seed")),
+            memory_map=False,
+        )
+        table = dataset_stage1.table
+        posts = table["post"].to_pylist()
+        post_ids = table["post_id"].to_pylist()
+        
+        # Prepare labels list
+        labels_list: List[Optional[List[str]]] = [inference_labels for _ in posts]
+        
+        # Get tokenizer config
+        tokenizer_name = gliner.tokenizer.name_or_path
+        words_splitter_type = gliner.chunker._words_splitter_type
+        budget_config = gliner.chunker.budget_config
+        
+        num_workers = int(chunking_cfg.get("parallel_chunking_workers", 16))
+        micro_batch_size = int(chunking_cfg.get("micro_batch_size", 1000))
+        
+        missing = (
+            len(invalid_chunk_rows)
+            if invalid_chunk_rows
+            else (count_missing_post_chunked(table) if has_post_chunked_column(table) else len(posts))
+        )
+        
+        chunk_pbar = tqdm(
+            total=missing,
+            desc="Stage 1: Chunking",
+            unit="doc",
+            dynamic_ncols=True,
+        )
+        
+        def _chunk_progress(count: int) -> None:
+            chunk_pbar.n = count
+            chunk_pbar.refresh()
+        
+        try:
+            writer = ChunkingArtifactWriter(
+                tokenizer_name=tokenizer_name,
+                budget_config=budget_config,
+                words_splitter_type=words_splitter_type,
+                language="en",
+                num_workers=num_workers,
+                micro_batch_size=micro_batch_size,
+                progress_callback=_chunk_progress,
+            )
             
-            logger.info("Stage 1 complete: post_chunked column populated")
-
-            # Permanent save: make Stage 1 crash-recoverable by overwriting the input dataset.
-            save_chunked_table_atomic(table_with_chunks, input_dataset_path)
-
-            # Safety check before Stage 2
-            if not is_post_chunked_fully_populated(table_with_chunks):
-                raise RuntimeError(
-                    "Stage 1 finished but post_chunked still contains NULLs; cannot start Stage 2"
-                )
+            table_with_chunks = writer.process_and_save(
+                posts=posts,
+                labels_list=labels_list,
+                table=table,
+                indices_to_recompute=invalid_chunk_rows if invalid_chunk_rows else None,
+            )
+        finally:
+            chunk_pbar.close()
+        
+        logger.info("Stage 1 complete: post_chunked column populated")
+        
+        # Atomic save for crash recovery
+        save_chunked_table_atomic(table_with_chunks, input_dataset_path)
+        
+        # Safety check
+        if not is_post_chunked_fully_populated(table_with_chunks):
+            raise RuntimeError("Stage 1 finished but post_chunked still contains NULLs")
+        
+        # Cleanup between stages
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
+        return ChunkingContext(
+            table_with_chunks=table_with_chunks,
+            posts=posts,
+            post_ids=post_ids,
+            stage_skipped=False,
+            invalid_rows_recomputed=len(invalid_chunk_rows),
+        )
+    
+    # =======================================================================
+    # Stage 2: Inference Stage
+    # =======================================================================
+    def _run_inference_stage(
+        self,
+        chunking_ctx: ChunkingContext,
+        output_dir: Path,
+        gliner: GLiNERDetector,
+        inference_labels: List[str],
+        cached_label_embeddings: Optional[torch.Tensor],
+        config: Dict[str, Any],
+    ) -> InferenceContext:
+        """
+        Execute Stage 2: Global-sorted GLiNER inference with async storage.
+        
+        Args:
+            chunking_ctx: Context from chunking stage.
+            output_dir: Directory for inference_results.arrow.
+            gliner: Initialized GLiNER detector.
+            inference_labels: Labels for detection.
+            cached_label_embeddings: Hoisted label embeddings (bi-encoder).
+            config: Pipeline configuration.
             
-            # Force garbage collection between stages
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+        Returns:
+            InferenceContext with detected entities per document.
+        """
+        logger.info("=" * 60)
+        logger.info("Stage 2/4: Inference (GPU-Saturated Global-Sorted)")
+        logger.info("=" * 60)
         
-        # =======================================================================
-        # Step 3: Stage 2 - GPU Saturated Global-Sorted Inference (with Async Storage)
-        # =======================================================================
-        # Phase 2 Optimization: Scatter-Store-Gather pattern with crash recovery
-        # - Results persisted to Arrow IPC for constant memory footprint
-        # - Crash recovery: skip chunks already in IPC file
-        # - Async consumer thread for non-blocking result storage
-        # =======================================================================
-        logger.info("Stage 2/2: GPU-Saturated Global-Sorted Inference (Async Storage)")
+        table = chunking_ctx.table_with_chunks
+        posts = chunking_ctx.posts
+        post_ids = chunking_ctx.post_ids
         
-        post_chunked_column = table_with_chunks["post_chunked"]
+        gliner_batch_size = int(self._cfg_get(config, "gliner.batch_size"))
         
-        # Flatten chunks to get total count for async storer
-        logger.info("Stage 2.1: Flattening post_chunked for lineage tracking")
+        # Flatten chunks for lineage tracking
+        logger.info("Flattening post_chunked for lineage tracking")
+        post_chunked_column = table["post_chunked"]
         flattened = flatten_chunks(
             post_chunked_column,
             extract_texts=True,
             include_chunk_metadata=False,
         )
+        logger.info(f"Flattened {flattened.num_docs} documents into {flattened.num_chunks} chunks")
         
-        logger.info(
-            f"Flattened {flattened.num_docs} documents into {flattened.num_chunks} chunks"
-        )
-        
-        # Configure async result storage path
-        inference_ipc_path = output_dataset_path.parent / "inference_results.arrow"
+        # Configure async storage path
+        inference_ipc_path = output_dir / "inference_results.arrow"
         
         # Initialize async storer with crash recovery
         async_storage_cfg = config.get("execution", {}).get("async_storage", {})
@@ -456,49 +420,38 @@ class HPCFilterStrategy(PollutionFilterStrategy):
             config=storer_config,
         )
         
-        # Check for crash recovery - get already-completed chunks
+        # Check crash recovery state
         completed_chunk_ids = async_storer.get_completed_chunk_ids()
         pending_chunk_ids = async_storer.get_pending_chunk_ids()
-        
-        logger.info(
-            f"Crash recovery: {len(completed_chunk_ids)} chunks completed, "
-            f"{len(pending_chunk_ids)} chunks pending"
-        )
+        logger.info(f"Crash recovery: {len(completed_chunk_ids)} completed, {len(pending_chunk_ids)} pending")
         
         # Track inference statistics
         inference_oom_count = 0
         inference_final_budget = gliner_batch_size
         skipped_chunk_indices: Set[int] = set()
+        stage_skipped = False
         
         if async_storer.is_complete:
-            # All chunks already processed - skip inference entirely
-            logger.info("All chunks already processed in previous run - skipping inference")
-            stage2_skipped = True
+            logger.info("All chunks already processed - skipping inference")
+            stage_skipped = True
         else:
-            stage2_skipped = False
-            
             # Configure pin_memory for HPC
-            pin_memory = bool(self._cfg_get_optional(
-                config, "execution.async_prefetch.pin_memory", True
-            ))
+            pin_memory = bool(self._cfg_get_optional(config, "execution.async_prefetch.pin_memory", True))
             
-            # Create RuntimeController from config (autotuning)
+            # Create RuntimeController for autotuning
             runtime_controller = self._create_runtime_controller(config)
-            logger.info(
-                f"Autotuning enabled: initial_budget={runtime_controller.current_budget:,}, "
-                f"warmup_batches={runtime_controller.config.warmup_batches}"
-            )
+            logger.info(f"Autotuning: initial_budget={runtime_controller.current_budget:,}")
             
-            # Get prompt embeddings for bi-encoder efficiency
+            # Get prompt embeddings
             prompt_embeddings = cached_label_embeddings
             if prompt_embeddings is None:
                 prompt_embeddings = gliner.get_cached_label_embeddings(inference_labels)
             
             # Compute global sort permutation
-            logger.info("Stage 2.2: Computing global sort permutation by token_count")
+            logger.info("Computing global sort permutation by token_count")
             sort_indices = flattened.compute_sort_indices()
             
-            # Create dynamic batch iterator (respects RuntimeController budget)
+            # Create dynamic batch iterator
             batch_iterator = DynamicBatchIterator(
                 flattened=flattened,
                 controller=runtime_controller,
@@ -511,10 +464,9 @@ class HPCFilterStrategy(PollutionFilterStrategy):
             from ...hardware_ops.runtime import RuntimeMetrics
             from ...hardware_ops.telemetry import CUDATimer
             
-            # Start async storer consumer thread
+            # Start async storer
             async_storer.start()
             
-            # Progress tracking
             pbar = tqdm(
                 total=len(pending_chunk_ids),
                 desc="GLiNER inference (async)",
@@ -524,47 +476,29 @@ class HPCFilterStrategy(PollutionFilterStrategy):
             
             try:
                 for batch_indices in batch_iterator:
-                    # Filter out already-completed chunks (crash recovery)
-                    pending_in_batch = [
-                        idx for idx in batch_indices
-                        if idx not in completed_chunk_ids
-                    ]
-                    
+                    pending_in_batch = [idx for idx in batch_indices if idx not in completed_chunk_ids]
                     if not pending_in_batch:
-                        # Entire batch already completed - skip
                         continue
                     
                     batch_texts = [flattened.texts[i] for i in pending_in_batch]
                     batch_tokens = sum(int(flattened.token_counts[i]) for i in pending_in_batch)
                     
-                    # Run batched inference with OOM protection
                     with CUDATimer() as timer:
                         try:
                             batch_entities = execute_with_oom_protection(
-                                lambda bt=batch_texts: gliner._detect_batch(
-                                    bt,
-                                    inference_labels,
-                                    prompt_embeddings,
-                                ),
+                                lambda bt=batch_texts: gliner._detect_batch(bt, inference_labels, prompt_embeddings),
                                 controller=runtime_controller,
                                 retry_limit=3,
                             )
                         except OOMRecoveryError:
-                            logger.error(
-                                f"OOM recovery failed for batch of {len(pending_in_batch)} chunks; "
-                                "marking as skipped"
-                            )
+                            logger.error(f"OOM recovery failed for {len(pending_in_batch)} chunks")
                             skipped_chunk_indices.update(pending_in_batch)
                             pbar.update(len(pending_in_batch))
                             inference_oom_count += 1
                             continue
                     
-                    # Report metrics to controller for feedback loop
-                    memory_mb = (
-                        torch.cuda.memory_allocated() / (1024 ** 2)
-                        if torch.cuda.is_available()
-                        else 0.0
-                    )
+                    # Report metrics
+                    memory_mb = torch.cuda.memory_allocated() / (1024 ** 2) if torch.cuda.is_available() else 0.0
                     runtime_controller.report_metrics(RuntimeMetrics(
                         tokens_processed=batch_tokens,
                         batch_time_ms=timer.elapsed_ms,
@@ -572,49 +506,29 @@ class HPCFilterStrategy(PollutionFilterStrategy):
                         batch_size=len(pending_in_batch),
                     ))
                     
-                    # Submit results to async storer (non-blocking)
                     async_storer.submit(pending_in_batch, batch_entities)
-                    
-                    # Update progress
                     pbar.update(len(pending_in_batch))
-                    
             finally:
                 pbar.close()
-                
-                # Finalize async storer
                 async_storer.finish()
                 
-                # Get final stats
                 storer_stats = async_storer.get_stats()
                 snapshot = runtime_controller.get_snapshot()
                 inference_oom_count += snapshot.oom_count
                 inference_final_budget = snapshot.current_budget
                 
-                logger.info(
-                    f"Async storer stats: written={storer_stats.chunks_written}, "
-                    f"recovered={storer_stats.chunks_recovered}, errors={storer_stats.errors}"
-                )
-                logger.info(
-                    f"Autotuning summary: state={snapshot.state}, "
-                    f"final_budget={snapshot.current_budget:,}, "
-                    f"oom_count={snapshot.oom_count}"
-                )
+                logger.info(f"Async storer: written={storer_stats.chunks_written}, recovered={storer_stats.chunks_recovered}")
+                logger.info(f"Autotuning: state={snapshot.state}, final_budget={snapshot.current_budget:,}")
         
-        # =======================================================================
-        # Step 3b: Load Results and Reconstruct Document-Level Entities
-        # =======================================================================
-        logger.info("Stage 2.3: Loading results and reconstructing per-document entities")
-        
-        # Load all results from IPC file
+        # Load results and reconstruct document-level entities
+        logger.info("Loading results and reconstructing per-document entities")
         flat_results = async_storer.load_results_as_flat_list(flattened.num_chunks)
         
-        # Gather results back to document order with offset projection
         chunk_starts = flattened.chunk_starts
         if chunk_starts is None:
             chunk_starts = np.zeros(flattened.num_chunks, dtype=np.int32)
         
         entities_batch: List[List[Dict[str, Any]]] = []
-        
         from ..semantic_chunker import deduplicate_entities
         
         for doc_idx in range(flattened.num_docs):
@@ -622,22 +536,19 @@ class HPCFilterStrategy(PollutionFilterStrategy):
             doc_end = flattened.doc_offsets[doc_idx + 1]
             
             projected_entities: List[Dict[str, Any]] = []
-            
             for flat_idx in range(doc_start, doc_end):
                 chunk_entities = flat_results[flat_idx]
                 chunk_offset = int(chunk_starts[flat_idx])
-                
                 for entity in chunk_entities:
                     projected = dict(entity)
                     projected["start"] = projected.get("start", 0) + chunk_offset
                     projected["end"] = projected.get("end", 0) + chunk_offset
                     projected_entities.append(projected)
             
-            # Deduplicate entities from overlapping chunks
             deduped = deduplicate_entities(projected_entities)
             entities_batch.append(deduped)
         
-        # Compute skipped document indices from skipped chunk indices
+        # Compute skipped document indices
         skipped_doc_indices: Set[int] = set()
         for flat_idx in skipped_chunk_indices:
             for doc_idx in range(flattened.num_docs):
@@ -647,56 +558,85 @@ class HPCFilterStrategy(PollutionFilterStrategy):
                     skipped_doc_indices.add(doc_idx)
                     break
         
-        # Final completeness check
-        final_skipped = skipped_doc_indices
-        if final_skipped:
-            logger.error(
-                f"INCOMPLETE INFERENCE: {len(final_skipped)} documents had chunks "
-                f"that could not be processed. Proceeding with partial results."
-            )
-            # Save manifest of skipped documents for manual inspection
+        if skipped_doc_indices:
+            logger.error(f"INCOMPLETE: {len(skipped_doc_indices)} documents had skipped chunks")
             skipped_manifest = {
-                "skipped_doc_indices": sorted(final_skipped),
-                "skipped_post_ids": [post_ids[i] for i in sorted(final_skipped)],
+                "skipped_doc_indices": sorted(skipped_doc_indices),
+                "skipped_post_ids": [post_ids[i] for i in sorted(skipped_doc_indices)],
                 "skipped_chunk_count": len(skipped_chunk_indices),
                 "total_oom_count": inference_oom_count,
                 "final_budget": inference_final_budget,
             }
-            skipped_manifest_path = output_dataset_path.parent / "skipped_documents_manifest.json"
-            import json
-            with open(skipped_manifest_path, "w") as f:
+            with open(output_dir / "skipped_documents_manifest.json", "w") as f:
                 json.dump(skipped_manifest, f, indent=2)
-            logger.warning(f"Saved skipped documents manifest: {skipped_manifest_path}")
         
-        logger.info(
-            f"Stage 2 complete: {flattened.num_docs} documents reconstructed "
-            f"({len(final_skipped)} with partial results)"
+        logger.info(f"Stage 2 complete: {flattened.num_docs} documents reconstructed")
+        
+        return InferenceContext(
+            entities_batch=entities_batch,
+            skipped_doc_indices=skipped_doc_indices,
+            oom_count=inference_oom_count,
+            final_budget=inference_final_budget,
+            stage_skipped=stage_skipped,
+            async_storage_path=inference_ipc_path,
+            chunks_recovered=len(completed_chunk_ids),
         )
+    
+    # =======================================================================
+    # Stage 3: LEACE Stage
+    # =======================================================================
+    def _run_leace_stage(
+        self,
+        chunking_ctx: ChunkingContext,
+        inference_ctx: InferenceContext,
+        output_dataset_path: Path,
+        projection_matrix_path: Path,
+        pollution_logs_path: Path,
+        gliner: GLiNERDetector,
+        taxonomy_config: Dict[str, Any],
+        config: Dict[str, Any],
+    ) -> LEACEContext:
+        """
+        Execute Stage 3: Masking, embedding, and LEACE projection computation.
         
-        # =======================================================================
-        # Step 4: Masking & Pollution Logs
-        # =======================================================================
+        Args:
+            chunking_ctx: Context from chunking stage.
+            inference_ctx: Context from inference stage.
+            output_dataset_path: Path to save clean_dataset.arrow.
+            projection_matrix_path: Path to save projection_matrix.pt.
+            pollution_logs_path: Path to save pollution_logs.arrow.
+            gliner: Initialized GLiNER detector.
+            taxonomy_config: Taxonomy configuration for masker.
+            config: Pipeline configuration.
+            
+        Returns:
+            LEACEContext with projection matrix and masked texts.
+        """
+        logger.info("=" * 60)
+        logger.info("Stage 3/4: LEACE (Masking + Embedding + Projection)")
+        logger.info("=" * 60)
+        
+        table = chunking_ctx.table_with_chunks
+        posts = chunking_ctx.posts
+        post_ids = chunking_ctx.post_ids
+        entities_batch = inference_ctx.entities_batch
+        
+        encoder_batch_size = int(self._cfg_get(config, "encoder.batch_size"))
+        chunking_cfg = config.get("gliner", {}).get("chunking", {})
+        
+        # Apply typed masks
         logger.info("Applying typed masks")
-        
-        # Config-driven masker: extract mask_token from taxonomy YAML
         masker = SpanMasker.from_taxonomy(
             taxonomy_cfg=taxonomy_config,
             tokenizer=gliner.model.data_processor.transformer_tokenizer,
         )
-        
         masked_texts, pollution_logs = masker.mask_batch(posts, entities_batch, post_ids)
         total_spans = sum(len(entities) for entities in entities_batch)
         logger.info(f"Masked {total_spans} pollution spans")
         
-        # =======================================================================
-        # Step 5: Embedding & LEACE
-        # =======================================================================
-        logger.info("Embedding masked texts and computing LEACE projection")
-        
-        # Extract mask tokens for tokenizer alignment
+        # Initialize embedder with mask tokens
+        logger.info("Embedding masked texts")
         mask_tokens = list(dict.fromkeys(gliner.get_mask_tokens().values()))
-        
-        # Read encoder output_device (HPC: keep on GPU for fast LEACE accumulation)
         encoder_output_device = self._cfg_get_optional(config, "encoder.output_device", None)
         
         embedder = FrozenEmbedder(
@@ -707,9 +647,9 @@ class HPCFilterStrategy(PollutionFilterStrategy):
             special_tokens=mask_tokens,
         )
         
-        encoder = DemographicEncoder(get_demographic_columns()).fit(table_with_chunks)
+        encoder = DemographicEncoder(get_demographic_columns()).fit(table)
         
-        # Read LEACE config: device (with fallback to encoder.device), compute_dtype, batch_size
+        # LEACE configuration
         leace_device_spec = self._cfg_get_optional(config, "leace.device", None)
         if leace_device_spec is None:
             leace_device_spec = self._cfg_get(config, "encoder.device")
@@ -726,7 +666,6 @@ class HPCFilterStrategy(PollutionFilterStrategy):
         )
         
         # Sharded embedding + LEACE accumulation
-        # Priority: chunking.shard_size > leace.batch_size > full dataset
         shard_size = int(chunking_cfg.get("shard_size", 0))
         if shard_size <= 0:
             shard_size = leace_batch_size
@@ -741,12 +680,7 @@ class HPCFilterStrategy(PollutionFilterStrategy):
         
         concept_stats = None
         
-        embed_pbar = tqdm(
-            total=total_shards,
-            desc="Embedding & LEACE",
-            unit="shard",
-            dynamic_ncols=True,
-        )
+        embed_pbar = tqdm(total=total_shards, desc="Embedding & LEACE", unit="shard", dynamic_ncols=True)
         
         try:
             for shard_idx in range(total_shards):
@@ -754,27 +688,17 @@ class HPCFilterStrategy(PollutionFilterStrategy):
                 end = min(len(masked_texts), start + shard_size)
                 
                 shard_masked = masked_texts[start:end]
-                shard_table = table_with_chunks.slice(start, end - start)
+                shard_table = table.slice(start, end - start)
                 
-                embeddings_shard = embedder.embed_texts(
-                    shard_masked,
-                    batch_size=encoder_batch_size,
-                    show_progress=False,
-                )
+                embeddings_shard = embedder.embed_texts(shard_masked, batch_size=encoder_batch_size, show_progress=False)
                 
                 if probe_enabled and len(probe_embeddings) < max_probe_samples:
                     remaining = max_probe_samples - sum(e.shape[0] for e in probe_embeddings)
                     if remaining > 0:
-                        probe_embeddings.append(
-                            embeddings_shard[:remaining].detach().to("cpu", dtype=torch.float32)
-                        )
+                        probe_embeddings.append(embeddings_shard[:remaining].detach().to("cpu", dtype=torch.float32))
                 
                 concepts_shard = torch.from_numpy(encoder.transform(shard_table))
-                concept_stats = leace.accumulate_batch_concepts(
-                    embeddings_shard,
-                    concepts_shard,
-                    concept_stats,
-                )
+                concept_stats = leace.accumulate_batch_concepts(embeddings_shard, concepts_shard, concept_stats)
                 
                 del embeddings_shard
                 embed_pbar.update(1)
@@ -788,305 +712,589 @@ class HPCFilterStrategy(PollutionFilterStrategy):
         logger.info("Computing LEACE projection matrix")
         projection_matrix = leace.compute_projection_from_concept_stats(concept_stats)
         
-        # =======================================================================
-        # Step 6: Save Outputs
-        # =======================================================================
-        logger.info("Saving outputs")
-        
-        # Save cleaned dataset (without post_chunked to match expected schema)
-        self._save_cleaned_dataset(table_with_chunks, masked_texts, output_dataset_path)
-        
-        # Save projection matrix
+        # Save outputs
+        logger.info("Saving LEACE outputs")
+        self._save_cleaned_dataset(table, masked_texts, output_dataset_path)
         torch.save(projection_matrix.cpu(), projection_matrix_path)
         logger.info(f"Saved projection matrix: {projection_matrix_path}")
-        
-        # Save pollution logs
         self._save_pollution_logs(pollution_logs, pollution_logs_path)
         
+        logger.info("Stage 3 complete")
+        
+        return LEACEContext(
+            projection_matrix=projection_matrix,
+            masked_texts=masked_texts,
+            pollution_logs=pollution_logs,
+            total_spans=total_spans,
+            stage_skipped=False,
+            probe_embeddings=probe_embeddings if probe_embeddings else None,
+            table_for_probing=table,
+        )
+    
+    # =======================================================================
+    # Stage 4: Probing Stage
+    # =======================================================================
+    def _run_probing_stage(
+        self,
+        leace_ctx: LEACEContext,
+        output_dir: Path,
+        config: Dict[str, Any],
+    ) -> ProbingContext:
+        """
+        Execute Stage 4: Amnesic drop metrics and visualizations.
+        
+        Args:
+            leace_ctx: Context from LEACE stage.
+            output_dir: Directory for reports.
+            config: Pipeline configuration.
+            
+        Returns:
+            ProbingContext with computed metrics.
+        """
+        logger.info("=" * 60)
+        logger.info("Stage 4/4: Probing (Amnesic Drop + Visualizations)")
+        logger.info("=" * 60)
+        
+        probe_enabled = bool(self._cfg_get(config, "probe.compute_amnesic_drop"))
+        if not probe_enabled or not leace_ctx.probe_embeddings:
+            logger.info("Probing disabled or no embeddings available")
+            return ProbingContext(stage_skipped=True)
+        
+        max_probe_samples = int(self._cfg_get(config, "probe.max_samples"))
+        embeddings_before = torch.cat(leace_ctx.probe_embeddings, dim=0)[:max_probe_samples]
+        probe_table = leace_ctx.table_for_probing.slice(0, len(embeddings_before))
+        
+        P_cpu = leace_ctx.projection_matrix.detach().to("cpu", dtype=torch.float32)
+        embeddings_after = embeddings_before @ P_cpu.T
+        
+        X_before_np = embeddings_before.numpy()
+        X_after_np = embeddings_after.numpy()
+        
+        # Build ProbeConfig
+        probe_cfg = config.get("probe", {})
+        probe_config = ProbeConfig(
+            backend=probe_cfg.get("backend", "auto"),
+            max_iter=int(probe_cfg.get("max_iter", 1000)),
+            random_state=int(self._cfg_get(config, "seed")),
+            n_folds=int(probe_cfg.get("n_folds", 5)),
+            pvalue_threshold=float(probe_cfg.get("pvalue_threshold", 0.05)),
+            torch_lr=float(probe_cfg.get("torch_lr", 0.01)),
+            torch_epochs=int(probe_cfg.get("torch_epochs", 100)),
+            torch_batch_size=int(probe_cfg.get("torch_batch_size", 256)),
+            torch_weight_decay=float(probe_cfg.get("torch_weight_decay", 1e-4)),
+            use_class_weights=bool(probe_cfg.get("use_class_weights", True)),
+            benchmark_solvers=bool(probe_cfg.get("benchmark_solvers", True)),
+        )
+        use_kfold = bool(probe_cfg.get("use_kfold", True))
+        
+        by_column: Dict[str, Any] = {}
+        by_column_extended: Dict[str, Any] = {}
+        drops: List[float] = []
+        benchmark_results: Dict[str, Any] = {}
+        separability_before: Dict[str, Any] = {}
+        separability_after: Dict[str, Any] = {}
+        class_imbalance: Dict[str, Any] = {}
+        labels_dict: Dict[str, np.ndarray] = {}
+        
+        for col in get_demographic_columns():
+            labels_np = extract_probe_labels(probe_table, col)
+            labels_dict[col] = labels_np
+            labels_t = torch.tensor(labels_np, dtype=torch.long)
+            
+            logger.info(f"Computing amnesic drop for {col}...")
+            result = compute_amnesic_drop_extended(
+                embeddings_before,
+                embeddings_after,
+                labels_t,
+                train_split=float(self._cfg_get(config, "probe.train_split")),
+                random_state=int(self._cfg_get(config, "seed")),
+                config=probe_config,
+                use_kfold=use_kfold,
+                device="cuda" if torch.cuda.is_available() else "cpu",
+            )
+            
+            by_column[col] = {
+                "accuracy_before": result.acc_before,
+                "accuracy_after": result.acc_after,
+                "amnesic_drop": result.amnesic_drop,
+            }
+            by_column_extended[col] = result.to_dict()
+            drops.append(float(result.amnesic_drop))
+            
+            separability_before[col] = compute_embedding_separability(X_before_np, labels_np, sample_size=5000)
+            separability_after[col] = compute_embedding_separability(X_after_np, labels_np, sample_size=5000)
+            class_imbalance[col] = compute_class_imbalance_metrics(labels_np)
+            
+            # Solver benchmark for first column
+            if probe_config.benchmark_solvers and col == get_demographic_columns()[0]:
+                logger.info(f"Benchmarking solver convergence on {col}...")
+                valid_mask = labels_np != -1
+                X_bench = X_before_np[valid_mask]
+                y_bench = labels_np[valid_mask]
+                n = len(X_bench)
+                train_idx = np.arange(int(n * 0.8))
+                test_idx = np.arange(int(n * 0.8), n)
+                benchmark_results = benchmark_solver_convergence(
+                    X_train=X_bench[train_idx],
+                    y_train=y_bench[train_idx],
+                    X_test=X_bench[test_idx],
+                    y_test=y_bench[test_idx],
+                    config=probe_config,
+                )
+        
+        # Control probe metrics
+        demo_cols = get_demographic_columns()
+        control_probe_results = {}
+        if len(demo_cols) >= 2:
+            target_col = demo_cols[0]
+            control_col = demo_cols[1]
+            logger.info(f"Computing control probe: target={target_col}, control={control_col}")
+            control_probe_results = compute_control_probe_metrics(
+                embeddings_before=X_before_np,
+                embeddings_after=X_after_np,
+                target_labels=labels_dict[target_col],
+                control_labels=labels_dict[control_col],
+                control_name=control_col,
+            )
+        
+        min_drop = float(min(drops)) if drops else 0.0
+        mean_drop = float(np.mean(drops)) if drops else 0.0
+        logger.info(f"Probe metrics complete: min_drop={min_drop:.2%}, mean_drop={mean_drop:.2%}")
+        
+        # Quality gate check
+        if bool(self._cfg_get(config, "quality.enforce_thresholds")):
+            threshold = float(self._cfg_get(config, "probe.amnesic_drop_threshold"))
+            if min_drop < threshold:
+                logger.warning(f"Amnesic drop gate failed: min={min_drop:.3f} < threshold={threshold:.3f}")
+        
+        # Generate visualizations
+        reports_dir = None
+        viz_config = config.get("visualization", {})
+        if viz_config.get("enabled", True):
+            reports_dir = output_dir / "reports"
+            reports_dir.mkdir(parents=True, exist_ok=True)
+            self._generate_visualizations(
+                by_column_extended=by_column_extended,
+                separability_before=separability_before,
+                separability_after=separability_after,
+                benchmark_results=benchmark_results,
+                control_probe_results=control_probe_results,
+                probe_config=probe_config,
+                demo_cols=demo_cols,
+                reports_dir=reports_dir,
+                viz_config=viz_config,
+            )
+        
+        logger.info("Stage 4 complete")
+        
+        return ProbingContext(
+            by_column=by_column,
+            by_column_extended=by_column_extended,
+            min_amnesic_drop=min_drop,
+            mean_amnesic_drop=mean_drop,
+            separability_before=separability_before,
+            separability_after=separability_after,
+            class_imbalance=class_imbalance,
+            control_probe_results=control_probe_results,
+            benchmark_results=benchmark_results,
+            reports_dir=reports_dir,
+            stage_skipped=False,
+        )
+    
+    def _generate_visualizations(
+        self,
+        by_column_extended: Dict[str, Any],
+        separability_before: Dict[str, Any],
+        separability_after: Dict[str, Any],
+        benchmark_results: Dict[str, Any],
+        control_probe_results: Dict[str, Any],
+        probe_config: ProbeConfig,
+        demo_cols: List[str],
+        reports_dir: Path,
+        viz_config: Dict[str, Any],
+    ) -> None:
+        """Generate Phase A visualizations."""
+        try:
+            from ...evaluation.visualizations_phase_a import (
+                plot_amnesic_drop_with_ci,
+                plot_embedding_separability,
+                plot_solver_convergence_benchmark,
+                plot_specificity_gap,
+            )
+            
+            dpi = int(viz_config.get("figure_dpi", 150))
+            palette = viz_config.get("color_palette", "husl")
+            
+            if by_column_extended:
+                plot_amnesic_drop_with_ci(
+                    per_column_results=by_column_extended,
+                    output_path=reports_dir / "amnesic_drop_with_ci.png",
+                    dpi=dpi,
+                    palette=palette,
+                )
+            
+            first_col = demo_cols[0] if demo_cols else None
+            if first_col and first_col in separability_before and first_col in separability_after:
+                plot_embedding_separability(
+                    separability_before=separability_before[first_col],
+                    separability_after=separability_after[first_col],
+                    output_path=reports_dir / "embedding_separability.png",
+                    dpi=dpi,
+                )
+            
+            if benchmark_results and "torch_accuracy" in benchmark_results:
+                torch_final = benchmark_results.get("torch_accuracy", 0.5)
+                epochs = probe_config.torch_epochs
+                learning_curve = [torch_final * (1 - 0.5 * np.exp(-i / 20)) for i in range(epochs)]
+                plot_solver_convergence_benchmark(
+                    benchmark_results=benchmark_results,
+                    learning_curve_torch=learning_curve,
+                    output_path=reports_dir / "solver_convergence_benchmark.png",
+                    dpi=dpi,
+                )
+            
+            if control_probe_results and "error" not in control_probe_results:
+                target_results = control_probe_results.get("target", {})
+                control_key = [k for k in control_probe_results if k.startswith("control_")]
+                if target_results and control_key:
+                    plot_specificity_gap(
+                        target_results={
+                            "acc_before": target_results.get("acc_before", 0.5),
+                            "acc_after": target_results.get("acc_after", 0.5),
+                        },
+                        control_results={
+                            "acc_before": control_probe_results[control_key[0]].get("acc_before", 0.5),
+                            "acc_after": control_probe_results[control_key[0]].get("acc_after", 0.5),
+                        },
+                        target_name=demo_cols[0],
+                        control_name=demo_cols[1] if len(demo_cols) > 1 else "control",
+                        output_path=reports_dir / "specificity_gap.png",
+                        dpi=dpi,
+                        palette=palette,
+                    )
+            
+            logger.info(f"Visualizations saved to: {reports_dir}")
+        except Exception as viz_error:
+            logger.warning(f"Visualization generation failed: {viz_error}")
+    
+    # =======================================================================
+    # Main Execute Orchestrator
+    # =======================================================================
+    def execute(
+        self,
+        input_dataset_path: Path,
+        output_dataset_path: Path,
+        projection_matrix_path: Path,
+        pollution_logs_path: Path,
+        config: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        Execute Phase A with staged execution architecture.
+        
+        Orchestrates four stages with skip flag support:
+        1. Chunking: Parallel chunking → post_chunked (skip if --skip-chunking)
+        2. Inference: GLiNER detection → entities (skip if --skip-inference)
+        3. LEACE: Masking + projection (skip if --skip-leace)
+        4. Probing: Metrics + visualizations (skip if --skip-probing)
+        
+        Args:
+            input_dataset_path: Path to input Arrow dataset.
+            output_dataset_path: Path to save clean_dataset.arrow.
+            projection_matrix_path: Path to save projection_matrix.pt.
+            pollution_logs_path: Path to save pollution_logs.arrow.
+            config: Pipeline configuration.
+            
+        Returns:
+            Execution metadata dictionary.
+        """
+        logger.info("=" * 80)
+        logger.info("Phase A: HPC Strategy (Four-Stage Execution)")
+        logger.info("=" * 80)
+        
+        # Parse skip flags
+        skip_cfg = SkipStagesConfig.from_config(config)
+        skip_cfg.validate_for_entry()
+        logger.info(f"Skip flags: chunking={skip_cfg.skip_chunking}, inference={skip_cfg.skip_inference}, "
+                   f"leace={skip_cfg.skip_leace}, probing={skip_cfg.skip_probing}")
+        
+        # Validate device
+        device = self._resolve_device(self._cfg_get(config, "gliner.device"))
+        if device != "cuda":
+            raise RuntimeError("HPC strategy requires config gliner.device='cuda'")
+        
+        gliner_batch_size = int(self._cfg_get(config, "gliner.batch_size"))
+        self._last_device = device
+        self._last_batch_size = gliner_batch_size
+        
+        output_dir = output_dataset_path.parent
+        
         # =======================================================================
-        # Step 7: Compute Metrics & Return
+        # Load Dataset
+        # =======================================================================
+        logger.info(f"Loading dataset: {input_dataset_path}")
+        dataset = SOBRDataset(
+            arrow_path=input_dataset_path,
+            seed=int(self._cfg_get(config, "seed")),
+        )
+        table = dataset.table
+        
+        # Optional subset
+        if bool(self._cfg_get(config, "subset.enabled")):
+            size = self._cfg_get(config, "subset.size")
+            if size is not None and len(table) > int(size):
+                rng = np.random.default_rng(int(self._cfg_get(config, "seed")))
+                indices = rng.choice(len(table), size=int(size), replace=False)
+                logger.info(f"Using subset (seeded): {int(size)}/{len(table)} samples")
+                table = table.take(pa.array(indices, type=pa.int64()))
+        
+        posts = table["post"].to_pylist()
+        post_ids = table["post_id"].to_pylist()
+        logger.info(f"Loaded {len(posts)} posts")
+        
+        # =======================================================================
+        # Initialize GLiNER (needed for chunking and inference)
+        # =======================================================================
+        gliner = None
+        inference_labels = None
+        cached_label_embeddings = None
+        taxonomy_config = None
+        
+        if not skip_cfg.skip_leace:  # Need GLiNER if running any stage before probing
+            logger.info("Initializing GLiNER detector")
+            taxonomy_config, constraints_config = self._load_taxonomy_config(config)
+            gliner_cfg = config.get("gliner", {})
+            batch_inference_cfg = gliner_cfg.get("batch_inference", {})
+            chunking_cfg = gliner_cfg.get("chunking", {})
+            
+            batch_config = BatchInferenceConfig(
+                enable_batching=batch_inference_cfg.get("enable_batching", True),
+                batch_size=gliner_batch_size,
+                num_buckets=batch_inference_cfg.get("num_buckets"),
+                min_bucket_size=batch_inference_cfg.get("min_bucket_size", 4),
+                enable_prompt_caching=batch_inference_cfg.get("enable_prompt_caching", True),
+                strict_padding=batch_inference_cfg.get("strict_padding", False),
+                seq_len_buckets=batch_inference_cfg.get("seq_len_buckets"),
+            )
+            
+            budget_config = BudgetConfig(
+                model_max_length=int(self._cfg_get(config, "encoder.max_length")),
+                mode=chunking_cfg.get("mode", "single_sentence"),
+                legacy_sequential_mode=False,
+                parallel_chunking_workers=int(chunking_cfg.get("parallel_chunking_workers", 16)),
+                parallel_chunking_min_texts=int(chunking_cfg.get("parallel_chunking_min_texts", 512)),
+                gliner_max_words=int(gliner_cfg.get("gliner_max_words", 512)),
+                tokens_per_word_ratio=float(gliner_cfg.get("tokens_per_word_ratio", 1.3)),
+            )
+            
+            execution_cfg = config.get("execution", {})
+            
+            gliner = GLiNERDetector(
+                model_name=str(self._cfg_get(config, "gliner.model")),
+                device=device,
+                max_length=int(self._cfg_get(config, "encoder.max_length")),
+                confidence_threshold=float(self._cfg_get(config, "gliner.confidence_threshold")),
+                taxonomy_config=taxonomy_config,
+                constraints_config=constraints_config,
+                budget_config=budget_config,
+                batch_inference_config=batch_config,
+                require_bi_encoder=bool(gliner_cfg.get("require_bi_encoder", False)),
+                execution_config=execution_cfg,
+            )
+            
+            inference_labels = gliner.taxonomy.get_inference_labels()
+            cached_label_embeddings = gliner.get_cached_label_embeddings(inference_labels)
+            if cached_label_embeddings is not None:
+                logger.info(f"Hoisted label embeddings for {len(inference_labels)} labels")
+        
+        # =======================================================================
+        # Stage 1: Chunking
+        # =======================================================================
+        if skip_cfg.skip_chunking:
+            logger.info("Skipping Stage 1 (Chunking) - validating prerequisites")
+            if not is_post_chunked_fully_populated(table):
+                raise RuntimeError("--skip-chunking requires post_chunked column to be fully populated")
+            chunking_ctx = ChunkingContext(
+                table_with_chunks=table,
+                posts=posts,
+                post_ids=post_ids,
+                stage_skipped=True,
+            )
+        else:
+            chunking_ctx = self._run_chunking_stage(
+                input_dataset_path=input_dataset_path,
+                table=table,
+                posts=posts,
+                post_ids=post_ids,
+                gliner=gliner,
+                inference_labels=inference_labels,
+                config=config,
+            )
+        
+        # =======================================================================
+        # Stage 2: Inference
+        # =======================================================================
+        if skip_cfg.skip_inference:
+            logger.info("Skipping Stage 2 (Inference) - loading from disk")
+            inference_ipc_path = output_dir / "inference_results.arrow"
+            if not inference_ipc_path.exists():
+                raise RuntimeError(f"--skip-inference requires {inference_ipc_path} to exist")
+            
+            # Load inference results from disk
+            flattened = flatten_chunks(
+                chunking_ctx.table_with_chunks["post_chunked"],
+                extract_texts=True,
+                include_chunk_metadata=False,
+            )
+            async_storer = AsyncResultStorer(
+                output_path=inference_ipc_path,
+                num_chunks=flattened.num_chunks,
+            )
+            
+            if not async_storer.is_complete:
+                raise RuntimeError("--skip-inference requires complete inference_results.arrow")
+            
+            flat_results = async_storer.load_results_as_flat_list(flattened.num_chunks)
+            chunk_starts = flattened.chunk_starts if flattened.chunk_starts is not None else np.zeros(flattened.num_chunks, dtype=np.int32)
+            
+            from ..semantic_chunker import deduplicate_entities
+            entities_batch = []
+            for doc_idx in range(flattened.num_docs):
+                doc_start = flattened.doc_offsets[doc_idx]
+                doc_end = flattened.doc_offsets[doc_idx + 1]
+                projected_entities = []
+                for flat_idx in range(doc_start, doc_end):
+                    chunk_entities = flat_results[flat_idx]
+                    chunk_offset = int(chunk_starts[flat_idx])
+                    for entity in chunk_entities:
+                        projected = dict(entity)
+                        projected["start"] = projected.get("start", 0) + chunk_offset
+                        projected["end"] = projected.get("end", 0) + chunk_offset
+                        projected_entities.append(projected)
+                entities_batch.append(deduplicate_entities(projected_entities))
+            
+            inference_ctx = InferenceContext(
+                entities_batch=entities_batch,
+                stage_skipped=True,
+                async_storage_path=inference_ipc_path,
+            )
+        else:
+            inference_ctx = self._run_inference_stage(
+                chunking_ctx=chunking_ctx,
+                output_dir=output_dir,
+                gliner=gliner,
+                inference_labels=inference_labels,
+                cached_label_embeddings=cached_label_embeddings,
+                config=config,
+            )
+        
+        # =======================================================================
+        # Stage 3: LEACE
+        # =======================================================================
+        if skip_cfg.skip_leace:
+            logger.info("Skipping Stage 3 (LEACE) - loading projection matrix")
+            if not projection_matrix_path.exists():
+                raise RuntimeError(f"--skip-leace requires {projection_matrix_path} to exist")
+            
+            projection_matrix = torch.load(projection_matrix_path, map_location="cpu")
+            
+            # Load clean dataset if probing is needed
+            probe_embeddings = None
+            table_for_probing = None
+            if not skip_cfg.skip_probing and output_dataset_path.exists():
+                table_for_probing = pa.feather.read_table(output_dataset_path)
+            
+            leace_ctx = LEACEContext(
+                projection_matrix=projection_matrix,
+                masked_texts=[],
+                pollution_logs=[],
+                stage_skipped=True,
+                probe_embeddings=probe_embeddings,
+                table_for_probing=table_for_probing,
+            )
+        else:
+            leace_ctx = self._run_leace_stage(
+                chunking_ctx=chunking_ctx,
+                inference_ctx=inference_ctx,
+                output_dataset_path=output_dataset_path,
+                projection_matrix_path=projection_matrix_path,
+                pollution_logs_path=pollution_logs_path,
+                gliner=gliner,
+                taxonomy_config=taxonomy_config,
+                config=config,
+            )
+        
+        # =======================================================================
+        # Stage 4: Probing
+        # =======================================================================
+        if skip_cfg.skip_probing:
+            logger.info("Skipping Stage 4 (Probing)")
+            probing_ctx = ProbingContext(stage_skipped=True)
+        else:
+            probing_ctx = self._run_probing_stage(
+                leace_ctx=leace_ctx,
+                output_dir=output_dir,
+                config=config,
+            )
+        
+        # =======================================================================
+        # Build Metadata
         # =======================================================================
         metadata: Dict[str, Any] = {
-            "num_samples": len(table_with_chunks),
-            "num_pollution_spans": total_spans,
-            "projection_matrix_shape": list(projection_matrix.shape),
+            "num_samples": len(chunking_ctx.table_with_chunks),
+            "num_pollution_spans": leace_ctx.total_spans,
+            "projection_matrix_shape": list(leace_ctx.projection_matrix.shape),
             "device": device,
             "use_bf16": self.use_bf16,
             "staged_execution": True,
-            "stage1_skipped": stage1_skipped,
-            "stage2_skipped": stage2_skipped if 'stage2_skipped' in dir() else False,
-            "inference_completeness": {
-                "total_docs": len(posts),
-                "total_chunks": flattened.num_chunks,
-                "processed_docs": len(posts) - len(final_skipped),
-                "skipped_docs": len(final_skipped),
-                "skipped_chunks": len(skipped_chunk_indices),
-                "oom_count": inference_oom_count,
-                "final_budget": inference_final_budget,
+            "stages": {
+                "chunking_skipped": chunking_ctx.stage_skipped,
+                "inference_skipped": inference_ctx.stage_skipped,
+                "leace_skipped": leace_ctx.stage_skipped,
+                "probing_skipped": probing_ctx.stage_skipped,
             },
-            "async_storage": {
-                "ipc_path": str(inference_ipc_path),
-                "chunks_recovered": len(completed_chunk_ids),
+            "inference_completeness": {
+                "total_docs": len(chunking_ctx.posts),
+                "skipped_docs": len(inference_ctx.skipped_doc_indices),
+                "oom_count": inference_ctx.oom_count,
+                "final_budget": inference_ctx.final_budget,
             },
         }
         
+        if inference_ctx.async_storage_path:
+            metadata["async_storage"] = {
+                "ipc_path": str(inference_ctx.async_storage_path),
+                "chunks_recovered": inference_ctx.chunks_recovered,
+            }
+        
         # Explicit recall
-        if bool(self._cfg_get(config, "gliner.compute_explicit_recall")):
+        if bool(self._cfg_get(config, "gliner.compute_explicit_recall")) and gliner and not skip_cfg.skip_leace:
             recall = compute_explicit_recall(
-                posts,
-                entities_batch,
+                chunking_ctx.posts,
+                inference_ctx.entities_batch,
                 gliner.taxonomy.get_reference_patterns(),
             )
             metadata["explicit_recall"] = recall
         
-        # Amnesic drop probe with multi-backend benchmarking
-        if probe_enabled and probe_embeddings:
-            logger.info("=" * 60)
-            logger.info("Computing Multi-Backend Probe Metrics (HPC Mode)")
-            logger.info("=" * 60)
-            
-            embeddings_before = torch.cat(probe_embeddings, dim=0)[:max_probe_samples]
-            probe_table = table_with_chunks.slice(0, len(embeddings_before))
-            
-            P_cpu = projection_matrix.detach().to("cpu", dtype=torch.float32)
-            embeddings_after = embeddings_before @ P_cpu.T
-            
-            # Convert to numpy for metrics
-            X_before_np = embeddings_before.numpy()
-            X_after_np = embeddings_after.numpy()
-            
-            # Build ProbeConfig from YAML
-            probe_cfg = config.get("probe", {})
-            probe_config = ProbeConfig(
-                backend=probe_cfg.get("backend", "auto"),
-                max_iter=int(probe_cfg.get("max_iter", 1000)),
-                random_state=int(self._cfg_get(config, "seed")),
-                n_folds=int(probe_cfg.get("n_folds", 5)),
-                pvalue_threshold=float(probe_cfg.get("pvalue_threshold", 0.05)),
-                torch_lr=float(probe_cfg.get("torch_lr", 0.01)),
-                torch_epochs=int(probe_cfg.get("torch_epochs", 100)),
-                torch_batch_size=int(probe_cfg.get("torch_batch_size", 256)),
-                torch_weight_decay=float(probe_cfg.get("torch_weight_decay", 1e-4)),
-                use_class_weights=bool(probe_cfg.get("use_class_weights", True)),
-                benchmark_solvers=bool(probe_cfg.get("benchmark_solvers", True)),
-            )
-            use_kfold = bool(probe_cfg.get("use_kfold", True))
-            
-            by_column: Dict[str, Any] = {}
-            by_column_extended: Dict[str, Any] = {}
-            drops: List[float] = []
-            benchmark_results: Dict[str, Any] = {}
-            separability_before: Dict[str, Any] = {}
-            separability_after: Dict[str, Any] = {}
-            class_imbalance: Dict[str, Any] = {}
-            
-            # Collect all labels for per-column analysis
-            labels_dict: Dict[str, np.ndarray] = {}
-            
-            for col in get_demographic_columns():
-                labels_np = extract_probe_labels(probe_table, col)
-                labels_dict[col] = labels_np
-                labels_t = torch.tensor(labels_np, dtype=torch.long)
-                
-                # Extended amnesic drop with CV
-                logger.info(f"Computing amnesic drop for {col}...")
-                result = compute_amnesic_drop_extended(
-                    embeddings_before,
-                    embeddings_after,
-                    labels_t,
-                    train_split=float(self._cfg_get(config, "probe.train_split")),
-                    random_state=int(self._cfg_get(config, "seed")),
-                    config=probe_config,
-                    use_kfold=use_kfold,
-                    device="cuda" if torch.cuda.is_available() else "cpu",
-                )
-                
-                by_column[col] = {
-                    "accuracy_before": result.acc_before,
-                    "accuracy_after": result.acc_after,
-                    "amnesic_drop": result.amnesic_drop,
-                }
-                by_column_extended[col] = result.to_dict()
-                drops.append(float(result.amnesic_drop))
-                
-                # Embedding separability (silhouette, Davies-Bouldin)
-                separability_before[col] = compute_embedding_separability(
-                    X_before_np, labels_np, sample_size=5000
-                )
-                separability_after[col] = compute_embedding_separability(
-                    X_after_np, labels_np, sample_size=5000
-                )
-                
-                # Class imbalance metrics
-                class_imbalance[col] = compute_class_imbalance_metrics(labels_np)
-                
-                # Solver benchmark for first column (representative)
-                if probe_config.benchmark_solvers and col == get_demographic_columns()[0]:
-                    logger.info(f"Benchmarking solver convergence on {col}...")
-                    valid_mask = labels_np != -1
-                    X_bench = X_before_np[valid_mask]
-                    y_bench = labels_np[valid_mask]
-                    
-                    n = len(X_bench)
-                    train_idx = np.arange(int(n * 0.8))
-                    test_idx = np.arange(int(n * 0.8), n)
-                    
-                    benchmark_results = benchmark_solver_convergence(
-                        X_train=X_bench[train_idx],
-                        y_train=y_bench[train_idx],
-                        X_test=X_bench[test_idx],
-                        y_test=y_bench[test_idx],
-                        config=probe_config,
-                    )
-                    logger.info(f"Solver benchmark: exact={benchmark_results.get('exact_accuracy', 0):.3f}, "
-                               f"torch={benchmark_results.get('torch_accuracy', 0):.3f}, "
-                               f"delta={benchmark_results.get('solver_accuracy_delta', 0):.4f}")
-            
-            # Control probe metrics (cross-column specificity check)
-            # Use first two columns as target/control pair
-            demo_cols = get_demographic_columns()
-            control_probe_results = {}
-            if len(demo_cols) >= 2:
-                target_col = demo_cols[0]
-                control_col = demo_cols[1]
-                logger.info(f"Computing control probe: target={target_col}, control={control_col}")
-                control_probe_results = compute_control_probe_metrics(
-                    embeddings_before=X_before_np,
-                    embeddings_after=X_after_np,
-                    target_labels=labels_dict[target_col],
-                    control_labels=labels_dict[control_col],
-                    control_name=control_col,
-                )
-            
-            min_drop = float(min(drops)) if drops else 0.0
-            mean_drop = float(np.mean(drops)) if drops else 0.0
-            
+        # Add probe metrics
+        if not probing_ctx.stage_skipped:
             metadata["probe"] = {
-                "by_column": by_column,
-                "by_column_extended": by_column_extended,
-                "min_amnesic_drop": min_drop,
-                "mean_amnesic_drop": mean_drop,
+                "by_column": probing_ctx.by_column,
+                "by_column_extended": probing_ctx.by_column_extended,
+                "min_amnesic_drop": probing_ctx.min_amnesic_drop,
+                "mean_amnesic_drop": probing_ctx.mean_amnesic_drop,
                 "threshold": float(self._cfg_get(config, "probe.amnesic_drop_threshold")),
-                "max_samples": len(embeddings_before),
-                "config": {
-                    "backend": probe_config.backend,
-                    "use_kfold": use_kfold,
-                    "n_folds": probe_config.n_folds,
-                    "pvalue_threshold": probe_config.pvalue_threshold,
-                },
             }
-            
-            # Add benchmark results if computed
-            if benchmark_results:
-                metadata["probe"]["solver_benchmark"] = benchmark_results
-            
-            # Add separability metrics
             metadata["separability"] = {
-                "before": separability_before,
-                "after": separability_after,
+                "before": probing_ctx.separability_before,
+                "after": probing_ctx.separability_after,
             }
-            
-            # Add class imbalance metrics
-            metadata["class_imbalance"] = class_imbalance
-            
-            # Add control probe results
-            if control_probe_results:
-                metadata["control_probe"] = control_probe_results
-            
-            logger.info(f"Probe metrics complete: min_drop={min_drop:.2%}, mean_drop={mean_drop:.2%}")
-            
-            if bool(self._cfg_get(config, "quality.enforce_thresholds")):
-                threshold = float(self._cfg_get(config, "probe.amnesic_drop_threshold"))
-                if min_drop < threshold:
-                    raise ValueError(
-                        f"Amnesic drop gate failed: min={min_drop:.3f} < threshold={threshold:.3f}"
-                    )
-            
-            # =======================================================================
-            # Step 8: Generate Visualizations (HPC Mode)
-            # =======================================================================
-            viz_config = config.get("visualization", {})
-            if viz_config.get("enabled", True):
-                logger.info("Generating Phase A visualizations...")
-                reports_dir = output_dataset_path.parent / "reports"
-                reports_dir.mkdir(parents=True, exist_ok=True)
-                
-                try:
-                    from ...evaluation.visualizations_phase_a import (
-                        plot_amnesic_drop_with_ci,
-                        plot_embedding_separability,
-                        plot_probe_learning_curves,
-                        plot_solver_convergence_benchmark,
-                        plot_stratified_confusion_matrices,
-                        plot_specificity_gap,
-                    )
-                    
-                    dpi = int(viz_config.get("figure_dpi", 150))
-                    palette = viz_config.get("color_palette", "husl")
-                    
-                    # Amnesic drop with confidence intervals
-                    if by_column_extended:
-                        plot_amnesic_drop_with_ci(
-                            per_column_results=by_column_extended,
-                            output_path=reports_dir / "amnesic_drop_with_ci.png",
-                            dpi=dpi,
-                            palette=palette,
-                        )
-                    
-                    # Embedding separability (aggregate first column)
-                    first_col = get_demographic_columns()[0]
-                    if first_col in separability_before and first_col in separability_after:
-                        plot_embedding_separability(
-                            separability_before=separability_before[first_col],
-                            separability_after=separability_after[first_col],
-                            output_path=reports_dir / "embedding_separability.png",
-                            dpi=dpi,
-                        )
-                    
-                    # Solver convergence benchmark plot
-                    if benchmark_results and "torch_accuracy" in benchmark_results:
-                        # Generate mock learning curve if we don't have actual one
-                        torch_final = benchmark_results.get("torch_accuracy", 0.5)
-                        # Create convergence curve approximation
-                        epochs = probe_config.torch_epochs
-                        learning_curve = [
-                            torch_final * (1 - 0.5 * np.exp(-i / 20))
-                            for i in range(epochs)
-                        ]
-                        plot_solver_convergence_benchmark(
-                            benchmark_results=benchmark_results,
-                            learning_curve_torch=learning_curve,
-                            output_path=reports_dir / "solver_convergence_benchmark.png",
-                            dpi=dpi,
-                        )
-                    
-                    # Specificity gap (target vs control)
-                    if control_probe_results and "error" not in control_probe_results:
-                        target_results = control_probe_results.get("target", {})
-                        control_key = [k for k in control_probe_results if k.startswith("control_")]
-                        if target_results and control_key:
-                            plot_specificity_gap(
-                                target_results={
-                                    "acc_before": target_results.get("acc_before", 0.5),
-                                    "acc_after": target_results.get("acc_after", 0.5),
-                                },
-                                control_results={
-                                    "acc_before": control_probe_results[control_key[0]].get("acc_before", 0.5),
-                                    "acc_after": control_probe_results[control_key[0]].get("acc_after", 0.5),
-                                },
-                                target_name=demo_cols[0],
-                                control_name=demo_cols[1] if len(demo_cols) > 1 else "control",
-                                output_path=reports_dir / "specificity_gap.png",
-                                dpi=dpi,
-                                palette=palette,
-                            )
-                    
-                    logger.info(f"Visualizations saved to: {reports_dir}")
-                    metadata["reports_dir"] = str(reports_dir)
-                    
-                except Exception as viz_error:
-                    logger.warning(f"Visualization generation failed: {viz_error}")
-                    metadata["visualization_error"] = str(viz_error)
+            metadata["class_imbalance"] = probing_ctx.class_imbalance
+            if probing_ctx.control_probe_results:
+                metadata["control_probe"] = probing_ctx.control_probe_results
+            if probing_ctx.benchmark_results:
+                metadata["probe"]["solver_benchmark"] = probing_ctx.benchmark_results
+            if probing_ctx.reports_dir:
+                metadata["reports_dir"] = str(probing_ctx.reports_dir)
         
         logger.info("Phase A complete!")
         return metadata
