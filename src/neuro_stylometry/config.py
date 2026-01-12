@@ -474,5 +474,57 @@ def load_pipeline_config(
     # Validate if requested
     if validate:
         validate_pipeline_config(merged)
-    
+
+    return merged
+
+
+def load_phase_d_config(
+    *,
+    mode: Literal["auto", "laptop", "hpc"] = "laptop",
+    experiment_config_path: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """
+    Load Phase D training configuration from YAML.
+
+    Merge order: base/phase_d.yaml -> {mode}/phase_d.yaml -> experiment config
+
+    Args:
+        mode: Hardware mode ("auto", "laptop", or "hpc").
+        experiment_config_path: Optional experiment YAML to merge.
+
+    Returns:
+        Resolved configuration dictionary.
+
+    Raises:
+        FileNotFoundError: If base Phase D config not found.
+    """
+    repo_root = Path(__file__).resolve().parents[2]
+
+    if mode == "auto":
+        from .hardware_ops.detection import HardwareDetector
+        profile = HardwareDetector.detect()
+        mode = "hpc" if profile.profile_type.value.lower() == "hpc" else "laptop"
+
+    # Load base Phase D config
+    base_config_path = repo_root / "conf" / "base" / "phase_d.yaml"
+    if not base_config_path.exists():
+        raise FileNotFoundError(f"Base Phase D config not found: {base_config_path}")
+
+    base_config = OmegaConf.load(base_config_path)
+
+    # Load mode-specific Phase D config
+    mode_config_path = repo_root / "conf" / mode / "phase_d.yaml"
+    if mode_config_path.exists():
+        mode_config = OmegaConf.load(mode_config_path)
+        base_config = OmegaConf.merge(base_config, mode_config)
+
+    # Merge experiment config if provided
+    if experiment_config_path:
+        exp_config = OmegaConf.load(experiment_config_path)
+        base_config = OmegaConf.merge(base_config, exp_config)
+
+    merged = OmegaConf.to_container(base_config, resolve=True)
+    if not isinstance(merged, dict):
+        raise TypeError("Loaded config did not resolve to a mapping")
+
     return merged

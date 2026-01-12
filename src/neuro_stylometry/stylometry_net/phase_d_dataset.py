@@ -63,7 +63,14 @@ class PhaseDDataset(Dataset):
 
         table = feather.read_table(self.arrow_path, memory_map=True)
         if split is not None:
+            # Check if split column exists and has valid values
+            has_valid_split = False
             if "split" in table.column_names:
+                split_values = table["split"]
+                non_null_count = pc.sum(pc.is_valid(split_values)).as_py()
+                has_valid_split = non_null_count > 0
+
+            if has_valid_split:
                 mask = pc.equal(table["split"], split)
                 table = table.filter(mask)
             elif "author_id" in table.column_names:

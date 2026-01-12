@@ -1,0 +1,116 @@
+{
+  "baseline": {
+    "test": {
+      "birth_year": {
+        "accuracy": 0.0,
+        "f1_macro": 0.0
+      },
+      "female": {
+        "accuracy": 1.0,
+        "f1_macro": 1.0
+      },
+      "nationality": {
+        "accuracy": 0.0,
+        "f1_macro": 0.0
+      },
+      "political_leaning": {
+        "accuracy": 0.0,
+        "f1_macro": 0.0
+      },
+      "extrovert": {
+        "accuracy": 0.0,
+        "f1_macro": 0.0
+      },
+      "sensing": {
+        "accuracy": 0.0,
+        "f1_macro": 0.0
+      },
+      "feeling": {
+        "accuracy": 0.0,
+        "f1_macro": 0.0
+      },
+      "judging": {
+        "accuracy": 0.0,
+        "f1_macro": 0.0
+      }
+    }
+  },
+  "constrained": {
+    "test": {
+      "birth_year": {
+        "accuracy": 0.0,
+        "f1_macro": 0.0
+      },
+      "female": {
+        "accuracy": 1.0,
+        "f1_macro": 1.0
+      },
+      "nationality": {
+        "accuracy": 0.0,
+        "f1_macro": 0.0
+      },
+      "political_leaning": {
+        "accuracy": 0.0,
+        "f1_macro": 0.0
+      },
+      "extrovert": {
+        "accuracy": 0.0,
+        "f1_macro": 0.0
+      },
+      "sensing": {
+        "accuracy": 0.0,
+        "f1_macro": 0.0
+      },
+      "feeling": {
+        "accuracy": 0.0,
+        "f1_macro": 0.0
+      },
+      "judging": {
+        "accuracy": 0.0,
+        "f1_macro": 0.0
+      }
+    }
+  },
+  "delta": {
+    "birth_year": {
+      "accuracy_delta": 0.0,
+      "baseline_accuracy": 0.0,
+      "constrained_accuracy": 0.0
+    },
+    "female": {
+      "accuracy_delta": 0.0,
+      "baseline_accuracy": 1.0,
+      "constrained_accuracy": 1.0
+    },
+    "nationality": {
+      "accuracy_delta": 0.0,
+      "baseline_accuracy": 0.0,
+      "constrained_accuracy": 0.0
+    },
+    "political_leaning": {
+      "accuracy_delta": 0.0,
+      "baseline_accuracy": 0.0,
+      "constrained_accuracy": 0.0
+    },
+    "extrovert": {
+      "accuracy_delta": 0.0,
+      "baseline_accuracy": 0.0,
+      "constrained_accuracy": 0.0
+    },
+    "sensing": {
+      "accuracy_delta": 0.0,
+      "baseline_accuracy": 0.0,
+      "constrained_accuracy": 0.0
+    },
+    "feeling": {
+      "accuracy_delta": 0.0,
+      "baseline_accuracy": 0.0,
+      "constrained_accuracy": 0.0
+    },
+    "judging": {
+      "accuracy_delta": 0.0,
+      "baseline_accuracy": 0.0,
+      "constrained_accuracy": 0.0
+    }
+  }
+}

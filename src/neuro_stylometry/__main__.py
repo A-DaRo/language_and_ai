@@ -318,7 +318,7 @@ def validate_handover(artifacts_dir: Path):
     "--dataset",
     type=click.Path(exists=True, path_type=Path),
     required=True,
-    help="Path to Phase D dataset (e.g., artifacts/phase_a/clean_dataset.arrow)",
+    help="Path to clean_dataset.arrow from Phase A",
 )
 @click.option(
     "--output-dir",
@@ -329,144 +329,52 @@ def validate_handover(artifacts_dir: Path):
 @click.option(
     "--artifacts-dir",
     type=click.Path(exists=True, path_type=Path),
-    default=Path("artifacts/phase_a"),
-    show_default=True,
-    help="Phase A artifacts directory containing projection_matrix.pt",
+    required=True,
+    help="Phase A artifacts directory (contains projection_matrix.pt)",
 )
 @click.option(
-    "--model-name",
-    default="roberta-base",
-    show_default=True,
-    help="Base Hugging Face model for Phase D",
+    "--mode",
+    type=click.Choice(["laptop", "hpc"]),
+    default="laptop",
+    help="Hardware mode (laptop or hpc)",
 )
 @click.option(
-    "--taxonomy-path",
-    type=click.Path(exists=True, dir_okay=False, path_type=Path),
-    default=Path("conf/base/gliner_taxonomy.yaml"),
-    show_default=True,
-    help="GLiNER taxonomy path for mask-token alignment",
-)
-@click.option(
-    "--max-length",
-    default=512,
-    show_default=True,
-    help="Tokenizer max length for Phase D",
-)
-@click.option(
-    "--batch-size",
-    default=8,
-    show_default=True,
-    help="Training batch size",
-)
-@click.option(
-    "--num-epochs",
-    default=1,
-    show_default=True,
-    help="Number of training epochs",
-)
-@click.option(
-    "--max-steps",
-    type=int,
+    "--config",
+    "config_path",
+    type=click.Path(exists=True, path_type=Path),
     default=None,
-    help="Optional max training steps per run",
-)
-@click.option(
-    "--learning-rate",
-    default=2e-5,
-    show_default=True,
-    help="AdamW learning rate",
-)
-@click.option(
-    "--save-every-steps",
-    type=int,
-    default=None,
-    help="Checkpoint cadence in steps (optional)",
-)
-@click.option(
-    "--save-every-epochs",
-    type=int,
-    default=None,
-    help="Checkpoint cadence in epochs (optional)",
-)
-@click.option(
-    "--split-ratios",
-    default="0.8,0.1,0.1",
-    show_default=True,
-    help="Train/val/test ratios for author-stratified split when split column missing",
-)
-@click.option(
-    "--use-affine-guard/--no-affine-guard",
-    default=True,
-    show_default=True,
-    help="Enable Affine Guard projection with Phase A matrix",
-)
-@click.option(
-    "--dry-run",
-    is_flag=True,
-    help="Initialize model + tokenizer and exit without training",
+    help="Optional experiment config to override defaults",
 )
 def run_phase_d(
     dataset: Path,
     output_dir: Path,
     artifacts_dir: Path,
-    model_name: str,
-    taxonomy_path: Path,
-    max_length: int,
-    batch_size: int,
-    num_epochs: int,
-    max_steps: int | None,
-    learning_rate: float,
-    save_every_steps: int | None,
-    save_every_epochs: int | None,
-    split_ratios: str,
-    use_affine_guard: bool,
-    dry_run: bool,
+    mode: str,
+    config_path: Path | None,
 ):
-    """Train baseline vs constrained Phase D models."""
-    from .training.trainer import PhaseDTrainConfig, PhaseDTrainer
+    """Train Phase D baseline and constrained models."""
+    from .phase_d_pipeline import run_phase_d_training
 
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    ratio_parts = [p.strip() for p in split_ratios.split(",") if p.strip()]
-    if len(ratio_parts) != 3:
-        raise click.ClickException("--split-ratios must have three comma-separated values")
     try:
-        train_ratio, val_ratio, test_ratio = (float(part) for part in ratio_parts)
-    except ValueError as exc:
-        raise click.ClickException("--split-ratios must be numeric values") from exc
+        results = run_phase_d_training(
+            dataset_path=dataset,
+            output_dir=output_dir,
+            artifacts_dir=artifacts_dir,
+            mode=mode,
+            config_path=config_path,
+        )
 
-    config = PhaseDTrainConfig(
-        dataset_path=dataset,
-        artifacts_dir=artifacts_dir,
-        output_dir=output_dir,
-        model_name=model_name,
-        taxonomy_path=taxonomy_path,
-        max_length=max_length,
-        batch_size=batch_size,
-        num_epochs=num_epochs,
-        max_steps=max_steps,
-        learning_rate=learning_rate,
-        save_every_steps=save_every_steps,
-        save_every_epochs=save_every_epochs,
-        split_ratios={"train": train_ratio, "val": val_ratio, "test": test_ratio},
-    )
+        click.echo("\n" + "=" * 80)
+        click.echo("PHASE D TRAINING COMPLETE")
+        click.echo("=" * 80)
+        click.echo(f"\nOutput directory: {output_dir}")
+        click.echo(f"  - Baseline: {output_dir}/baseline")
+        click.echo(f"  - Constrained: {output_dir}/constrained")
+        click.echo(f"  - Comparative metrics: {output_dir}/phase_d_comparative_metrics.json")
 
-    trainer = PhaseDTrainer(config)
-
-    if dry_run:
-        click.echo("Phase D dry run: training setup initialized.")
-        click.echo(f"Dataset: {dataset}")
-        click.echo(f"Artifacts dir: {artifacts_dir}")
-        click.echo(f"Output dir: {output_dir}")
-        click.echo(f"Model: {model_name}")
-        click.echo(f"Batch size: {batch_size}, epochs: {num_epochs}")
-        return
-
-    click.echo("Starting Phase D baseline vs constrained training...")
-    if not use_affine_guard:
-        click.echo("Warning: --no-affine-guard disables constrained training.")
-    trainer.train_baseline_and_constrained(use_affine_guard=use_affine_guard)
-    click.echo("Phase D training complete.")
+    except Exception as e:
+        logger.error(f"Phase D training failed: {e}", exc_info=True)
+        raise click.ClickException(str(e))
 
 
 @cli.command("verify")

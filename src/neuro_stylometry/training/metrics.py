@@ -50,6 +50,13 @@ def compute_task_metrics(
     num_classes: int,
     ignore_index: int = -1,
 ) -> Dict[str, float]:
+    # Handle empty tensors (no valid samples for this task)
+    if logits.numel() == 0 or labels.numel() == 0:
+        return {
+            "accuracy": 0.0,
+            "f1_macro": 0.0,
+        }
+
     preds = torch.argmax(logits, dim=-1)
     return {
         "accuracy": compute_accuracy(preds, labels, ignore_index=ignore_index),

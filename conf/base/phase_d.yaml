@@ -1,0 +1,64 @@
+# Phase D Training Configuration (Base)
+
+phase_d:
+  experiment_name: "phase_d_baseline"
+  seed: 1337
+
+# Model configuration
+model:
+  name: "roberta-base"
+  max_length: 512
+  taxonomy_path: "conf/base/gliner_taxonomy.yaml"
+
+# Data configuration
+data:
+  # Will be overridden by CLI args
+  dataset_path: "artifacts/data/output/clean_dataset.arrow"
+  artifacts_dir: "artifacts/data/output"
+
+  # Split configuration
+  use_split_column: true  # Use existing 'split' column if present
+  split_ratios:
+    train: 0.8
+    val: 0.1
+    test: 0.1
+  split_seed: 42
+
+  # Demographic label fields (from SOBR schema)
+  label_fields:
+    - female
+    - birth_year
+    - nationality
+    - political_leaning
+    - extrovert
+    - sensing
+    - feeling
+    - judging
+
+# Training configuration
+training:
+  num_epochs: 3
+  batch_size: 8
+  learning_rate: 2e-5
+
+  # For testing/debugging
+  max_steps: null  # null means run full epochs
+
+  # Checkpointing
+  save_every_steps: null
+  save_every_epochs: 1  # Save after each epoch
+
+  # Device
+  device: "auto"  # auto, cuda, cpu
+
+# Evaluation
+evaluation:
+  eval_on_val: true
+  eval_on_test: true
+  eval_every_epochs: 1
+
+# Output
+output:
+  save_model: true
+  save_logs: true
+  save_metrics: true

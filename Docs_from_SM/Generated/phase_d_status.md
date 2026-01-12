@@ -1,19 +1,49 @@
 # Phase D Status Report (Implementation Snapshot)
 
-**Document Type:** Status + Gap Analysis  
-**Scope:** Phase D (Neural Stylometry)  
-**Context:** Phase A artifacts available under `artifacts/phase_a/`  
-**Last Updated:** 2026-01-xx  
+**Document Type:** Status + Gap Analysis
+**Scope:** Phase D (Neural Stylometry)
+**Context:** Phase A artifacts available under `artifacts/phase_a/`
+**Last Updated:** 2026-01-12  
 
 ---
 
 ## 1. Executive Summary
 
-Phase D is now partially implemented beyond the original stubs. The core model wrapper, Affine Guard injection, tokenizer alignment, dataset loading, baseline vs constrained training loop, checkpointing, metrics reporting, and CHG/SVS verification entry points are in place. The remaining work is primarily in evaluation/reporting, richer training utilities, and full CHG/SVS rigor.
+Phase D is now fully implemented for Track A (training pipeline) with configuration-driven architecture. The core model wrapper, Affine Guard injection, tokenizer alignment, dataset loading, baseline vs constrained training loop, checkpointing, metrics reporting, and CHG/SVS verification entry points are in place. The pipeline now uses YAML-based configuration with mode-specific overrides (laptop/HPC), providing a clean separation between configuration and execution. The remaining work is primarily in evaluation/reporting (Track B), HPC optimization, and full CHG/SVS rigor.
 
 ---
 
 ## 2. Implemented in This Update (Chat Session Summary)
+
+### 2.0 Configuration System (NEW - January 2026)
+
+**Files:**
+- `conf/base/phase_d.yaml` - Base Phase D configuration
+- `conf/laptop/phase_d.yaml` - Laptop-specific overrides
+- `src/neuro_stylometry/config.py` - Configuration loading with `load_phase_d_config()`
+- `src/neuro_stylometry/phase_d_pipeline.py` - Training orchestrator
+
+**What it does:**
+- YAML-based configuration with mode-specific overrides (base → laptop/hpc → experiment)
+- Orchestrates training of both baseline and constrained models
+- Provides comparative metrics and summary reporting
+- Supports split column detection with fallback to author-stratified split
+- Configurable training parameters (epochs, batch size, learning rate, checkpointing)
+
+**Configuration Merge Order:**
+1. `conf/base/phase_d.yaml` - Base defaults
+2. `conf/{mode}/phase_d.yaml` - Mode-specific (laptop/hpc)
+3. Optional experiment config - User overrides
+
+**Why it matters:**
+Provides clean separation between configuration and execution, making it easy to switch between laptop and HPC modes, run experiments with different hyperparameters, and maintain reproducible training configurations.
+
+**Artifacts per pipeline run:**
+- `baseline/` directory with baseline model artifacts
+- `constrained/` directory with constrained model artifacts
+- `phase_d_comparative_metrics.json` - Comparative summary with accuracy deltas
+
+---
 
 ### 2.1 Tokenizer Alignment (Phase A Compatibility)
 
@@ -81,26 +111,43 @@ Ensures `[MASK:*]` tokens from Phase A remain single tokens in Phase D.
 
 ---
 
-### 2.5 CLI Wiring
+### 2.5 CLI Wiring (UPDATED - January 2026)
 
 **Files:**
 - `src/neuro_stylometry/__main__.py`
 
-**Run Phase D:**
-```
+**Run Phase D (New Config-Driven Approach):**
+```bash
 python -m neuro_stylometry run-phase-d \
-  --dataset artifacts/phase_a/clean_dataset.arrow \
+  --dataset artifacts/data/output/clean_dataset.arrow \
   --output-dir artifacts/phase_d \
-  --artifacts-dir artifacts/phase_a
+  --artifacts-dir artifacts/data/output \
+  --mode laptop
+```
+
+**Optional experiment config override:**
+```bash
+python -m neuro_stylometry run-phase-d \
+  --dataset artifacts/data/output/clean_dataset.arrow \
+  --output-dir artifacts/phase_d \
+  --artifacts-dir artifacts/data/output \
+  --mode laptop \
+  --config experiments/custom_phase_d.yaml
 ```
 
 **Verification:**
-```
+```bash
 python -m neuro_stylometry verify \
   --dataset artifacts/phase_a/clean_dataset.arrow \
   --phase-d-dir artifacts/phase_d \
   --output-dir artifacts/phase_d/chg
 ```
+
+**Key Changes:**
+- Simplified CLI with mode-based configuration loading
+- All hyperparameters now controlled via YAML configuration files
+- Removed individual parameter flags in favor of clean config files
+- CLI paths now point to actual Phase A output location (`artifacts/data/output/`)
 
 ---
 
@@ -129,6 +176,8 @@ python -m neuro_stylometry verify \
 
 | Area | Status | Notes |
 |------|--------|-------|
+| **Configuration System** | ✅ **NEW** | **YAML-based config with mode overrides (laptop/HPC)** |
+| **Pipeline Orchestrator** | ✅ **NEW** | **Trains both baseline + constrained with comparative metrics** |
 | Tokenizer alignment | ✅ | Mask tokens from taxonomy, enforced single-token |
 | Affine Guard | ✅ | Projection matrix buffer, frozen by default |
 | Transformer wrapper | ✅ | Injects guard after embeddings |
@@ -137,30 +186,30 @@ python -m neuro_stylometry verify \
 | Metrics | ✅ | Per-task accuracy and macro‑F1 |
 | CHG verifier | ✅ (proxy) | Lightweight gate learning |
 | SVS | ✅ (heuristic) | Function vs content mass |
-| CLI wiring | ✅ | run‑phase‑d + verify |
+| CLI wiring | ✅ **UPDATED** | **Config-driven run-phase-d + verify** |
 
 ### 3.2 Known Limitations / Improvements
 
-1. **CHG is proxy‑based**
+1. **HPC configuration not yet finalized**
+   - Laptop config exists and tested, HPC config needs tuning.
+   - Improvement: add `conf/hpc/phase_d.yaml` with appropriate batch sizes and precision settings.
+
+2. **CHG is proxy‑based**
    - Current gate learning scales loss by mean gate value.
    - Does not re‑run with gated attention outputs.
    - Improvement: implement true attention‑head gating forward pass.
 
-2. **SVS is heuristic**
+3. **SVS is heuristic**
    - Uses a fixed function‑word list and CLS attention.
    - Improvement: use POS tagging or expanded function‑word lexicon.
 
-3. **Evaluation on validation split only**
-   - Currently uses `split=val` if present.
-   - Improvement: add test split evaluation and report both.
+4. **Test set evaluation present but basic**
+   - Pipeline evaluates on test set and reports metrics.
+   - Improvement: add richer analysis (confusion matrices, per-attribute breakdowns).
 
-4. **Training utilities are minimal**
+5. **Training utilities are minimal**
    - No scheduler/warmup, no AMP, no gradient accumulation.
    - Improvement: wire precision management + scheduler in training.
-
-5. **No top‑level metrics aggregation**
-   - Baseline and constrained metrics saved separately.
-   - Improvement: aggregate into `artifacts/phase_d/phase_d_metrics.json`.
 
 ---
 
@@ -221,20 +270,71 @@ python -m neuro_stylometry verify \
 
 ## 6. Quick Reference (Current CLI Usage)
 
-**Train baseline + constrained:**
-```
+**Train baseline + constrained (laptop mode):**
+```bash
 python -m neuro_stylometry run-phase-d \
-  --dataset artifacts/phase_a/clean_dataset.arrow \
+  --dataset artifacts/data/output/clean_dataset.arrow \
   --output-dir artifacts/phase_d \
-  --artifacts-dir artifacts/phase_a
+  --artifacts-dir artifacts/data/output \
+  --mode laptop
 ```
 
-**Verify CHG + SVS:**
+**Train with custom experiment config:**
+```bash
+python -m neuro_stylometry run-phase-d \
+  --dataset artifacts/data/output/clean_dataset.arrow \
+  --output-dir artifacts/phase_d \
+  --artifacts-dir artifacts/data/output \
+  --mode laptop \
+  --config experiments/my_config.yaml
 ```
+
+**Expected outputs:**
+- `artifacts/phase_d/baseline/` - Baseline model artifacts (model.pt, head.pt, training_log.jsonl, test_metrics.json)
+- `artifacts/phase_d/constrained/` - Constrained model artifacts (same structure)
+- `artifacts/phase_d/phase_d_comparative_metrics.json` - Comparative summary with accuracy deltas
+
+**Verify CHG + SVS:**
+```bash
 python -m neuro_stylometry verify \
-  --dataset artifacts/phase_a/clean_dataset.arrow \
+  --dataset artifacts/data/output/clean_dataset.arrow \
   --phase-d-dir artifacts/phase_d \
   --output-dir artifacts/phase_d/chg
+```
+
+---
+
+## 7. Configuration Files Reference
+
+**Base Configuration:** `conf/base/phase_d.yaml`
+- Defines all training parameters with sensible defaults
+- Includes model configuration (roberta-base, max_length=512)
+- Specifies demographic label fields to predict
+- Sets evaluation and output options
+
+**Laptop Configuration:** `conf/laptop/phase_d.yaml`
+- Overrides for resource-constrained environments
+- Reduced epochs (2 instead of 3)
+- Smaller batch size (4 instead of 8)
+
+**HPC Configuration:** `conf/hpc/phase_d.yaml` (TODO)
+- Will include larger batch sizes
+- Mixed precision training
+- Multi-GPU support
+
+**Creating Custom Experiment Configs:**
+```yaml
+# experiments/my_experiment.yaml
+training:
+  num_epochs: 5
+  batch_size: 16
+  learning_rate: 3e-5
+
+data:
+  split_ratios:
+    train: 0.7
+    val: 0.15
+    test: 0.15
 ```
 
 ---

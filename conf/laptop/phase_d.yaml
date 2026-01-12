@@ -1,0 +1,8 @@
+# Phase D Training Configuration (Laptop Overrides)
+
+# Laptop-specific overrides for smaller-scale training
+
+training:
+  num_epochs: 2  # Shorter for testing
+  batch_size: 4  # Smaller batch for laptop
+  max_steps: null  # Run full epochs even on laptop

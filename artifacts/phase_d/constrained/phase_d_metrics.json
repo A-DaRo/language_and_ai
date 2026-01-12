@@ -1,0 +1,34 @@
+{
+  "birth_year": {
+    "accuracy": 0.0,
+    "f1_macro": 0.0
+  },
+  "extrovert": {
+    "accuracy": 0.0,
+    "f1_macro": 0.0
+  },
+  "feeling": {
+    "accuracy": 0.0,
+    "f1_macro": 0.0
+  },
+  "female": {
+    "accuracy": 1.0,
+    "f1_macro": 1.0
+  },
+  "judging": {
+    "accuracy": 0.0,
+    "f1_macro": 0.0
+  },
+  "nationality": {
+    "accuracy": 0.0,
+    "f1_macro": 0.0
+  },
+  "political_leaning": {
+    "accuracy": 0.0,
+    "f1_macro": 0.0
+  },
+  "sensing": {
+    "accuracy": 0.0,
+    "f1_macro": 0.0
+  }
+}
