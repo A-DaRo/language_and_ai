@@ -18,7 +18,6 @@ from ..hardware_ops.oom_guard import execute_with_oom_protection
 from ..hardware_ops.runtime import RuntimeController
 from ..hardware_ops.telemetry import CUDATimer, TelemetryCollector, create_runtime_metrics
 from ..data_engine.schemas import get_demographic_columns
-from ..data_engine.bucketing import SortishBatchSampler
 from ..stylometry_net.classification_head import MultiTaskHead
 from ..stylometry_net.phase_d_dataset import (
     PhaseDBudgetedBatchSampler,
@@ -80,8 +79,6 @@ class PhaseDTrainer:
         self._dynamic_batching_enabled = bool(
             self._dynamic_batching_cfg.get("enabled", self._autotuning_enabled)
         )
-        self._bucketing_cfg = self._execution_config.get("bucketing", {})
-        self._bucketing_enabled = bool(self._bucketing_cfg.get("enabled", False))
         self._telemetry_enabled = bool(
             self._execution_config.get("telemetry", {}).get("enabled", False)
             or self._autotuning_enabled
@@ -89,11 +86,6 @@ class PhaseDTrainer:
         self._telemetry = TelemetryCollector.get_instance() if self._telemetry_enabled else None
         self._static_token_budget = int(self.config.batch_size * self.config.max_length)
         self._precision = str(self.config.precision or "fp32").lower()
-        self._pin_memory = bool(
-            self._execution_config.get("data_loader", {}).get(
-                "pin_memory", self.device.type == "cuda"
-            )
-        )
 
     def _build_loader(
         self,
@@ -103,7 +95,6 @@ class PhaseDTrainer:
         split: Optional[str] = None,
         shuffle: bool = False,
         enable_dynamic_batching: bool = False,
-        enable_bucketing: bool = False,
     ) -> tuple[DataLoader, PhaseDLabelMaps]:
         dataset = PhaseDDataset(
             self.config.dataset_path,
@@ -136,46 +127,7 @@ class PhaseDTrainer:
             loader_kwargs["persistent_workers"] = persistent_workers
             loader_kwargs["prefetch_factor"] = prefetch_factor
 
-        if enable_bucketing and self._bucketing_enabled:
-            length_column = str(self._bucketing_cfg.get("length_column", "token_count"))
-            length_scale = float(self._bucketing_cfg.get("length_scale", 1.0))
-            batch_size = int(self._bucketing_cfg.get("batch_size", self.config.batch_size))
-            mega_batch_mult = int(self._bucketing_cfg.get("mega_batch_mult", 100))
-            shuffle_batches = bool(self._bucketing_cfg.get("shuffle", shuffle))
-            drop_last = bool(self._bucketing_cfg.get("drop_last", False))
-            seed = int(self._bucketing_cfg.get("seed", 42))
-
-            lengths = dataset.get_length_array(length_column)
-            if lengths is None:
-                lengths = []
-                for index in range(len(dataset)):
-                    cached = dataset.get_length(index, length_column)
-                    if cached is None:
-                        text = dataset.get_text(index)
-                        cached = tokenizer.estimate_length(text)
-                    scaled = max(1, int(cached * length_scale))
-                    lengths.append(min(scaled, int(self.config.max_length)))
-            else:
-                lengths = [
-                    min(max(1, int(value * length_scale)), int(self.config.max_length))
-                    for value in lengths
-                ]
-
-            batch_sampler = SortishBatchSampler(
-                lengths,
-                batch_size=batch_size,
-                mega_batch_mult=mega_batch_mult,
-                shuffle=shuffle_batches,
-                seed=seed,
-                drop_last=drop_last,
-            )
-            loader = DataLoader(
-                dataset,
-                batch_sampler=batch_sampler,
-                collate_fn=collator,
-                **loader_kwargs,
-            )
-        elif enable_dynamic_batching and self._dynamic_batching_enabled:
+        if enable_dynamic_batching and self._dynamic_batching_enabled:
             max_batch_size = int(
                 self._dynamic_batching_cfg.get("max_batch_size", self.config.batch_size)
             )
@@ -272,12 +224,9 @@ class PhaseDTrainer:
         task_labels: Dict[str, list[torch.Tensor]] = {k: [] for k in num_classes}
 
         for batch in loader:
-            input_ids = batch["input_ids"].to(self.device, non_blocking=self._pin_memory)
-            attention_mask = batch["attention_mask"].to(self.device, non_blocking=self._pin_memory)
-            labels = {
-                k: v.to(self.device, non_blocking=self._pin_memory)
-                for k, v in batch["labels"].items()
-            }
+            input_ids = batch["input_ids"].to(self.device)
+            attention_mask = batch["attention_mask"].to(self.device)
+            labels = {k: v.to(self.device) for k, v in batch["labels"].items()}
 
             autocast_ctx = (
                 torch.autocast(device_type="cuda", dtype=torch.bfloat16)
@@ -325,12 +274,9 @@ class PhaseDTrainer:
         task_labels: Dict[str, list[torch.Tensor]] = {k: [] for k in num_classes}
 
         for batch in loader:
-            input_ids = batch["input_ids"].to(self.device, non_blocking=self._pin_memory)
-            attention_mask = batch["attention_mask"].to(self.device, non_blocking=self._pin_memory)
-            labels = {
-                k: v.to(self.device, non_blocking=self._pin_memory)
-                for k, v in batch["labels"].items()
-            }
+            input_ids = batch["input_ids"].to(self.device)
+            attention_mask = batch["attention_mask"].to(self.device)
+            labels = {k: v.to(self.device) for k, v in batch["labels"].items()}
 
             autocast_ctx = (
                 torch.autocast(device_type="cuda", dtype=torch.bfloat16)
@@ -388,9 +334,6 @@ class PhaseDTrainer:
         log_path = run_dir / "training_log.jsonl"
         metrics_path = run_dir / "phase_d_metrics.json"
         checkpoint_path = run_dir / "checkpoint.pt"
-        telemetry_cfg = self._execution_config.get("telemetry", {})
-        telemetry_every = int(telemetry_cfg.get("sample_every", 1))
-        telemetry_sync = bool(telemetry_cfg.get("synchronize", True))
         model.train()
         head.train()
 
@@ -438,19 +381,12 @@ class PhaseDTrainer:
                 batch_sampler.set_epoch(epoch)
             progress = tqdm(loader, desc=f"Epoch {epoch + 1}", leave=False)
             for batch in progress:
-                input_ids = batch["input_ids"].to(self.device, non_blocking=self._pin_memory)
-                attention_mask = batch["attention_mask"].to(self.device, non_blocking=self._pin_memory)
-                labels = {
-                    k: v.to(self.device, non_blocking=self._pin_memory)
-                    for k, v in batch["labels"].items()
-                }
+                input_ids = batch["input_ids"].to(self.device)
+                attention_mask = batch["attention_mask"].to(self.device)
+                labels = {k: v.to(self.device) for k, v in batch["labels"].items()}
 
+                tokens = int(attention_mask.sum().item())
                 batch_size = int(attention_mask.size(0))
-                do_sample = (
-                    self._telemetry_enabled
-                    and telemetry_every > 0
-                    and (step % telemetry_every == 0)
-                )
 
                 def handle_oom(_event) -> None:
                     nonlocal accum_counter
@@ -459,11 +395,7 @@ class PhaseDTrainer:
 
                 def run_step() -> tuple[Optional[float], bool]:
                     nonlocal accum_counter, optimizer_step
-                    timer_ctx = (
-                        CUDATimer(synchronize=telemetry_sync)
-                        if do_sample
-                        else nullcontext()
-                    )
+                    timer_ctx = CUDATimer() if self._telemetry_enabled else nullcontext()
                     with timer_ctx as timer:
                         autocast_ctx = (
                             torch.autocast(device_type="cuda", dtype=torch.bfloat16)
@@ -493,8 +425,7 @@ class PhaseDTrainer:
                             accum_counter = 0
                             did_step = True
 
-                    if do_sample and self._telemetry is not None and timer is not None:
-                        tokens = int(attention_mask.sum().item())
+                    if self._telemetry_enabled and self._telemetry is not None and timer is not None:
                         self._telemetry.record_batch(
                             batch_size=batch_size,
                             tokens=tokens,
