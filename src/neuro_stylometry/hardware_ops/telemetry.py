@@ -74,25 +74,30 @@ class CUDATimer:
         self._cpu_end: float = 0.0
     
     def __enter__(self) -> CUDATimer:
+        self._cpu_start = time.perf_counter()
         if self._use_cuda:
             if self.synchronize:
                 torch.cuda.synchronize()
             self._start_event = torch.cuda.Event(enable_timing=True)
             self._end_event = torch.cuda.Event(enable_timing=True)
             self._start_event.record()
-        else:
-            self._cpu_start = time.perf_counter()
         return self
     
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self._cpu_end = time.perf_counter()
         if self._use_cuda:
-            self._end_event.record()
-            if self.synchronize:
-                torch.cuda.synchronize()
-            self._elapsed_ms = self._start_event.elapsed_time(self._end_event)
-        else:
-            self._cpu_end = time.perf_counter()
-            self._elapsed_ms = (self._cpu_end - self._cpu_start) * 1000.0
+            if self._end_event is not None:
+                self._end_event.record()
+            try:
+                if self.synchronize:
+                    torch.cuda.synchronize()
+                if self._start_event is None or self._end_event is None:
+                    raise RuntimeError("CUDA events not initialized")
+                self._elapsed_ms = self._start_event.elapsed_time(self._end_event)
+                return
+            except Exception as exc:
+                logger.debug("CUDA timer fallback to CPU timing: %s", exc)
+        self._elapsed_ms = (self._cpu_end - self._cpu_start) * 1000.0
     
     @property
     def elapsed_ms(self) -> float:

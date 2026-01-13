@@ -111,6 +111,22 @@ class PhaseDTrainer:
         )
         collator = PhaseDCollator(tokenizer)
 
+        loader_cfg = self._execution_config.get("data_loader", {})
+        num_workers = int(loader_cfg.get("num_workers", 0))
+        pin_memory = bool(loader_cfg.get("pin_memory", self.device.type == "cuda"))
+        persistent_workers = bool(loader_cfg.get("persistent_workers", False))
+        prefetch_factor = int(loader_cfg.get("prefetch_factor", 2))
+        if num_workers <= 0:
+            persistent_workers = False
+            prefetch_factor = 2
+        loader_kwargs = {
+            "num_workers": num_workers,
+            "pin_memory": pin_memory,
+        }
+        if num_workers > 0:
+            loader_kwargs["persistent_workers"] = persistent_workers
+            loader_kwargs["prefetch_factor"] = prefetch_factor
+
         if enable_dynamic_batching and self._dynamic_batching_enabled:
             max_batch_size = int(
                 self._dynamic_batching_cfg.get("max_batch_size", self.config.batch_size)
@@ -119,8 +135,14 @@ class PhaseDTrainer:
             drop_last = bool(self._dynamic_batching_cfg.get("drop_last", False))
             shuffle_batches = bool(self._dynamic_batching_cfg.get("shuffle", shuffle))
             seed = int(self._dynamic_batching_cfg.get("seed", 42))
+            length_column = str(self._dynamic_batching_cfg.get("length_column", "text_length"))
+            length_scale = float(self._dynamic_batching_cfg.get("length_scale", 1.0))
 
             def length_fn(index: int) -> int:
+                cached = dataset.get_length(index, length_column)
+                if cached is not None:
+                    scaled = max(1, int(cached * length_scale))
+                    return min(scaled, int(self.config.max_length))
                 text = dataset.get_text(index)
                 length = tokenizer.estimate_length(text)
                 return min(int(length), int(self.config.max_length))
@@ -144,7 +166,7 @@ class PhaseDTrainer:
                 dataset,
                 batch_sampler=batch_sampler,
                 collate_fn=collator,
-                num_workers=0,
+                **loader_kwargs,
             )
         else:
             loader = DataLoader(
@@ -152,6 +174,7 @@ class PhaseDTrainer:
                 batch_size=self.config.batch_size,
                 shuffle=shuffle,
                 collate_fn=collator,
+                **loader_kwargs,
             )
         return loader, dataset.label_maps
 
