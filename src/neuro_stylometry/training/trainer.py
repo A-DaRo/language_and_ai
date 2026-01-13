@@ -141,6 +141,10 @@ class PhaseDTrainer:
     def __init__(self, config: PhaseDTrainConfig) -> None:
         self.config = config
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+        # Enable TF32 tensor cores for faster float32 matmuls on Ampere+ GPUs
+        if self.device.type == "cuda":
+            torch.set_float32_matmul_precision("high")
         self._execution_config = config.execution_config or {}
         autotuning_cfg = self._execution_config.get("autotuning", {})
         self._autotuning_enabled = bool(autotuning_cfg.get("enabled", False))

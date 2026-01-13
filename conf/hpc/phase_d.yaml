@@ -48,20 +48,19 @@ optimization:
   # Quantized bucketing for compilation stability
   quantize_step: 16
   
-  # High token budget for large batches
-  # RTX 5090 (32GB): ~256 samples @ 512 tokens
-  # A100 (80GB): ~512 samples @ 512 tokens
-  token_budget: 131072  # Aggressive for HPC VRAM
+  # Conservative token budget - autotuning will scale up if headroom exists
+  # Start lower to avoid OOM cascade during warmup
+  token_budget: 32768
 
 # HPC execution overrides
 execution:
   autotuning:
     enabled: true  # Let runtime find optimal budget
     warmup_batches: 10
-    initial_token_budget: 131072
-    min_token_budget: 16384
-    max_token_budget: 524288  # Very high ceiling for 80GB+ GPUs
-    memory_headroom_mb: 4096
+    initial_token_budget: 32768  # Start conservative, scale up if headroom
+    min_token_budget: 4096
+    max_token_budget: 393216       # Tuned for ~24-32GB VRAM usage (Safety cap)
+    memory_headroom_mb: 4096       # Larger headroom for 5090 burst allocations
     scale_up_factor: 1.25
     scale_down_factor: 0.85
     oom_slash_factor: 0.5
