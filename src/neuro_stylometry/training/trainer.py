@@ -119,6 +119,10 @@ class PhaseDTrainConfig:
     use_aot_mode: bool = True  # Use pre-tokenized data + FastCollator
     use_torch_compile: bool = True  # Apply torch.compile to model
     torch_compile_mode: str = "reduce-overhead"  # CUDA Graph optimization
+    compile_train_step: bool = False  # Compile full train step (forward+loss+backward)
+    torch_compile_disable_cudagraphs: bool = False
+    use_cuda_graph_training: bool = False  # Manual CUDA-graph training path
+    cuda_graph_training: Dict[str, Any] = field(default_factory=dict)
     use_fused_optimizer: bool = True  # Fused AdamW kernel
     use_device_prefetch: bool = True  # Async H2D transfers
     quantize_step: int = DEFAULT_QUANTIZE_STEP  # Snap-to-Grid step (16)
