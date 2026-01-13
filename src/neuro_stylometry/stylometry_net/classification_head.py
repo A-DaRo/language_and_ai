@@ -78,9 +78,6 @@ class MultiTaskHead(nn.Module):
         labels: tuple[torch.Tensor, ...],
         ignore_index: int = -1,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # DEBUG BYPASS: Return sum of logits as loss to check backward
-        return (logits[0].sum() * 0.001), torch.full((), 1.0, device=logits[0].device)
-        
         first_logits = logits[0]
         total_loss = torch.zeros((), device=first_logits.device, dtype=first_logits.dtype)
         valid_flag = torch.zeros((), device=first_logits.device, dtype=torch.int32)

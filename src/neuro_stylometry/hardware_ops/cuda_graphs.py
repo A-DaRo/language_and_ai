@@ -35,6 +35,13 @@ logger = logging.getLogger(__name__)
 T = TypeVar("T")
 
 
+def _prepare_capture_buffer(tensor: Tensor) -> Tensor:
+    clean = tensor.detach().clone()
+    if tensor.requires_grad:
+        clean.requires_grad_(True)
+    return clean
+
+
 @dataclass
 class GraphCacheConfig:
     """
@@ -201,15 +208,17 @@ class GraphCache:
         if self._capture_stream is None:
             self._capture_stream = torch.cuda.Stream()
         
-        # Allocate input buffers (copy input shapes)
-        # Use detach().clone() to ensure clean buffer creation, matching raw_test success
-        input_buffers = {
-            name: tensor.detach().clone()
-            for name, tensor in input_tensors.items()
-        }
-
-        # Ensure input buffers are ready on capture stream by syncing host/device
+        # Ensure capture stream waits on any prior work before cloning buffers.
+        self._capture_stream.wait_stream(torch.cuda.current_stream())
         torch.cuda.synchronize()
+
+        # Allocate input buffers (copy input shapes) on the capture stream.
+        # Use detach().clone() to ensure clean buffer creation and preserve requires_grad.
+        with torch.cuda.stream(self._capture_stream):
+            input_buffers = {
+                name: _prepare_capture_buffer(tensor)
+                for name, tensor in input_tensors.items()
+            }
         
         # Make capture stream wait for current stream processing?
         # torch.cuda.current_stream().synchronize() # Already covered by global sync
@@ -219,7 +228,7 @@ class GraphCache:
             for _ in range(self.config.warmup_iterations):
                 _ = forward_fn(**input_buffers)
         
-        # Synchronize before capture
+        # Synchronize before capture to avoid cross-stream hazards.
         torch.cuda.synchronize()
         
         # Capture the graph with dedicated memory pool (if available)
@@ -994,17 +1003,35 @@ class GraphAwareTraining:
         head: Any,
         input_ids: Tensor,
         attention_mask: Tensor,
-        labels: tuple[Tensor, ...],
+        labels: tuple[Tensor, ...] | Dict[str, Tensor],
         accum_steps: int,
         pad_token_id: Optional[int] = None,
+        pre_capture_hook: Optional[Callable[[], bool]] = None,
     ) -> tuple[Tensor, Tensor, bool]:
         if self._accum_steps is None:
             self._accum_steps = int(accum_steps)
         elif int(accum_steps) != self._accum_steps:
             raise RuntimeError("accum_steps changed during CUDA graph training")
 
-        if self._label_keys is None:
-            self._label_keys = [f"label_{i}" for i in range(len(labels))]
+        if isinstance(labels, dict):
+            label_keys = list(getattr(head, "task_order", labels.keys()))
+            if self._label_keys is None:
+                self._label_keys = label_keys
+            elif self._label_keys != label_keys:
+                raise RuntimeError("Label order changed during CUDA graph training")
+            try:
+                labels_tuple = tuple(labels[key] for key in self._label_keys)
+            except KeyError as exc:
+                raise RuntimeError(f"Missing label key for CUDA graph training: {exc}") from exc
+        else:
+            labels_tuple = labels
+            if self._label_keys is None:
+                if hasattr(head, "task_order"):
+                    self._label_keys = list(head.task_order)
+                else:
+                    self._label_keys = [f"label_{i}" for i in range(len(labels_tuple))]
+            if len(labels_tuple) != len(self._label_keys):
+                raise RuntimeError("Label count mismatch during CUDA graph training")
 
         if not self.is_enabled:
             self._direct_calls += 1
@@ -1017,7 +1044,7 @@ class GraphAwareTraining:
             outputs = step_fn(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
-                **{k: v for k, v in zip(self._label_keys, labels)},
+                **{k: v for k, v in zip(self._label_keys, labels_tuple)},
             )
             return outputs["loss"], outputs["valid"], False
 
@@ -1034,7 +1061,7 @@ class GraphAwareTraining:
             outputs = step_fn(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
-                **{k: v for k, v in zip(self._label_keys, labels)},
+                **{k: v for k, v in zip(self._label_keys, labels_tuple)},
             )
             return outputs["loss"], outputs["valid"], False
 
@@ -1049,7 +1076,7 @@ class GraphAwareTraining:
             attention_mask,
             pad_token_id=pad_token_id,
         )
-        padded_labels = self._pad_labels(labels, bucket.batch_size)
+        padded_labels = self._pad_labels(labels_tuple, bucket.batch_size)
 
         label_inputs = {k: v for k, v in zip(self._label_keys, padded_labels)}
         step_fn = self._train_step_fn(
@@ -1068,6 +1095,15 @@ class GraphAwareTraining:
             )
             return outputs["loss"], outputs["valid"], False
 
+        if bucket.shape_key not in self.graph_cache and pre_capture_hook is not None:
+            if not bool(pre_capture_hook()):
+                self._fallback_calls += 1
+                outputs = step_fn(
+                    input_ids=padded_ids,
+                    attention_mask=padded_mask,
+                    **label_inputs,
+                )
+                return outputs["loss"], outputs["valid"], False
         self._graph_calls += 1
         outputs = self.graph_cache.run_with_graph(
             bucket.shape_key,

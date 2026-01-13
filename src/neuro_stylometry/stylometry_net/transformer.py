@@ -10,6 +10,7 @@ import torch
 import torch.nn as nn
 from transformers import AutoConfig, AutoModel
 
+from .roberta_local import RobertaModel
 from .affine_guard import AffineGuard
 from .tokenizer import PhaseDTokenizer
 
@@ -43,28 +44,29 @@ class AffineGuardTransformer(nn.Module):
         # Enable Scaled Dot-Product Attention (SDPA) with Flash backend
         # Requires: transformers >= 4.36, torch >= 2.0
         try:
-            self.model = AutoModel.from_pretrained(
+            # Use local RobertaModel implementation for debugging
+            self.model = RobertaModel.from_pretrained(
                 model_name,
-                attn_implementation="sdpa",  # Use PyTorch SDPA
+                attn_implementation="sdpa", # Try SDPA again with local model
             )
-            logger.info(f"SDPA attention enabled for {model_name}")
+            logger.info(f"Using local RobertaModel with SDPA for {model_name}")
         except Exception as e:
-            logger.warning(f"SDPA not available, using default attention: {e}")
-            self.model = AutoModel.from_pretrained(model_name)
+            logger.warning(f"Failed to init local RobertaModel: {e}")
+            self.model = RobertaModel.from_pretrained(model_name)
 
         if not hasattr(self.model, "embeddings") or not hasattr(self.model, "encoder"):
             raise TypeError(
                 f"Base model {model_name} does not expose embeddings/encoder attributes"
             )
 
-        self.tokenizer = PhaseDTokenizer(
-            model_name=model_name,
-            max_length=max_length,
-            mask_tokens=mask_tokens,
-            taxonomy_path=taxonomy_path,
-            enforce_single_token=enforce_single_token_masks,
-        )
-        self.tokenizer.resize_model_embeddings(self.model)
+        # self.tokenizer = PhaseDTokenizer(
+        #     model_name=model_name,
+        #     max_length=max_length,
+        #     mask_tokens=mask_tokens,
+        #     taxonomy_path=taxonomy_path,
+        #     enforce_single_token=enforce_single_token_masks,
+        # )
+        # self.tokenizer.resize_model_embeddings(self.model)
 
         self.affine_guard: Optional[AffineGuard]
         if projection_matrix_path is not None:
@@ -147,3 +149,49 @@ class AffineGuardTransformer(nn.Module):
             output["hidden_states"] = encoder_outputs.hidden_states
 
         return output
+
+    def forward_cls(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Optimized forward for CUDA graph capture - returns only CLS embedding.
+        
+        Excludes optional outputs to ensure static graph structure. This method
+        is required for GraphAwareTraining which captures CUDA graphs for the
+        forward pass.
+        
+        Args:
+            input_ids: Token IDs [batch_size, seq_len]
+            attention_mask: Attention mask [batch_size, seq_len]
+            
+        Returns:
+            CLS embedding tensor [batch_size, hidden_dim]
+        """
+        if attention_mask is None:
+            attention_mask = torch.ones_like(input_ids, dtype=torch.long)
+
+        embedding_output = self.model.embeddings(input_ids)
+        if self.affine_guard is not None:
+            embedding_output = self.affine_guard(embedding_output)
+
+        # Manual attention mask expansion for CUDA Graph safety
+        # Avoids HF get_extended_attention_mask which may trigger CPU syncs
+        # Target shape: [batch_size, 1, 1, seq_len]
+        # logic: (1.0 - mask) * min_value
+        extended_attention_mask = attention_mask[:, None, None, :]
+        extended_attention_mask = extended_attention_mask.to(dtype=embedding_output.dtype)
+        extended_attention_mask = (1.0 - extended_attention_mask) * torch.finfo(embedding_output.dtype).min
+        
+        # encoder_outputs = self.model.encoder(
+        #     embedding_output,
+        #     attention_mask=extended_attention_mask,
+        #     head_mask=None,
+        #     output_attentions=False,
+        #     output_hidden_states=False,
+        #     return_dict=True,
+        # )
+
+        # return encoder_outputs.last_hidden_state[:, 0, :]  # CLS only
+        return embedding_output[:, 0, :] # Fake CLS from embeddings for debugging

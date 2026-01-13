@@ -34,6 +34,11 @@ from ..data_engine.bucketing import (
     DEFAULT_QUANTIZE_STEP,
     create_quantized_sampler,
 )
+from ..hardware_ops.cuda_graphs import (
+    GraphAwareTraining,
+    GraphCache,
+    GraphCacheConfig,
+)
 from ..stylometry_net.classification_head import MultiTaskHead
 from ..stylometry_net.phase_d_dataset import (
     DevicePrefetcher,
@@ -179,6 +184,7 @@ class PhaseDTrainer:
         self._use_device_prefetch = bool(config.use_device_prefetch)
         self._use_torch_compile = bool(config.use_torch_compile)
         self._torch_compile_mode = str(config.torch_compile_mode)
+        self._torch_compile_disable_cudagraphs = bool(config.torch_compile_disable_cudagraphs)
         self._use_fused_optimizer = bool(config.use_fused_optimizer)
         self._quantize_step = int(config.quantize_step)
         self._token_budget = int(config.token_budget)
@@ -385,17 +391,26 @@ class PhaseDTrainer:
             num_labels_per_task=self.label_maps.num_classes(),
         ).to(self.device)
         
-        # Apply torch.compile for kernel optimization (CUDA Graphs)
+        # Apply torch.compile for kernel optimization
         if self._use_torch_compile and self.device.type == "cuda":
+            # Override to "default" mode if CUDA Graphs are disabled
+            # "reduce-overhead" uses CUDA Graphs which can cause tensor overwrite errors
+            # "default" still provides kernel fusion benefits without graph capture
+            effective_mode = (
+                "default" if self._torch_compile_disable_cudagraphs 
+                else self._torch_compile_mode
+            )
             logger.info(
-                f"Applying torch.compile to transformer (mode={self._torch_compile_mode})"
+                f"Applying torch.compile to transformer (mode={effective_mode}, "
+                f"cudagraphs={'disabled' if self._torch_compile_disable_cudagraphs else 'enabled'})"
             )
             try:
-                # Compile the transformer backbone for CUDA Graph caching
-                # mode="reduce-overhead" enables automatic CUDA Graph capture
+                # Compile the transformer backbone
+                # mode="default": kernel fusion only (stable)
+                # mode="reduce-overhead": CUDA Graph capture (faster but can cause tensor aliasing)
                 model = torch.compile(
                     model,
-                    mode=self._torch_compile_mode,
+                    mode=effective_mode,
                     fullgraph=False,  # Allow graph breaks for flexibility
                 )
                 # DO NOT compile head:
@@ -582,6 +597,34 @@ class PhaseDTrainer:
             use_fused=self._use_fused_optimizer,
         )
 
+        # Initialize Manual CUDA Graph Training if enabled
+        graph_trainer: Optional[GraphAwareTraining] = None
+        if self.config.use_cuda_graph_training and self.device.type == "cuda":
+            logger.info("Initializing Manual CUDA Graph Training...")
+            cg_conf = self.config.cuda_graph_training or {}
+            cache_config = GraphCacheConfig(
+                enabled=True,
+                warmup_iterations=int(cg_conf.get("warmup_iterations", 3)),
+                max_cached_graphs=int(cg_conf.get("max_cached_graphs", 16)),
+                capture_pool_size_mb=int(cg_conf.get("capture_pool_size_mb", 256)),
+                use_cuda_graph_memory_pool=bool(cg_conf.get("use_cuda_graph_memory_pool", True)),
+            )
+            graph_cache = GraphCache(config=cache_config)
+            graph_trainer = GraphAwareTraining(
+                graph_cache=graph_cache,
+                pad_token_id=1,  # RoBERTa pad token is 1
+                ignore_index=-1, # Matches MultiTaskHead default
+            )
+            
+            # Disable conflicting automatic CUDA graphs from torch.compile
+            # We want torch.compile for kernel fusion ("default"), but not for graph capture ("reduce-overhead")
+            if self._torch_compile_mode == "reduce-overhead":
+                logger.warning(
+                    "Conflict: use_cuda_graph_training=True with torch_compile_mode='reduce-overhead'. "
+                    "Switching effective mode to 'default' to prevent double-graphing."
+                )
+                self._torch_compile_mode = "default"
+
         run_dir.mkdir(parents=True, exist_ok=True)
         checkpoint_dir = run_dir / "checkpoints"
         log_path = run_dir / "training_log.jsonl"
@@ -741,8 +784,79 @@ class PhaseDTrainer:
                     optimizer.zero_grad(set_to_none=True)
                     accum_counter = 0
 
-                def run_step() -> tuple[Optional[float], bool]:
+                def run_step() -> tuple[Optional[float], bool, bool]:
                     nonlocal accum_counter, optimizer_step
+                    
+                    # ==========================================================
+                    # Path A: Manual CUDA Graph Training (High Throughput)
+                    # ==========================================================
+                    if graph_trainer is not None and graph_trainer.is_enabled:
+                         # 1. Prepare labels ordered by head.task_order inside graph trainer
+                         labels_dict = labels
+                         
+                         def _pre_capture_hook() -> bool:
+                             if accum_counter != 0:
+                                 return False
+                             optimizer.zero_grad(set_to_none=True)
+                             return True
+                         
+                         # 2. Timer (strided)
+                         timer_ctx = CUDATimer(synchronize=False) if should_measure else nullcontext()
+                         with timer_ctx as timer:
+                             # 3. Execute graph (forward + loss + backward in one capture)
+                             # Enclose in autocast so capture records correct precision
+                             autocast_ctx = self._get_autocast_context()
+                             with autocast_ctx:
+                                 loss_tensor, valid_flag, did_run = graph_trainer.run(
+                                     model=model,
+                                     head=head,
+                                     input_ids=input_ids,
+                                     attention_mask=attention_mask,
+                                     labels=labels_dict,
+                                     accum_steps=accum_steps,
+                                     pad_token_id=1,
+                                     pre_capture_hook=_pre_capture_hook,
+                                 )
+
+                             # 4. Check validity (if valid_flag is 0, loss was NaN/skipped)
+                             if valid_flag.item() == 0:
+                                 return None, False, True # loss, did_step, skip_batch
+                             
+                             # 5. Optimization step
+                             loss_value = loss_tensor.item() if should_measure else None
+                             
+                             did_step = False
+                             accum_counter += 1
+                             if accum_counter >= accum_steps:
+                                optimizer.step()
+                                optimizer.zero_grad(set_to_none=True)
+                                if scheduler is not None:
+                                    scheduler.step()
+                                optimizer_step += 1
+                                accum_counter = 0
+                                did_step = True
+                    
+                         # Telemetry
+                         if should_measure and self._telemetry is not None and timer is not None:
+                            self._telemetry.record_batch(
+                                batch_size=batch_size,
+                                tokens=tokens,
+                                elapsed_ms=timer.elapsed_ms,
+                            )
+                            if self._runtime_controller is not None:
+                                runtime_metrics = create_runtime_metrics(
+                                    timer,
+                                    tokens=tokens,
+                                    batch_size=batch_size,
+                                )
+                                self._runtime_controller.report_metrics(runtime_metrics)
+                                
+                         return loss_value, did_step, False
+
+
+                    # ==========================================================
+                    # Path B: Standard Training (torch.compile / default)
+                    # ==========================================================
                     
                     # Mark CUDA Graph step boundary BEFORE any computation to prevent
                     # tensor overwrite errors when using torch.compile with mode="reduce-overhead"
@@ -757,7 +871,11 @@ class PhaseDTrainer:
                         autocast_ctx = self._get_autocast_context()
                         with autocast_ctx:
                             outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-                            logits = head(outputs["cls_embedding"])
+                            # Clone cls_embedding to break CUDA Graph memory reuse dependency.
+                            # Without this, the backward pass may try to read tensors that have
+                            # been overwritten by a subsequent CUDA Graph execution.
+                            cls_embedding = outputs["cls_embedding"].clone()
+                            logits = head(cls_embedding)
                             loss = head.compute_loss(logits, labels)
 
                         if loss is None:
