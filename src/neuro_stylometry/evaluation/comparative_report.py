@@ -148,6 +148,15 @@ def generate_phase_d_report(
     if svs_delta is None and baseline_svs and constrained_svs:
         svs_delta = constrained_svs["svs"] - baseline_svs["svs"]
 
+    def _img_block(path: Optional[Path], title: str) -> str:
+        if not path:
+            return ""
+        rel_path = path.relative_to(output_dir)
+        return (
+            f"<figure><img src='{rel_path.as_posix()}' alt='{title}'/>"
+            f"<figcaption>{title}</figcaption></figure>"
+        )
+
     confusion_blocks = []
     per_class_blocks = []
     for task, details in baseline_details.items():
@@ -177,15 +186,6 @@ def generate_phase_d_report(
 
     report_path = output_dir / report_name
     dataset_note = str(dataset_path) if dataset_path else "n/a"
-
-    def _img_block(path: Optional[Path], title: str) -> str:
-        if not path:
-            return ""
-        rel_path = path.relative_to(output_dir)
-        return (
-            f"<figure><img src='{rel_path.as_posix()}' alt='{title}'/>"
-            f"<figcaption>{title}</figcaption></figure>"
-        )
 
     html = f"""<!doctype html>
 <html lang="en">

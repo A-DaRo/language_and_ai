@@ -1,0 +1,86 @@
+{
+  "birth_year": {
+    "accuracy": 0.0,
+    "f1_macro": 0.0,
+    "confusion_matrix": [
+      [
+        0
+      ]
+    ],
+    "per_class": {}
+  },
+  "female": {
+    "accuracy": 1.0,
+    "f1_macro": 1.0,
+    "confusion_matrix": [
+      [
+        50
+      ]
+    ],
+    "per_class": {
+      "0": {
+        "precision": 1.0,
+        "recall": 1.0,
+        "f1": 1.0,
+        "support": 50
+      }
+    }
+  },
+  "nationality": {
+    "accuracy": 0.0,
+    "f1_macro": 0.0,
+    "confusion_matrix": [],
+    "per_class": {}
+  },
+  "political_leaning": {
+    "accuracy": 0.0,
+    "f1_macro": 0.0,
+    "confusion_matrix": [],
+    "per_class": {}
+  },
+  "extrovert": {
+    "accuracy": 0.0,
+    "f1_macro": 0.0,
+    "confusion_matrix": [
+      [
+        0,
+        0
+      ],
+      [
+        0,
+        0
+      ]
+    ],
+    "per_class": {}
+  },
+  "sensing": {
+    "accuracy": 0.0,
+    "f1_macro": 0.0,
+    "confusion_matrix": [
+      [
+        0
+      ]
+    ],
+    "per_class": {}
+  },
+  "feeling": {
+    "accuracy": 0.0,
+    "f1_macro": 0.0,
+    "confusion_matrix": [
+      [
+        0
+      ]
+    ],
+    "per_class": {}
+  },
+  "judging": {
+    "accuracy": 0.0,
+    "f1_macro": 0.0,
+    "confusion_matrix": [
+      [
+        0
+      ]
+    ],
+    "per_class": {}
+  }
+}

@@ -44,13 +44,23 @@ def _load_model_and_head(
             max_length=max_length,
         )
 
+    # Load head state first to infer num_labels from checkpoint
+    head_state = torch.load(run_dir / "head.pt", map_location=device)
+
+    # Infer num_labels_per_task from the saved checkpoint
+    num_labels_per_task = {}
+    for key in head_state.keys():
+        if key.endswith(".weight"):
+            task_name = key.split(".")[1]  # Extract task name from "heads.{task}.weight"
+            num_labels = head_state[key].shape[0]
+            num_labels_per_task[task_name] = num_labels
+
     head = MultiTaskHead(
         hidden_dim=model.config.hidden_size,
-        num_labels_per_task={k: len(v) for k, v in label_maps.items()},
+        num_labels_per_task=num_labels_per_task,
     )
 
     model_state = torch.load(run_dir / "model.pt", map_location=device)
-    head_state = torch.load(run_dir / "head.pt", map_location=device)
     model.load_state_dict(model_state)
     head.load_state_dict(head_state)
 
