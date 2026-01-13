@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Iterable, Optional
 
@@ -11,6 +12,8 @@ from transformers import AutoConfig, AutoModel
 
 from .affine_guard import AffineGuard
 from .tokenizer import PhaseDTokenizer
+
+logger = logging.getLogger(__name__)
 
 
 class AffineGuardTransformer(nn.Module):
@@ -36,7 +39,18 @@ class AffineGuardTransformer(nn.Module):
         super().__init__()
 
         self.config = AutoConfig.from_pretrained(model_name)
-        self.model = AutoModel.from_pretrained(model_name)
+        model_kwargs = {}
+        if hasattr(self.config, "attn_implementation"):
+            self.config.attn_implementation = "sdpa"
+            logger.info("Using attention implementation: sdpa")
+        else:
+            model_kwargs["attn_implementation"] = "sdpa"
+        try:
+            self.model = AutoModel.from_pretrained(model_name, config=self.config, **model_kwargs)
+        except TypeError:
+            if model_kwargs:
+                logger.debug("attn_implementation not supported by model; using default.")
+            self.model = AutoModel.from_pretrained(model_name, config=self.config)
 
         if not hasattr(self.model, "embeddings") or not hasattr(self.model, "encoder"):
             raise TypeError(

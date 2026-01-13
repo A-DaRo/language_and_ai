@@ -149,6 +149,13 @@ class PhaseDTrainer:
         # Enable TF32 tensor cores for faster float32 matmuls on Ampere+ GPUs
         if self.device.type == "cuda":
             torch.set_float32_matmul_precision("high")
+            try:
+                torch.backends.cuda.enable_flash_sdp(True)
+                torch.backends.cuda.enable_mem_efficient_sdp(True)
+                torch.backends.cuda.enable_math_sdp(True)
+                logger.info("Enabled SDPA backends (flash/mem_efficient/math)")
+            except Exception as exc:
+                logger.debug("SDPA backend configuration unavailable: %s", exc)
         self._execution_config = config.execution_config or {}
         autotuning_cfg = self._execution_config.get("autotuning", {})
         self._autotuning_enabled = bool(autotuning_cfg.get("enabled", False))
@@ -168,6 +175,12 @@ class PhaseDTrainer:
             telemetry_cfg.get("enabled", False) or self._autotuning_enabled
         )
         self._telemetry_stride = int(telemetry_cfg.get("stride", 1))  # Measure every Nth batch
+        loss_log_stride = self._execution_config.get("loss_log_stride")
+        if loss_log_stride is None:
+            loss_log_stride = telemetry_cfg.get("loss_log_stride")
+        if loss_log_stride is None:
+            loss_log_stride = 50
+        self._loss_log_stride = max(1, int(loss_log_stride))
         self._telemetry = TelemetryCollector.get_instance() if self._telemetry_enabled else None
         self._telemetry_step_counter = 0
         
@@ -207,6 +220,7 @@ class PhaseDTrainer:
             f"aot_mode={self._aot_mode_requested}, torch_compile={self._use_torch_compile}, "
             f"compile_train_step={self._compile_train_step}, "
             f"cuda_graph_training={self._use_cuda_graph_training}, "
+            f"loss_log_stride={self._loss_log_stride}, "
             f"torch_compile_disable_cudagraphs={self._torch_compile_disable_cudagraphs}"
         )
 
@@ -762,6 +776,7 @@ class PhaseDTrainer:
             accum_counter = 0
             epoch_loss_sum = 0.0
             epoch_loss_count = 0
+            last_loss_value: Optional[float] = None
             batch_sampler = getattr(loader, "batch_sampler", None)
             if hasattr(batch_sampler, "set_epoch"):
                 batch_sampler.set_epoch(epoch)
@@ -797,8 +812,18 @@ class PhaseDTrainer:
                         for k, v in batch["labels"].items()
                     }
 
-                tokens = int(attention_mask.sum().item())
                 batch_size = int(attention_mask.size(0))
+                padded_length = batch.get("padded_length")
+                tokens = batch.get("tokens")
+                if tokens is None:
+                    if padded_length is not None:
+                        tokens = int(padded_length) * batch_size
+                    elif attention_mask.device.type == "cpu":
+                        tokens = int(attention_mask.sum().item())
+                    else:
+                        tokens = int(attention_mask.numel())
+                else:
+                    tokens = int(tokens)
                 
                 # Strided telemetry: only measure every Nth batch to reduce overhead
                 self._telemetry_step_counter += 1
@@ -806,13 +831,14 @@ class PhaseDTrainer:
                     self._telemetry_enabled 
                     and self._telemetry_step_counter % self._telemetry_stride == 0
                 )
+                should_log_loss = self._loss_log_stride > 0 and step % self._loss_log_stride == 0
 
                 def handle_oom(_event) -> None:
                     nonlocal accum_counter
                     optimizer.zero_grad(set_to_none=not self._use_cuda_graph_training)
                     accum_counter = 0
 
-                def run_step() -> tuple[Optional[float], bool]:
+                def run_step() -> tuple[Optional[float], bool, bool]:
                     nonlocal accum_counter, optimizer_step
                     
                     # Mark CUDA Graph step boundary BEFORE any computation to prevent
@@ -873,14 +899,16 @@ class PhaseDTrainer:
                                 logits = head(cls_embedding)
                                 loss_tensor = head.compute_loss(logits, labels)
                                 if loss_tensor is None:
-                                    return None, False
+                                    return None, False, False
                                 (loss_tensor / accum_steps).backward()
                                 did_backward = True
 
                         if not did_backward:
-                            return None, False
+                            return None, False, False
 
-                        loss_value = float(loss_tensor.item())
+                        loss_value = None
+                        if should_log_loss:
+                            loss_value = float(loss_tensor.detach().float().item())
 
                         did_step = False
                         accum_counter += 1
@@ -908,26 +936,28 @@ class PhaseDTrainer:
                             )
                             self._runtime_controller.report_metrics(runtime_metrics)
 
-                    return loss_value, did_step
+                    return loss_value, did_step, True
 
-                loss_value, did_step = execute_with_oom_protection(
+                loss_value, did_step, did_backward = execute_with_oom_protection(
                     run_step,
                     controller=self._runtime_controller,
                     on_oom=handle_oom,
                 )
 
-                if loss_value is None:
+                if not did_backward:
                     continue
 
-                # Track epoch loss for averaging
-                epoch_loss_sum += loss_value
-                epoch_loss_count += 1
+                if loss_value is not None:
+                    last_loss_value = loss_value
+                    epoch_loss_sum += loss_value
+                    epoch_loss_count += 1
                 
                 # Update batch progress bar with current loss
-                batch_pbar.set_postfix({
-                    "loss": f"{loss_value:.4f}",
-                    "avg": f"{epoch_loss_sum / epoch_loss_count:.4f}",
-                })
+                if last_loss_value is not None and epoch_loss_count > 0:
+                    batch_pbar.set_postfix({
+                        "loss": f"{last_loss_value:.4f}",
+                        "avg": f"{epoch_loss_sum / epoch_loss_count:.4f}",
+                    })
 
                 if did_step:
                     step_metrics = {
@@ -935,8 +965,9 @@ class PhaseDTrainer:
                         "epoch": epoch + 1,
                         "step": step,
                         "optimizer_step": optimizer_step,
-                        "loss": loss_value,
                     }
+                    if last_loss_value is not None:
+                        step_metrics["loss"] = last_loss_value
                     self._log_jsonl(log_path, step_metrics)
 
                 step += 1

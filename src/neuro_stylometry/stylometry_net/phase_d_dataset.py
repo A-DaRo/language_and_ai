@@ -280,11 +280,16 @@ class PhaseDCollator:
                     dtype=torch.long,
                 )
 
+        padded_length = int(encoding["input_ids"].size(1))
+        tokens = int(encoding["attention_mask"].sum().item())
+
         return {
             "input_ids": encoding["input_ids"],
             "attention_mask": encoding["attention_mask"],
             "labels": labels,
             "post_id": [sample.get("post_id") for sample in batch],
+            "padded_length": padded_length,
+            "tokens": tokens,
         }
 
 
@@ -378,15 +383,8 @@ class FastCollator:
                 )
             
             # Convert to numpy if needed
-            if not isinstance(ids, np.ndarray):
-                ids = np.array(ids, dtype=np.int64)
-            else:
-                ids = ids.astype(np.int64)
-            
-            if not isinstance(mask, np.ndarray):
-                mask = np.array(mask, dtype=np.int64)
-            else:
-                mask = mask.astype(np.int64)
+            ids = np.asarray(ids, dtype=np.uint16)
+            mask = np.asarray(mask, dtype=np.uint8)
             
             input_ids_list.append(ids)
             attention_mask_list.append(mask)
@@ -398,18 +396,29 @@ class FastCollator:
             snap_to_grid(max_len_in_batch, self.quantize_step),
             self.max_length
         )
+        tokens = int(sum(lengths))
         
         # Pre-allocate tensors (pinned memory is handled by DataLoader's pin_memory=True,
         # NOT here - CUDA ops in worker processes cause initialization errors)
-        input_ids = torch.zeros((batch_size, padded_length), dtype=torch.long)
-        attention_mask = torch.zeros((batch_size, padded_length), dtype=torch.long)
+        input_ids_np = np.full(
+            (batch_size, padded_length),
+            self.pad_token_id,
+            dtype=np.uint16,
+        )
+        attention_mask_np = np.zeros(
+            (batch_size, padded_length),
+            dtype=np.uint8,
+        )
         
         # Fill tensors (pad on right with pad_token_id / 0)
         for i, (ids, mask) in enumerate(zip(input_ids_list, attention_mask_list)):
             seq_len = min(len(ids), padded_length)
-            input_ids[i, :seq_len] = torch.from_numpy(ids[:seq_len])
-            attention_mask[i, :seq_len] = torch.from_numpy(mask[:seq_len])
+            input_ids_np[i, :seq_len] = ids[:seq_len]
+            attention_mask_np[i, :seq_len] = mask[:seq_len]
             # Padding positions already 0 from zeros initialization
+
+        input_ids = torch.from_numpy(input_ids_np).to(dtype=torch.long)
+        attention_mask = torch.from_numpy(attention_mask_np)
         
         # Collate labels (pinned memory handled by DataLoader, not here)
         labels: Dict[str, torch.Tensor] = {}
@@ -417,7 +426,9 @@ class FastCollator:
             label_keys = batch[0]["labels"].keys()
             for field in label_keys:
                 label_values = [sample["labels"][field] for sample in batch]
-                labels[field] = torch.tensor(label_values, dtype=torch.long)
+                labels[field] = torch.from_numpy(
+                    np.asarray(label_values, dtype=np.int64)
+                )
         
         return {
             "input_ids": input_ids,
@@ -425,6 +436,7 @@ class FastCollator:
             "labels": labels,
             "post_id": [sample.get("post_id") for sample in batch],
             "padded_length": padded_length,  # For telemetry
+            "tokens": tokens,
         }
 
 
