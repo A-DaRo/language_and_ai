@@ -660,14 +660,16 @@ class PhaseDTrainer:
 
                 def run_step() -> tuple[Optional[float], bool]:
                     nonlocal accum_counter, optimizer_step
+                    
+                    # Mark CUDA Graph step boundary BEFORE any computation to prevent
+                    # tensor overwrite errors when using torch.compile with mode="reduce-overhead"
+                    # This must be called before both forward AND backward passes
+                    if self._use_torch_compile and self.device.type == "cuda":
+                        torch.compiler.cudagraph_mark_step_begin()
+                    
                     # Use strided telemetry to avoid synchronization overhead
                     timer_ctx = CUDATimer(synchronize=False) if should_measure else nullcontext()
                     with timer_ctx as timer:
-                        # Mark CUDA Graph step boundary to prevent tensor overwrite errors
-                        # when using torch.compile with mode="reduce-overhead"
-                        if self._use_torch_compile and self.device.type == "cuda":
-                            torch.compiler.cudagraph_mark_step_begin()
-                        
                         # Use precision-aware autocast context
                         autocast_ctx = self._get_autocast_context()
                         with autocast_ctx:
