@@ -91,6 +91,7 @@ class AffineGuardTransformer(nn.Module):
         input_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         *,
+        head_mask: Optional[torch.Tensor] = None,
         output_attentions: bool = False,
         output_hidden_states: bool = False,
     ) -> dict:
@@ -104,10 +105,15 @@ class AffineGuardTransformer(nn.Module):
         extended_attention_mask = self.model.get_extended_attention_mask(
             attention_mask, input_ids.shape
         )
+        if head_mask is not None:
+            head_mask = self.model.get_head_mask(
+                head_mask, self.model.config.num_hidden_layers
+            )
 
         encoder_outputs = self.model.encoder(
             embedding_output,
             attention_mask=extended_attention_mask,
+            head_mask=head_mask,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=True,

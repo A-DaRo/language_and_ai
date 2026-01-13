@@ -3,13 +3,13 @@
 **Document Type:** Status + Gap Analysis
 **Scope:** Phase D (Neural Stylometry)
 **Context:** Phase A artifacts available under `artifacts/phase_a/`
-**Last Updated:** 2026-01-12  
+**Last Updated:** 2026-01-12 (Updated with evaluation + CHG/SVS improvements)  
 
 ---
 
 ## 1. Executive Summary
 
-Phase D is now fully implemented for Track A (training pipeline) with configuration-driven architecture. The core model wrapper, Affine Guard injection, tokenizer alignment, dataset loading, baseline vs constrained training loop, checkpointing, metrics reporting, and CHG/SVS verification entry points are in place. The pipeline now uses YAML-based configuration with mode-specific overrides (laptop/HPC), providing a clean separation between configuration and execution. The remaining work is primarily in evaluation/reporting (Track B), HPC optimization, and full CHG/SVS rigor.
+Phase D is now fully implemented for Track A (training pipeline) with configuration-driven architecture. The core model wrapper, Affine Guard injection, tokenizer alignment, dataset loading, baseline vs constrained training loop, checkpointing, metrics reporting, and CHG/SVS verification entry points are in place. The pipeline now uses YAML-based configuration with mode-specific overrides (laptop/HPC), providing a clean separation between configuration and execution. Evaluation/reporting is now implemented (report + plots), and CHG/SVS have been upgraded for rigor (head gating + POS-aware SVS). Remaining work is primarily in training optimization, full evaluation depth, and expanded tests.
 
 ---
 
@@ -159,8 +159,8 @@ python -m neuro_stylometry verify \
 - `src/neuro_stylometry/stylometry_net/verification.py`
 
 **What it does:**
-- CHG learns gate parameters per head (proxy loss scaling + L1 regularization)
-- SVS computes function‑word vs content‑word attention mass ratio
+- CHG learns gate parameters per head using attention head masks during forward pass (L1 regularization)
+- SVS computes function‑word vs content‑word attention mass ratio with optional POS tagging (spaCy) and lexical fallback
 - CLI `verify` runs baseline + constrained verification and writes artifacts
 
 **Artifacts:**
@@ -184,9 +184,10 @@ python -m neuro_stylometry verify \
 | Dataset loader | ✅ | Arrow read + split logic + label maps |
 | Training loop | ✅ | Baseline + constrained, logs, checkpoints |
 | Metrics | ✅ | Per-task accuracy and macro‑F1 |
-| CHG verifier | ✅ (proxy) | Lightweight gate learning |
-| SVS | ✅ (heuristic) | Function vs content mass |
+| CHG verifier | ✅ | Head gating via attention masks |
+| SVS | ✅ | POS‑aware (spaCy) + lexical fallback |
 | CLI wiring | ✅ **UPDATED** | **Config-driven run-phase-d + verify** |
+| Evaluation/reporting | ✅ **NEW** | **Plots + HTML report + report CLI** |
 
 ### 3.2 Known Limitations / Improvements
 
@@ -194,20 +195,15 @@ python -m neuro_stylometry verify \
    - Laptop config exists and tested, HPC config needs tuning.
    - Improvement: add `conf/hpc/phase_d.yaml` with appropriate batch sizes and precision settings.
 
-2. **CHG is proxy‑based**
-   - Current gate learning scales loss by mean gate value.
-   - Does not re‑run with gated attention outputs.
-   - Improvement: implement true attention‑head gating forward pass.
+2. **SVS still uses a simplified attention query**
+   - Uses CLS attention as the query position.
+   - Improvement: evaluate alternative query positions or aggregate across tokens.
 
-3. **SVS is heuristic**
-   - Uses a fixed function‑word list and CLS attention.
-   - Improvement: use POS tagging or expanded function‑word lexicon.
-
-4. **Test set evaluation present but basic**
+3. **Test set evaluation present but basic**
    - Pipeline evaluates on test set and reports metrics.
    - Improvement: add richer analysis (confusion matrices, per-attribute breakdowns).
 
-5. **Training utilities are minimal**
+4. **Training utilities are minimal**
    - No scheduler/warmup, no AMP, no gradient accumulation.
    - Improvement: wire precision management + scheduler in training.
 
@@ -215,25 +211,24 @@ python -m neuro_stylometry verify \
 
 ## 4. Remaining Phase D Work (Spec‑Aligned)
 
-### 4.1 Evaluation + Reporting (Primary Blocker)
+### 4.1 Evaluation + Reporting (Completed)
 
-**Required files:**
+**Delivered files:**
 - `src/neuro_stylometry/evaluation/attention_analysis.py`
 - `src/neuro_stylometry/evaluation/visualizations.py`
 - `src/neuro_stylometry/evaluation/comparative_report.py`
 
-**Required artifacts:**
-- Baseline vs constrained plots (learning curves, accuracy bars, gate heatmaps)
+**Delivered artifacts:**
+- Baseline vs constrained plots (learning curves, accuracy bars)
 - Report HTML under `artifacts/reports/phase_d_report.html`
 - Aggregated `phase_d_metrics.json` at `artifacts/phase_d/`
 
 ---
 
-### 4.2 Verification Enhancements
+### 4.2 Verification Enhancements (In Progress)
 
 **Needed improvements:**
-- Full CHG implementation with gated attention outputs.
-- SVS with POS tagging for robust stylometry vs content categorization.
+- SVS: expand beyond CLS query (aggregate across tokens or tasks).
 - Comparative summary output (delta SVS, delta accuracy).
 
 ---
@@ -260,11 +255,10 @@ python -m neuro_stylometry verify \
 
 ## 5. Suggested Next Implementation Order
 
-1. **Phase D evaluation/reporting pipeline**
-2. **CHG/SVS rigor improvements**
-3. **Training quality upgrades (precision, scheduler)**
-4. **Test coverage**
-5. **Config schema finalization (last per instruction)**
+1. **SVS robustness (query aggregation + reporting deltas)**
+2. **Training quality upgrades (precision, scheduler)**
+3. **Test coverage**
+4. **Config schema finalization (last per instruction)**
 
 ---
 
@@ -300,6 +294,14 @@ python -m neuro_stylometry verify \
   --dataset artifacts/data/output/clean_dataset.arrow \
   --phase-d-dir artifacts/phase_d \
   --output-dir artifacts/phase_d/chg
+```
+
+**Report generation (from existing outputs):**
+```bash
+python -m neuro_stylometry report-phase-d \
+  --phase-d-dir artifacts/phase_d \
+  --output-dir artifacts/reports \
+  --dataset artifacts/data/output/clean_dataset.arrow
 ```
 
 ---

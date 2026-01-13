@@ -48,9 +48,8 @@ class CHGVerifier:
     """
     Learn per-head gates for attention heads.
 
-    This is a lightweight proxy implementation: gates scale loss via mean gate
-    value with L1 sparsity regularization. It does not re-run the forward pass
-    with gated attention outputs.
+    Gates are applied as head masks during the forward pass to measure causal
+    contribution. The base model is frozen; only gate parameters are optimized.
     """
 
     def __init__(
@@ -78,8 +77,10 @@ class CHGVerifier:
         dataloader: DataLoader,
         device: torch.device,
     ) -> HeadGates:
-        gates = nn.Parameter(
-            torch.full((self.num_layers, self.num_heads), float(self.gate_init), device=device)
+        gate_init = float(self.gate_init)
+        gate_init = min(max(gate_init, 1e-3), 1 - 1e-3)
+        gate_logits = nn.Parameter(
+            torch.full((self.num_layers, self.num_heads), float(torch.logit(torch.tensor(gate_init))), device=device)
         )
 
         for param in model.parameters():
@@ -90,7 +91,7 @@ class CHGVerifier:
         model.eval()
         head.eval()
 
-        optimizer = torch.optim.Adam([gates], lr=self.learning_rate)
+        optimizer = torch.optim.Adam([gate_logits], lr=self.learning_rate)
 
         for _ in range(self.num_epochs):
             for batch in dataloader:
@@ -98,9 +99,11 @@ class CHGVerifier:
                 attention_mask = batch["attention_mask"].to(device)
                 labels = {k: v.to(device) for k, v in batch["labels"].items()}
 
+                gate_values = torch.sigmoid(gate_logits)
                 outputs = model(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
+                    head_mask=gate_values,
                     output_attentions=True,
                 )
                 logits = head(outputs["cls_embedding"])
@@ -108,14 +111,13 @@ class CHGVerifier:
                 if base_loss is None:
                     continue
 
-                gate_values = torch.sigmoid(gates)
-                loss = base_loss * gate_values.mean()
+                loss = base_loss
                 loss = loss + self.regularization * gate_values.abs().mean()
 
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
 
-        final_gates = torch.sigmoid(gates).detach()
+        final_gates = torch.sigmoid(gate_logits).detach()
         layer_means = final_gates.mean(dim=1)
         return HeadGates(gates=final_gates, layer_gate_means=layer_means)
