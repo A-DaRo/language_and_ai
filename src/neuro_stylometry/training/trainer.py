@@ -453,7 +453,11 @@ class PhaseDTrainer:
             )
             with autocast_ctx:
                 outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-                logits = head(outputs["cls_embedding"])
+                cls_embedding = outputs["cls_embedding"]
+                if self._use_torch_compile and self.device.type == "cuda":
+                    # Break CUDAGraph output aliasing before eager head usage.
+                    cls_embedding = cls_embedding.clone()
+                logits = head(cls_embedding)
 
             for task, task_logits_batch in logits.items():
                 task_logits[task].append(task_logits_batch.detach().cpu())
@@ -517,7 +521,11 @@ class PhaseDTrainer:
             )
             with autocast_ctx:
                 outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-                logits = head(outputs["cls_embedding"])
+                cls_embedding = outputs["cls_embedding"]
+                if self._use_torch_compile and self.device.type == "cuda":
+                    # Break CUDAGraph output aliasing before eager head usage.
+                    cls_embedding = cls_embedding.clone()
+                logits = head(cls_embedding)
 
             for task, task_logits_batch in logits.items():
                 task_logits[task].append(task_logits_batch.detach().cpu())
@@ -670,7 +678,11 @@ class PhaseDTrainer:
                         autocast_ctx = self._get_autocast_context()
                         with autocast_ctx:
                             outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-                            logits = head(outputs["cls_embedding"])
+                            cls_embedding = outputs["cls_embedding"]
+                            if self._use_torch_compile and self.device.type == "cuda":
+                                # Break CUDAGraph output aliasing before eager head usage.
+                                cls_embedding = cls_embedding.clone()
+                            logits = head(cls_embedding)
                             loss = head.compute_loss(logits, labels)
 
                         if loss is None:
