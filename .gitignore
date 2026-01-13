@@ -60,6 +60,7 @@ artifacts/phase_d/**/*.pt
 artifacts/phase_d/**/checkpoint.pt
 artifacts/phase_d/**/*.bin
 artifacts/phase_d/**/*.jsonl
+tokenized_dataset.arrow
 
 # Logs
 logs/

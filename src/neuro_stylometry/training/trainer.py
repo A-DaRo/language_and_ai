@@ -23,7 +23,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from tqdm import tqdm
+from tqdm.auto import tqdm
 
 from ..hardware_ops.oom_guard import execute_with_oom_protection
 from ..hardware_ops.runtime import RuntimeController
@@ -429,7 +429,15 @@ class PhaseDTrainer:
         task_logits: Dict[str, list[torch.Tensor]] = {k: [] for k in num_classes}
         task_labels: Dict[str, list[torch.Tensor]] = {k: [] for k in num_classes}
 
-        for batch in loader:
+        eval_pbar = tqdm(
+            loader,
+            desc="Evaluating",
+            unit="batch",
+            leave=False,
+            dynamic_ncols=True,
+        )
+        
+        for batch in eval_pbar:
             input_ids = batch["input_ids"].to(self.device)
             attention_mask = batch["attention_mask"].to(self.device)
             labels = {k: v.to(self.device) for k, v in batch["labels"].items()}
@@ -446,6 +454,8 @@ class PhaseDTrainer:
             for task, task_logits_batch in logits.items():
                 task_logits[task].append(task_logits_batch.detach().cpu())
                 task_labels[task].append(labels[task].detach().cpu())
+        
+        eval_pbar.close()
 
         for task in num_classes:
             if not task_logits[task]:
@@ -479,7 +489,15 @@ class PhaseDTrainer:
         task_logits: Dict[str, list[torch.Tensor]] = {k: [] for k in num_classes}
         task_labels: Dict[str, list[torch.Tensor]] = {k: [] for k in num_classes}
 
-        for batch in loader:
+        eval_pbar = tqdm(
+            loader,
+            desc="Detailed Eval",
+            unit="batch",
+            leave=False,
+            dynamic_ncols=True,
+        )
+        
+        for batch in eval_pbar:
             input_ids = batch["input_ids"].to(self.device)
             attention_mask = batch["attention_mask"].to(self.device)
             labels = {k: v.to(self.device) for k, v in batch["labels"].items()}
@@ -496,6 +514,8 @@ class PhaseDTrainer:
             for task, task_logits_batch in logits.items():
                 task_logits[task].append(task_logits_batch.detach().cpu())
                 task_labels[task].append(labels[task].detach().cpu())
+        
+        eval_pbar.close()
 
         for task in num_classes:
             if not task_logits[task]:
@@ -579,14 +599,34 @@ class PhaseDTrainer:
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
         best_score = None
         bad_epochs = 0
-        for epoch in range(start_epoch, self.config.num_epochs):
+        
+        # Overall training info
+        num_epochs = self.config.num_epochs
+        total_batches = len(loader)
+        logger.info(
+            f"Starting training: {num_epochs} epochs, ~{total_batches} batches/epoch, "
+            f"{total_batches * num_epochs} total batches"
+        )
+        
+        for epoch in range(start_epoch, num_epochs):
             optimizer.zero_grad(set_to_none=True)
             accum_counter = 0
+            epoch_loss_sum = 0.0
+            epoch_loss_count = 0
             batch_sampler = getattr(loader, "batch_sampler", None)
             if hasattr(batch_sampler, "set_epoch"):
                 batch_sampler.set_epoch(epoch)
-            progress = tqdm(loader, desc=f"Epoch {epoch + 1}", leave=False)
-            for batch in progress:
+            
+            # Progress bar for batches within epoch - single persistent bar
+            batch_pbar = tqdm(
+                loader,
+                desc=f"Epoch {epoch + 1}/{num_epochs}",
+                unit="batch",
+                leave=True,  # Keep bar visible after epoch completes
+                ncols=100,  # Fixed width for consistency
+            )
+            
+            for batch in batch_pbar:
                 input_ids = batch["input_ids"].to(self.device)
                 attention_mask = batch["attention_mask"].to(self.device)
                 labels = {k: v.to(self.device) for k, v in batch["labels"].items()}
@@ -662,6 +702,16 @@ class PhaseDTrainer:
                 if loss_value is None:
                     continue
 
+                # Track epoch loss for averaging
+                epoch_loss_sum += loss_value
+                epoch_loss_count += 1
+                
+                # Update batch progress bar with current loss
+                batch_pbar.set_postfix({
+                    "loss": f"{loss_value:.4f}",
+                    "avg": f"{epoch_loss_sum / epoch_loss_count:.4f}",
+                })
+
                 if did_step:
                     step_metrics = {
                         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -671,7 +721,6 @@ class PhaseDTrainer:
                         "loss": loss_value,
                     }
                     self._log_jsonl(log_path, step_metrics)
-                    progress.set_postfix({"loss": f"{loss_value:.4f}"})
 
                 step += 1
                 if self.config.save_every_steps and optimizer_step > 0:
@@ -694,12 +743,26 @@ class PhaseDTrainer:
                         )
                 if self.config.max_steps and step >= self.config.max_steps:
                     break
+            
+            # Close batch progress bar after epoch
+            batch_pbar.close()
+            
+            # Calculate epoch average loss
+            epoch_avg_loss = epoch_loss_sum / max(1, epoch_loss_count)
+            
             if accum_counter > 0:
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
                 if scheduler is not None:
                     scheduler.step()
                 optimizer_step += 1
+            
+            # Log epoch summary
+            logger.info(
+                f"Epoch {epoch + 1}/{num_epochs} complete: "
+                f"avg_loss={epoch_avg_loss:.4f}, optimizer_steps={optimizer_step}"
+            )
+            
             if self.config.save_every_epochs and (epoch + 1) % self.config.save_every_epochs == 0:
                 save_checkpoint(
                     checkpoint_dir / f"checkpoint_epoch_{epoch + 1}.pt",
@@ -734,10 +797,18 @@ class PhaseDTrainer:
                 else:
                     bad_epochs += 1
                     if bad_epochs >= self.config.early_stopping_patience:
+                        logger.info(f"Early stopping at epoch {epoch + 1}")
                         break
             if self.config.max_steps and step >= self.config.max_steps:
+                logger.info(f"Reached max_steps={self.config.max_steps}")
                 break
-        # Ensure eval mode after early stop break
+        
+        # Final training summary
+        logger.info(
+            f"Training complete: {optimizer_step} optimizer steps, "
+            f"{step} total batches"
+        )
+        
         model.train()
         head.train()
 

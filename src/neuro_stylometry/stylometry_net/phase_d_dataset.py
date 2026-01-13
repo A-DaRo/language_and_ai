@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
+import logging
 from pathlib import Path
 import random
 from typing import Callable, Dict, Iterable, List, Optional, Union
@@ -27,6 +28,7 @@ from ..data_engine.schemas import get_demographic_columns
 from ..data_engine.bucketing import snap_to_grid, DEFAULT_QUANTIZE_STEP
 from .tokenizer import PhaseDTokenizer
 
+logger = logging.getLogger(__name__)
 
 def _unique_values(array: pa.Array) -> List:
     if pa.types.is_dictionary(array.type):
@@ -124,8 +126,28 @@ class PhaseDDataset(Dataset):
         }
         
         # AOT mode: pre-tokenized data available
+        # AOT is only valid if the tokenized field matches the requested text_field
+        has_aot_columns = "input_ids" in self.table.column_names
+        aot_field_matches = False
+        tokenized_field = None
+        
+        if has_aot_columns and "tokenized_text_field" in self.table.column_names:
+            # Check if at least one row has matching tokenized field
+            tokenized_field = self.table["tokenized_text_field"][0].as_py()
+            aot_field_matches = (tokenized_field == text_field)
+        elif has_aot_columns:
+            # Legacy: no tokenized_text_field column, assume match for backward compat
+            aot_field_matches = True
+        
         if use_aot_tokens is None:
-            self._aot_mode = "input_ids" in self.table.column_names
+            # Auto-detect: enable AOT only if columns exist AND field matches
+            self._aot_mode = has_aot_columns and aot_field_matches
+            if has_aot_columns and not aot_field_matches:
+                logger.debug(
+                    f"AOT columns found but tokenized field mismatch: "
+                    f"requested '{text_field}', dataset has '{tokenized_field}'. "
+                    f"Falling back to JIT tokenization."
+                )
         else:
             self._aot_mode = use_aot_tokens
         

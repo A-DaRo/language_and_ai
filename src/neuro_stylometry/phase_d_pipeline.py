@@ -76,6 +76,9 @@ def run_phase_d_training(
     config['data']['dataset_path'] = str(dataset_path)
     config['data']['artifacts_dir'] = str(artifacts_dir)
 
+    # Extract optimization config for AOT pipeline
+    opt_cfg = config.get('optimization', {})
+
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -123,6 +126,14 @@ def run_phase_d_training(
         save_every_epochs=config['training'].get('save_every_epochs'),
         split_ratios=config['data'].get('split_ratios'),
         execution_config=config.get("execution", {}),
+        # AOT Pipeline Optimization Settings
+        use_aot_mode=opt_cfg.get('use_aot_mode', False),
+        use_torch_compile=opt_cfg.get('use_torch_compile', False),
+        torch_compile_mode=opt_cfg.get('torch_compile_mode', 'reduce-overhead'),
+        use_fused_optimizer=opt_cfg.get('use_fused_optimizer', False),
+        use_device_prefetch=opt_cfg.get('use_device_prefetch', False),
+        quantize_step=opt_cfg.get('quantize_step', 16),
+        token_budget=opt_cfg.get('token_budget', 65536),
     )
 
     baseline_trainer = PhaseDTrainer(baseline_config)
@@ -229,6 +240,14 @@ def run_phase_d_training(
         save_every_epochs=config['training'].get('save_every_epochs'),
         split_ratios=config['data'].get('split_ratios'),
         execution_config=config.get("execution", {}),
+        # AOT Pipeline Optimization Settings
+        use_aot_mode=opt_cfg.get('use_aot_mode', False),
+        use_torch_compile=opt_cfg.get('use_torch_compile', False),
+        torch_compile_mode=opt_cfg.get('torch_compile_mode', 'reduce-overhead'),
+        use_fused_optimizer=opt_cfg.get('use_fused_optimizer', False),
+        use_device_prefetch=opt_cfg.get('use_device_prefetch', False),
+        quantize_step=opt_cfg.get('quantize_step', 16),
+        token_budget=opt_cfg.get('token_budget', 65536),
     )
 
     constrained_trainer = PhaseDTrainer(constrained_config)

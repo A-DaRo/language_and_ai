@@ -265,6 +265,10 @@ def preprocess_dataset(
     output_columns["input_ids"] = input_ids_col
     output_columns["attention_mask"] = attention_mask_col
     output_columns["token_count"] = token_count_col
+    # Store metadata about which text field was tokenized
+    output_columns["tokenized_text_field"] = pa.array(
+        [text_field] * num_rows, type=pa.string()
+    )
     
     # Create output table
     output_table = pa.table(output_columns)

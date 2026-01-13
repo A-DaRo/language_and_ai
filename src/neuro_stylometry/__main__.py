@@ -326,9 +326,9 @@ def validate_handover(artifacts_dir: Path):
 @cli.command("run-phase-d")
 @click.option(
     "--dataset",
-    type=click.Path(exists=True, path_type=Path),
+    type=click.Path(path_type=Path),
     required=True,
-    help="Path to clean_dataset.arrow from Phase A",
+    help="Path to tokenized_dataset.arrow (created via --preprocess or preprocess-tokens)",
 )
 @click.option(
     "--output-dir",
@@ -341,6 +341,18 @@ def validate_handover(artifacts_dir: Path):
     type=click.Path(exists=True, path_type=Path),
     required=True,
     help="Phase A artifacts directory (contains projection_matrix.pt)",
+)
+@click.option(
+    "--source-dataset",
+    type=click.Path(exists=True, path_type=Path),
+    default=None,
+    help="Path to clean_dataset.arrow for preprocessing (auto-detected from artifacts-dir if not set)",
+)
+@click.option(
+    "--preprocess/--no-preprocess",
+    default=True,
+    show_default=True,
+    help="Auto-preprocess dataset if --dataset doesn't exist",
 )
 @click.option(
     "--mode",
@@ -366,15 +378,65 @@ def run_phase_d(
     dataset: Path,
     output_dir: Path,
     artifacts_dir: Path,
+    source_dataset: Path | None,
+    preprocess: bool,
     mode: str,
     config_path: Path | None,
     data_change: str,
 ):
     """Train Phase D baseline and constrained models."""
-    from .config import find_config_root
+    from .config import find_config_root, load_phase_d_config
     from .phase_d_pipeline import run_phase_d_training
 
     try:
+        # Check if dataset exists; if not and preprocess enabled, create it
+        if not dataset.exists():
+            if not preprocess:
+                raise click.ClickException(
+                    f"Dataset not found: {dataset}\n"
+                    f"Either provide an existing tokenized dataset or enable --preprocess"
+                )
+            
+            # Determine source dataset path
+            if source_dataset is None:
+                source_dataset = artifacts_dir / "clean_dataset.arrow"
+            
+            if not source_dataset.exists():
+                raise click.ClickException(
+                    f"Source dataset not found: {source_dataset}\n"
+                    f"Provide --source-dataset or ensure clean_dataset.arrow exists in artifacts-dir"
+                )
+            
+            # Load config to get model settings
+            config = load_phase_d_config(mode=mode, experiment_config_path=config_path)
+            model_name = config.get('model', {}).get('name', 'roberta-base')
+            max_length = config.get('model', {}).get('max_length', 512)
+            
+            click.echo(f"\n{'=' * 80}")
+            click.echo("AUTO-PREPROCESSING: Creating tokenized dataset")
+            click.echo(f"{'=' * 80}")
+            click.echo(f"Source: {source_dataset}")
+            click.echo(f"Output: {dataset}")
+            click.echo(f"Model: {model_name}")
+            click.echo(f"Max length: {max_length}")
+            
+            # Import and run preprocessing
+            import sys
+            sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent / "scripts"))
+            from scripts.preprocess_tokens import preprocess_dataset
+            
+            stats = preprocess_dataset(
+                input_path=source_dataset,
+                output_path=dataset,
+                model_name=model_name,
+                max_length=max_length,
+                text_field="post_masked",  # Tokenize masked text for constrained model
+                num_workers=None,  # Auto-detect
+            )
+            
+            click.echo(f"\nTokenization complete: {stats['num_rows']} rows in {stats['elapsed_seconds']:.1f}s")
+            click.echo(f"{'=' * 80}\n")
+
         logger.info("Phase D config root: %s", find_config_root("phase_d.yaml"))
         results = run_phase_d_training(
             dataset_path=dataset,
