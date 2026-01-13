@@ -98,6 +98,11 @@ class PhaseDDataset(Dataset):
 
         self._text_col = self.table[self.text_field]
         self._label_cols = {field: self.table[field] for field in self.label_fields}
+        self._length_cols = {
+            name: self.table[name]
+            for name in ("text_length", "token_length", "masked_text_length")
+            if name in self.table.column_names
+        }
 
     def __len__(self) -> int:
         return self.table.num_rows
@@ -122,6 +127,17 @@ class PhaseDDataset(Dataset):
     def get_text(self, index: int) -> str:
         text = self._text_col[index].as_py()
         return text or ""
+
+    def get_length(self, index: int, column: str = "text_length") -> Optional[int]:
+        if column not in self._length_cols:
+            return None
+        value = self._length_cols[column][index].as_py()
+        if value is None:
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
 
 
 class PhaseDCollator:

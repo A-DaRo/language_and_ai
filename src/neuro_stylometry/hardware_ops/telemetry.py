@@ -57,7 +57,7 @@ class CUDATimer:
         print(f"Elapsed: {timer.elapsed_ms:.2f}ms")
     """
     
-    def __init__(self, synchronize: bool = True):
+    def __init__(self, synchronize: bool = False):
         """
         Initialize CUDA timer.
         

@@ -6,3 +6,22 @@ training:
   num_epochs: 2  # Shorter for testing
   batch_size: 4  # Smaller batch for laptop
   max_steps: null  # Run full epochs even on laptop
+  precision: "fp32"
+
+execution:
+  dynamic_batching:
+    enabled: false
+    max_batch_size: 8
+    min_batch_size: 1
+    drop_last: false
+    shuffle: true
+    seed: 42
+    length_column: "text_length"
+    length_scale: 1.0
+  telemetry:
+    enabled: false
+  data_loader:
+    num_workers: 0
+    pin_memory: true
+    persistent_workers: false
+    prefetch_factor: 2

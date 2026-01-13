@@ -40,5 +40,12 @@ execution:
     drop_last: false
     shuffle: true
     seed: 42
+    length_column: "text_length"
+    length_scale: 1.0
   telemetry:
     enabled: true
+  data_loader:
+    num_workers: 4
+    pin_memory: true
+    persistent_workers: true
+    prefetch_factor: 2
