@@ -7,7 +7,7 @@
 # HPC training overrides
 training:
   num_epochs: 300
-  batch_size: 64  # Base batch (dynamic batching uses token budget instead)
+  batch_size: 128  # Base batch (dynamic batching uses token budget instead)
   learning_rate: 3e-5
   layerwise_lr_decay: 0.9
   gradient_accumulation_steps: 2
@@ -41,9 +41,9 @@ optimization:
   
   # torch.compile with CUDA Graph capture
   use_torch_compile: true
-  torch_compile_mode: "default"
-  compile_train_step: false
-  torch_compile_disable_cudagraphs: true
+  torch_compile_mode: "reduce-overhead"
+  compile_train_step: true
+  torch_compile_disable_cudagraphs: false
 
   # Manual CUDA-graph training (disabled by default)
   use_cuda_graph_training: false
@@ -55,16 +55,16 @@ optimization:
   use_device_prefetch: true
   
   # Quantized bucketing for compilation stability
-  quantize_step: 16
+  quantize_step: 32
   
   # Conservative token budget - autotuning will scale up if headroom exists
   # Start lower to avoid OOM cascade during warmup
-  token_budget: 32768
+  token_budget: 393216
 
 # HPC execution overrides
 execution:
   autotuning:
-    enabled: true  # Let runtime find optimal budget
+    enabled: false  # Let runtime find optimal budget
     warmup_batches: 10
     initial_token_budget: 32768  # Start conservative, scale up if headroom
     min_token_budget: 4096
@@ -81,7 +81,7 @@ execution:
     enabled: true
     # NO artificial cap - token budget controls batch size
     max_batch_size: 4096  # Effectively uncapped
-    min_batch_size: 32  # Minimum for GPU efficiency
+    min_batch_size: 128  # Minimum for GPU efficiency
     drop_last: false
     shuffle: true
     seed: 42

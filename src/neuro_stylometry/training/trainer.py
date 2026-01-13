@@ -187,8 +187,9 @@ class PhaseDTrainer:
         if self._precision == "fp8":
             if not is_fp8_available():
                 logger.warning(
-                    "FP8 precision requested but TransformerEngine not available. "
-                    "Falling back to BF16."
+                    "⚠️ FP8 requested but TransformerEngine not installed. "
+                    "Install with: pip install transformer-engine. "
+                    "Falling back to BF16 (1.5-2x slower than FP8)."
                 )
                 self._precision = "bf16"
             else:
@@ -604,13 +605,35 @@ class PhaseDTrainer:
             step = int(checkpoint_meta.get("step", 0))
             optimizer_step = int(checkpoint_meta.get("optimizer_step", 0))
 
-        steps_per_epoch = len(loader)
-        total_batch_steps = (
-            int(self.config.max_steps)
-            if self.config.max_steps
-            else steps_per_epoch * self.config.num_epochs
+        # len(loader) can be unreliable with dynamic batch samplers (budget changes per epoch)
+        # Use try/except and mark as approximate when dynamic batching is active
+        try:
+            steps_per_epoch = len(loader)
+        except TypeError:
+            # Sampler doesn't support __len__ (infinite or dynamic)
+            steps_per_epoch = None
+        
+        # Track whether batch count is approximate (dynamic batching can change it)
+        batch_sampler = getattr(loader, "batch_sampler", None)
+        is_dynamic_batching = (
+            batch_sampler is not None 
+            and hasattr(batch_sampler, "budget_provider")
+            and callable(getattr(batch_sampler, "budget_provider", None))
+        ) or self._runtime_controller is not None
+        
+        if steps_per_epoch is not None:
+            total_batch_steps = (
+                int(self.config.max_steps)
+                if self.config.max_steps
+                else steps_per_epoch * self.config.num_epochs
+            )
+        else:
+            # Fallback estimate when length unknown
+            total_batch_steps = int(self.config.max_steps) if self.config.max_steps else None
+        
+        total_optimizer_steps = (
+            math.ceil(total_batch_steps / accum_steps) if total_batch_steps else 1000
         )
-        total_optimizer_steps = math.ceil(total_batch_steps / accum_steps)
         scheduler = build_scheduler(
             optimizer=optimizer,
             scheduler_name=self.config.scheduler_name,
@@ -628,11 +651,16 @@ class PhaseDTrainer:
         
         # Overall training info
         num_epochs = self.config.num_epochs
-        total_batches = len(loader)
-        logger.info(
-            f"Starting training: {num_epochs} epochs, ~{total_batches} batches/epoch, "
-            f"{total_batches * num_epochs} total batches"
-        )
+        if steps_per_epoch is not None:
+            batch_qualifier = "~" if is_dynamic_batching else ""
+            logger.info(
+                f"Starting training: {num_epochs} epochs, {batch_qualifier}{steps_per_epoch} batches/epoch"
+                + (f" (dynamic budget)" if is_dynamic_batching else "")
+            )
+        else:
+            logger.info(
+                f"Starting training: {num_epochs} epochs, unknown batches/epoch (dynamic sampler)"
+            )
         
         # Validate and wire DevicePrefetcher for async H2D transfers
         use_device_prefetch = self._use_device_prefetch and self.device.type == "cuda"
@@ -666,13 +694,22 @@ class PhaseDTrainer:
                 else loader
             )
             
+            # Determine batch count for progress bar - prefer loader length, handle dynamic cases
+            try:
+                epoch_total = len(loader)  # Re-check each epoch (samplers may update)
+            except TypeError:
+                epoch_total = steps_per_epoch  # Use cached estimate or None
+            
             # Progress bar for batches within epoch - single persistent bar
+            # Explicitly pass total to avoid tqdm guessing wrong on wrapped iterators
             batch_pbar = tqdm(
                 train_iterator,
                 desc=f"Epoch {epoch + 1}/{num_epochs}",
+                total=epoch_total,  # Explicit total handles DevicePrefetcher wrapping
                 unit="batch",
                 leave=True,  # Keep bar visible after epoch completes
                 ncols=100,  # Fixed width for consistency
+                dynamic_ncols=False,  # Prevent resize issues
             )
             
             for batch in batch_pbar:
