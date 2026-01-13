@@ -371,7 +371,7 @@ class PhaseDTrainer:
         # Apply torch.compile for kernel optimization (CUDA Graphs)
         if self._use_torch_compile and self.device.type == "cuda":
             logger.info(
-                f"Applying torch.compile to model (mode={self._torch_compile_mode})"
+                f"Applying torch.compile to transformer (mode={self._torch_compile_mode})"
             )
             try:
                 # Compile the transformer backbone for CUDA Graph caching
@@ -381,13 +381,9 @@ class PhaseDTrainer:
                     mode=self._torch_compile_mode,
                     fullgraph=False,  # Allow graph breaks for flexibility
                 )
-                # Also compile the classification head
-                head = torch.compile(
-                    head,
-                    mode=self._torch_compile_mode,
-                    fullgraph=False,
-                )
-                logger.info("torch.compile applied successfully")
+                # Keep the classification head eager to avoid multi-graph
+                # CUDA tensor overwrite issues at the graph boundary.
+                logger.info("torch.compile applied to transformer (head excluded)")
             except Exception as e:
                 logger.warning(f"torch.compile failed, continuing without: {e}")
         
