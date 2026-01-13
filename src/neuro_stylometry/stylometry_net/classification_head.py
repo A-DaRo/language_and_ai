@@ -24,10 +24,18 @@ class MultiTaskHead(nn.Module):
         self.heads = nn.ModuleDict(
             {task: nn.Linear(hidden_dim, n) for task, n in num_labels_per_task.items()}
         )
+        self.task_order = tuple(num_labels_per_task.keys())
 
     def forward(self, cls_embedding: torch.Tensor) -> Dict[str, torch.Tensor]:
         cls_embedding = self.dropout(cls_embedding)
         return {task: head(cls_embedding) for task, head in self.heads.items()}
+
+    def forward_compiled(self, cls_embedding: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        cls_embedding = self.dropout(cls_embedding)
+        logits = []
+        for task in self.task_order:
+            logits.append(self.heads[task](cls_embedding))
+        return tuple(logits)
 
     def compute_loss(
         self,
@@ -57,3 +65,30 @@ class MultiTaskHead(nn.Module):
             total_loss = weighted if total_loss is None else total_loss + weighted
 
         return total_loss
+
+    def compute_loss_compiled(
+        self,
+        logits: tuple[torch.Tensor, ...],
+        labels: tuple[torch.Tensor, ...],
+        ignore_index: int = -1,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        first_logits = logits[0]
+        total_loss = torch.zeros((), device=first_logits.device, dtype=first_logits.dtype)
+        valid_flag = torch.zeros((), device=first_logits.device, dtype=torch.int32)
+        for task_logits, task_labels in zip(logits, labels):
+            valid_mask = task_labels != ignore_index
+            valid_count = valid_mask.sum()
+            per_sample = F.cross_entropy(
+                task_logits,
+                task_labels,
+                reduction="none",
+                ignore_index=ignore_index,
+            )
+            loss_sum = (per_sample * valid_mask).sum()
+            denom = valid_count.clamp(min=1)
+            task_loss = loss_sum / denom
+            total_loss = total_loss + task_loss
+            valid_flag = valid_flag + (valid_count > 0).to(valid_flag.dtype)
+
+        valid_flag = (valid_flag > 0).to(valid_flag.dtype)
+        return total_loss, valid_flag

@@ -652,23 +652,21 @@ class PhaseDTrainer:
             def _compiled_step(
                 input_ids: torch.Tensor,
                 attention_mask: torch.Tensor,
-                labels: Dict[str, torch.Tensor],
+                labels: tuple[torch.Tensor, ...],
             ) -> tuple[torch.Tensor, torch.Tensor]:
-                outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-                logits = head(outputs["cls_embedding"])
-                loss = head.compute_loss(logits, labels)
-                if loss is None:
-                    zero = torch.zeros((), device=input_ids.device)
-                    flag = torch.zeros((), device=input_ids.device, dtype=torch.int32)
-                    return zero, flag
+                cls_embedding = model.forward_cls(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                )
+                logits = head.forward_compiled(cls_embedding)
+                loss, valid_flag = head.compute_loss_compiled(logits, labels)
                 (loss / accum_steps).backward()
-                flag = torch.ones((), device=input_ids.device, dtype=torch.int32)
-                return loss, flag
+                return loss, valid_flag
 
             compiled_step = torch.compile(
                 _compiled_step,
                 mode=self._torch_compile_mode,
-                fullgraph=False,
+                fullgraph=True,
             )
             logger.info("torch.compile applied to full train step")
 
@@ -726,10 +724,13 @@ class PhaseDTrainer:
                         autocast_ctx = self._get_autocast_context()
                         with autocast_ctx:
                             if compiled_step is not None:
+                                labels_tuple = tuple(
+                                    labels[task] for task in head.task_order
+                                )
                                 loss_tensor, did_backward = compiled_step(
                                     input_ids,
                                     attention_mask,
-                                    labels,
+                                    labels_tuple,
                                 )
                                 did_backward = bool(did_backward.item())
                             else:

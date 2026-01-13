@@ -133,3 +133,37 @@ class AffineGuardTransformer(nn.Module):
             output["hidden_states"] = encoder_outputs.hidden_states
 
         return output
+
+    def forward_cls(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        *,
+        head_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if attention_mask is None:
+            attention_mask = torch.ones_like(input_ids, dtype=torch.long)
+
+        embedding_output = self.model.embeddings(input_ids)
+        if self.affine_guard is not None:
+            embedding_output = self.affine_guard(embedding_output)
+
+        extended_attention_mask = self.model.get_extended_attention_mask(
+            attention_mask, input_ids.shape
+        )
+        if head_mask is not None:
+            head_mask = self.model.get_head_mask(
+                head_mask, self.model.config.num_hidden_layers
+            )
+
+        encoder_outputs = self.model.encoder(
+            embedding_output,
+            attention_mask=extended_attention_mask,
+            head_mask=head_mask,
+            output_attentions=False,
+            output_hidden_states=False,
+            return_dict=True,
+        )
+
+        sequence_output = encoder_outputs.last_hidden_state
+        return sequence_output[:, 0, :]
