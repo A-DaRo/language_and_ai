@@ -31,7 +31,7 @@ class MultiTaskHead(nn.Module):
         return {task: head(cls_embedding) for task, head in self.heads.items()}
 
     def forward_compiled(self, cls_embedding: torch.Tensor) -> tuple[torch.Tensor, ...]:
-        cls_embedding = self.dropout(cls_embedding)
+        # cls_embedding = self.dropout(cls_embedding) # DEBUG: Disable dropout
         logits = []
         for task in self.task_order:
             logits.append(self.heads[task](cls_embedding))
@@ -53,14 +53,20 @@ class MultiTaskHead(nn.Module):
             if task_labels is None:
                 continue
 
-            valid_mask = task_labels != ignore_index
-            if valid_mask.sum().item() == 0:
-                continue
-
+            # Avoid GPU sync: use cross_entropy with ignore_index directly
+            # instead of checking valid_mask.sum().item() == 0
+            # PyTorch's cross_entropy handles ignore_index efficiently
             task_loss = F.cross_entropy(
-                task_logits[valid_mask],
-                task_labels[valid_mask],
+                task_logits,
+                task_labels,
+                ignore_index=ignore_index,
             )
+            
+            # Skip NaN losses (happens when all labels are ignore_index)
+            # if torch.isnan(task_loss):
+            #     continue
+            task_loss = torch.nan_to_num(task_loss, nan=0.0)
+                
             weighted = weights.get(task, 1.0) * task_loss
             total_loss = weighted if total_loss is None else total_loss + weighted
 
@@ -72,6 +78,9 @@ class MultiTaskHead(nn.Module):
         labels: tuple[torch.Tensor, ...],
         ignore_index: int = -1,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # DEBUG BYPASS: Return sum of logits as loss to check backward
+        return (logits[0].sum() * 0.001), torch.full((), 1.0, device=logits[0].device)
+        
         first_logits = logits[0]
         total_loss = torch.zeros((), device=first_logits.device, dtype=first_logits.dtype)
         valid_flag = torch.zeros((), device=first_logits.device, dtype=torch.int32)

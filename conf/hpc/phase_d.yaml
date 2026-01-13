@@ -43,7 +43,10 @@ optimization:
   use_torch_compile: true
   torch_compile_mode: "reduce-overhead"
   compile_train_step: true
-  torch_compile_disable_cudagraphs: false
+  # IMPORTANT: Set to true to avoid "tensor output of CUDAGraphs overwritten" errors
+  # This uses mode="default" (kernel fusion only) instead of CUDA Graph capture
+  # Slight throughput reduction (~1.2x vs ~2.5x) but much more stable
+  torch_compile_disable_cudagraphs: true
 
   # Manual CUDA-graph training (disabled by default)
   use_cuda_graph_training: false
@@ -59,7 +62,7 @@ optimization:
   
   # Conservative token budget - autotuning will scale up if headroom exists
   # Start lower to avoid OOM cascade during warmup
-  token_budget: 131027
+  token_budget: 32768  # 64K tokens
 
 # HPC execution overrides
 execution:

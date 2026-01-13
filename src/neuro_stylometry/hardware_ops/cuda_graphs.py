@@ -126,16 +126,34 @@ class GraphCache:
         # Capture stream (reused across captures)
         self._capture_stream: Optional[torch.cuda.Stream] = None
         
+        # CUDA graph memory pool for stable allocations across captures
+        self._capture_pool: Optional[Tuple[int, int]] = None
+        
         # Check CUDA availability
         self._cuda_available = torch.cuda.is_available()
         if self.config.enabled and not self._cuda_available:
             logger.warning("CUDA graphs requested but CUDA not available - disabling")
             self.config.enabled = False
         
+        # Initialize memory pool if enabled
+        if self.config.enabled and self.config.use_cuda_graph_memory_pool and self._cuda_available:
+            try:
+                # Get memory pool handle from CUDA allocator
+                # This creates a dedicated pool for graph captures, reducing fragmentation
+                self._capture_pool = torch.cuda.graph_pool_handle()
+                logger.info(
+                    f"CUDA graph memory pool initialized "
+                    f"(hint: {self.config.capture_pool_size_mb}MB)"
+                )
+            except Exception as e:
+                logger.warning(f"Failed to create CUDA graph pool: {e}")
+                self._capture_pool = None
+        
         if self.config.enabled:
             logger.info(
                 f"GraphCache initialized: max_graphs={self.config.max_cached_graphs}, "
-                f"warmup={self.config.warmup_iterations}"
+                f"warmup={self.config.warmup_iterations}, "
+                f"memory_pool={'enabled' if self._capture_pool else 'disabled'}"
             )
     
     @property
@@ -184,10 +202,17 @@ class GraphCache:
             self._capture_stream = torch.cuda.Stream()
         
         # Allocate input buffers (copy input shapes)
+        # Use detach().clone() to ensure clean buffer creation, matching raw_test success
         input_buffers = {
-            name: tensor.clone().detach()
+            name: tensor.detach().clone()
             for name, tensor in input_tensors.items()
         }
+
+        # Ensure input buffers are ready on capture stream by syncing host/device
+        torch.cuda.synchronize()
+        
+        # Make capture stream wait for current stream processing?
+        # torch.cuda.current_stream().synchronize() # Already covered by global sync
         
         # Warmup iterations (stabilizes CUDA state)
         with torch.cuda.stream(self._capture_stream):
@@ -195,12 +220,19 @@ class GraphCache:
                 _ = forward_fn(**input_buffers)
         
         # Synchronize before capture
-        torch.cuda.current_stream().wait_stream(self._capture_stream)
+        torch.cuda.synchronize()
         
-        # Capture the graph
+        # Capture the graph with dedicated memory pool (if available)
         graph = torch.cuda.CUDAGraph()
         
-        with torch.cuda.graph(graph, stream=self._capture_stream):
+        capture_kwargs = {"stream": self._capture_stream}
+        if self._capture_pool is not None:
+             capture_kwargs["pool"] = self._capture_pool
+        
+        # Ensure optimizer logic hasn't touched gradients in a way that confuses capture?
+        # Since we can't control optimizer here, rely on user doing zero_grad() before run()
+        
+        with torch.cuda.graph(graph, **capture_kwargs):
             output_dict = forward_fn(**input_buffers)
         
         # Keep captured output tensors so replay writes into the same buffers.
