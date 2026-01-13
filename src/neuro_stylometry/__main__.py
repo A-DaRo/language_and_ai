@@ -355,6 +355,12 @@ def validate_handover(artifacts_dir: Path):
     help="Auto-preprocess dataset if --dataset doesn't exist",
 )
 @click.option(
+    "--pre-pad/--no-pre-pad",
+    default=True,
+    show_default=True,
+    help="Use pre-padding for tokenization (recommended for HPC mode)",
+)
+@click.option(
     "--mode",
     type=click.Choice(["laptop", "hpc"]),
     default="laptop",
@@ -383,6 +389,7 @@ def run_phase_d(
     mode: str,
     config_path: Path | None,
     data_change: str,
+    pre_pad: bool,
 ):
     """Train Phase D baseline and constrained models."""
     from .config import find_config_root, load_phase_d_config
@@ -432,6 +439,7 @@ def run_phase_d(
                 max_length=max_length,
                 text_field="post_masked",  # Tokenize masked text for constrained model
                 num_workers=None,  # Auto-detect
+                pre_pad=pre_pad,
             )
             
             click.echo(f"\nTokenization complete: {stats['num_rows']} rows in {stats['elapsed_seconds']:.1f}s")
