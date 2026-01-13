@@ -5,13 +5,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional
+import random
+from typing import Callable, Dict, Iterable, List, Optional
 
 import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.feather as feather
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Sampler
 
 from ..data_engine.schemas import get_demographic_columns
 from .tokenizer import PhaseDTokenizer
@@ -118,6 +119,10 @@ class PhaseDDataset(Dataset):
         post_id = self.table["post_id"][index].as_py() if "post_id" in self.table.column_names else None
         return {"text": text or "", "labels": labels, "post_id": post_id}
 
+    def get_text(self, index: int) -> str:
+        text = self._text_col[index].as_py()
+        return text or ""
+
 
 class PhaseDCollator:
     """Tokenizing collator for Phase D."""
@@ -143,6 +148,73 @@ class PhaseDCollator:
             "labels": labels,
             "post_id": [sample.get("post_id") for sample in batch],
         }
+
+
+class PhaseDBudgetedBatchSampler(Sampler[List[int]]):
+    """Batch sampler that respects a dynamic token budget."""
+
+    def __init__(
+        self,
+        dataset: PhaseDDataset,
+        *,
+        length_fn: Callable[[int], int],
+        budget_provider: Callable[[], int],
+        max_batch_size: int,
+        min_batch_size: int = 1,
+        shuffle: bool = True,
+        drop_last: bool = False,
+        seed: int = 42,
+    ) -> None:
+        self.dataset = dataset
+        self.length_fn = length_fn
+        self.budget_provider = budget_provider
+        self.max_batch_size = max(1, int(max_batch_size))
+        self.min_batch_size = max(1, int(min_batch_size))
+        self.shuffle = shuffle
+        self.drop_last = drop_last
+        self.seed = seed
+        self._epoch = 0
+        self._length_cache = [-1] * len(dataset)
+
+    def set_epoch(self, epoch: int) -> None:
+        self._epoch = int(epoch)
+
+    def __len__(self) -> int:
+        return max(1, (len(self.dataset) + self.max_batch_size - 1) // self.max_batch_size)
+
+    def _get_length(self, index: int) -> int:
+        cached = self._length_cache[index]
+        if cached >= 0:
+            return cached
+        length = max(1, int(self.length_fn(index)))
+        self._length_cache[index] = length
+        return length
+
+    def __iter__(self):
+        indices = list(range(len(self.dataset)))
+        if self.shuffle:
+            rng = random.Random(self.seed + self._epoch)
+            rng.shuffle(indices)
+
+        batch: List[int] = []
+        budget = max(1, int(self.budget_provider()))
+        total_tokens = 0
+
+        for idx in indices:
+            length = self._get_length(idx)
+
+            if batch and (total_tokens + length > budget or len(batch) >= self.max_batch_size):
+                if len(batch) >= self.min_batch_size or not self.drop_last:
+                    yield batch
+                batch = []
+                budget = max(1, int(self.budget_provider()))
+                total_tokens = 0
+
+            batch.append(idx)
+            total_tokens += length
+
+        if batch and (len(batch) >= self.min_batch_size or not self.drop_last):
+            yield batch
 
 
 def load_label_maps(

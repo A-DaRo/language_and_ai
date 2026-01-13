@@ -115,3 +115,9 @@ class PhaseDTokenizer:
             max_length=self.max_length,
             return_tensors=return_tensors,
         )
+
+    def estimate_length(self, text: str) -> int:
+        try:
+            return len(self.tokenizer.encode(text, add_special_tokens=True))
+        except Exception:
+            return max(1, len(text.split()))

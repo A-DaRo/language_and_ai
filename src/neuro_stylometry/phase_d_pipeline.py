@@ -111,7 +111,9 @@ def run_phase_d_training(
         learning_rate=config['training']['learning_rate'],
         layerwise_lr_decay=config['training'].get('layerwise_lr_decay', 1.0),
         gradient_accumulation_steps=config['training'].get('gradient_accumulation_steps', 1),
-        mixed_precision=config['training'].get('mixed_precision', False),
+        precision=config['training'].get('precision') or (
+            "bf16" if config['training'].get('mixed_precision', False) else "fp32"
+        ),
         resume_from=resume_from,
         scheduler_name=config.get('scheduler', {}).get('name', 'linear'),
         num_warmup_steps=config.get('scheduler', {}).get('num_warmup_steps', 0),
@@ -122,6 +124,7 @@ def run_phase_d_training(
         save_every_steps=config['training'].get('save_every_steps'),
         save_every_epochs=config['training'].get('save_every_epochs'),
         split_ratios=config['data'].get('split_ratios'),
+        execution_config=config.get("execution", {}),
     )
 
     baseline_trainer = PhaseDTrainer(baseline_config)
@@ -131,6 +134,8 @@ def run_phase_d_training(
         text_field="post",
         label_maps=None,
         split="train",
+        shuffle=True,
+        enable_dynamic_batching=True,
     )
     baseline_trainer.label_maps = label_maps
 
@@ -138,12 +143,16 @@ def run_phase_d_training(
         text_field="post",
         label_maps=label_maps,
         split="val",
+        shuffle=False,
+        enable_dynamic_batching=False,
     )
 
     test_loader, _ = baseline_trainer._build_loader(
         text_field="post",
         label_maps=label_maps,
         split="test",
+        shuffle=False,
+        enable_dynamic_batching=False,
     )
 
     logger.info(f"Train samples: {len(train_loader.dataset)}")
@@ -210,7 +219,9 @@ def run_phase_d_training(
         learning_rate=config['training']['learning_rate'],
         layerwise_lr_decay=config['training'].get('layerwise_lr_decay', 1.0),
         gradient_accumulation_steps=config['training'].get('gradient_accumulation_steps', 1),
-        mixed_precision=config['training'].get('mixed_precision', False),
+        precision=config['training'].get('precision') or (
+            "bf16" if config['training'].get('mixed_precision', False) else "fp32"
+        ),
         resume_from=resume_from,
         scheduler_name=config.get('scheduler', {}).get('name', 'linear'),
         num_warmup_steps=config.get('scheduler', {}).get('num_warmup_steps', 0),
@@ -221,6 +232,7 @@ def run_phase_d_training(
         save_every_steps=config['training'].get('save_every_steps'),
         save_every_epochs=config['training'].get('save_every_epochs'),
         split_ratios=config['data'].get('split_ratios'),
+        execution_config=config.get("execution", {}),
     )
 
     constrained_trainer = PhaseDTrainer(constrained_config)
@@ -231,18 +243,24 @@ def run_phase_d_training(
         text_field="post_masked",
         label_maps=label_maps,
         split="train",
+        shuffle=True,
+        enable_dynamic_batching=True,
     )
 
     val_loader_c, _ = constrained_trainer._build_loader(
         text_field="post_masked",
         label_maps=label_maps,
         split="val",
+        shuffle=False,
+        enable_dynamic_batching=False,
     )
 
     test_loader_c, _ = constrained_trainer._build_loader(
         text_field="post_masked",
         label_maps=label_maps,
         split="test",
+        shuffle=False,
+        enable_dynamic_batching=False,
     )
 
     # Build constrained model with Affine Guard

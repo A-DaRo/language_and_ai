@@ -6,7 +6,7 @@ training:
   learning_rate: 3e-5
   layerwise_lr_decay: 0.9
   gradient_accumulation_steps: 2
-  mixed_precision: true
+  precision: "bf16"
   max_steps: null
   resume_from: null
   early_stopping:
@@ -18,3 +18,27 @@ training:
 scheduler:
   name: "cosine"
   num_warmup_steps: 500
+
+execution:
+  autotuning:
+    enabled: true
+    warmup_batches: 10
+    initial_token_budget: 65536
+    min_token_budget: 8192
+    max_token_budget: 262144
+    memory_headroom_mb: 2048
+    scale_up_factor: 1.25
+    scale_down_factor: 0.85
+    oom_slash_factor: 0.5
+    stability_threshold: 0.1
+    history_window: 10
+    recovery_patience: 5
+  dynamic_batching:
+    enabled: true
+    max_batch_size: 32
+    min_batch_size: 1
+    drop_last: false
+    shuffle: true
+    seed: 42
+  telemetry:
+    enabled: true
