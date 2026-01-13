@@ -120,6 +120,7 @@ class PhaseDTrainConfig:
     use_torch_compile: bool = True  # Apply torch.compile to model
     torch_compile_mode: str = "reduce-overhead"  # CUDA Graph optimization
     compile_train_step: bool = False  # Compile full train step (forward+loss+backward)
+    torch_compile_disable_cudagraphs: bool = False
     use_cuda_graph_training: bool = False  # Manual CUDA-graph training path
     cuda_graph_training: Dict[str, Any] = field(default_factory=dict)
     use_fused_optimizer: bool = True  # Fused AdamW kernel
@@ -179,6 +180,9 @@ class PhaseDTrainer:
         self._use_torch_compile = bool(config.use_torch_compile)
         self._torch_compile_mode = str(config.torch_compile_mode)
         self._compile_train_step = bool(config.compile_train_step)
+        self._torch_compile_disable_cudagraphs = bool(
+            config.torch_compile_disable_cudagraphs
+        )
         self._use_cuda_graph_training = bool(config.use_cuda_graph_training)
         self._cuda_graph_training_cfg = config.cuda_graph_training or {}
         self._use_fused_optimizer = bool(config.use_fused_optimizer)
@@ -202,7 +206,8 @@ class PhaseDTrainer:
             f"PhaseDTrainer initialized: device={self.device}, precision={self._precision}, "
             f"aot_mode={self._aot_mode_requested}, torch_compile={self._use_torch_compile}, "
             f"compile_train_step={self._compile_train_step}, "
-            f"cuda_graph_training={self._use_cuda_graph_training}"
+            f"cuda_graph_training={self._use_cuda_graph_training}, "
+            f"torch_compile_disable_cudagraphs={self._torch_compile_disable_cudagraphs}"
         )
 
         if self._use_cuda_graph_training:
@@ -413,6 +418,19 @@ class PhaseDTrainer:
                 f"Applying torch.compile to transformer (mode={self._torch_compile_mode})"
             )
             try:
+                if self._torch_compile_disable_cudagraphs:
+                    try:
+                        import torch._inductor.config as inductor_config
+
+                        if hasattr(inductor_config, "triton") and hasattr(
+                            inductor_config.triton, "cudagraphs"
+                        ):
+                            inductor_config.triton.cudagraphs = False
+                        if hasattr(inductor_config, "cudagraphs"):
+                            inductor_config.cudagraphs = False
+                        logger.info("Disabled torch.compile CUDA graphs via Inductor config")
+                    except Exception as e:
+                        logger.warning(f"Failed to disable CUDA graphs: {e}")
                 # Compile the transformer backbone for CUDA Graph caching
                 # mode="reduce-overhead" enables automatic CUDA Graph capture
                 model = torch.compile(

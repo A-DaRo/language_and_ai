@@ -19,6 +19,7 @@ optimization:
   
   # Disable torch.compile on laptop (compilation overhead > benefit for small runs)
   use_torch_compile: false
+  torch_compile_disable_cudagraphs: true
 
   # Manual CUDA-graph training (disabled on laptop)
   use_cuda_graph_training: false

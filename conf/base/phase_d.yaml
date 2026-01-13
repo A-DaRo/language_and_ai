@@ -100,6 +100,7 @@ optimization:
   # torch.compile settings for CUDA Graph caching
   use_torch_compile: true
   torch_compile_mode: "reduce-overhead"  # Enables automatic CUDA Graph capture
+  torch_compile_disable_cudagraphs: false
 
   # Manual CUDA-graph training (forward + loss + backward capture)
   # NOTE: Requires static bucket shapes and disables torch.compile.

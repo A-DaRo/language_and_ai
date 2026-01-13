@@ -37,8 +37,9 @@ optimization:
   
   # torch.compile with CUDA Graph capture
   use_torch_compile: true
-  torch_compile_mode: "max-autotune"
+  torch_compile_mode: "default"
   compile_train_step: false
+  torch_compile_disable_cudagraphs: true
 
   # Manual CUDA-graph training (disabled by default)
   use_cuda_graph_training: false
