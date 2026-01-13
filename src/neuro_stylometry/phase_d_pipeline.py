@@ -111,9 +111,7 @@ def run_phase_d_training(
         learning_rate=config['training']['learning_rate'],
         layerwise_lr_decay=config['training'].get('layerwise_lr_decay', 1.0),
         gradient_accumulation_steps=config['training'].get('gradient_accumulation_steps', 1),
-        precision=config['training'].get('precision') or (
-            "bf16" if config['training'].get('mixed_precision', False) else "fp32"
-        ),
+        precision=config['training'].get('precision', 'fp32'),
         resume_from=resume_from,
         scheduler_name=config.get('scheduler', {}).get('name', 'linear'),
         num_warmup_steps=config.get('scheduler', {}).get('num_warmup_steps', 0),
@@ -219,9 +217,7 @@ def run_phase_d_training(
         learning_rate=config['training']['learning_rate'],
         layerwise_lr_decay=config['training'].get('layerwise_lr_decay', 1.0),
         gradient_accumulation_steps=config['training'].get('gradient_accumulation_steps', 1),
-        precision=config['training'].get('precision') or (
-            "bf16" if config['training'].get('mixed_precision', False) else "fp32"
-        ),
+        precision=config['training'].get('precision', 'fp32'),
         resume_from=resume_from,
         scheduler_name=config.get('scheduler', {}).get('name', 'linear'),
         num_warmup_steps=config.get('scheduler', {}).get('num_warmup_steps', 0),

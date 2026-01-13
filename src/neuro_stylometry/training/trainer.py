@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from contextlib import nullcontext
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import math
 import json
@@ -10,13 +11,16 @@ from pathlib import Path
 from typing import Dict, Optional, Any
 
 import torch
-from torch.cuda.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
+from ..hardware_ops.oom_guard import execute_with_oom_protection
+from ..hardware_ops.runtime import RuntimeController
+from ..hardware_ops.telemetry import CUDATimer, TelemetryCollector, create_runtime_metrics
 from ..data_engine.schemas import get_demographic_columns
 from ..stylometry_net.classification_head import MultiTaskHead
 from ..stylometry_net.phase_d_dataset import (
+    PhaseDBudgetedBatchSampler,
     PhaseDCollator,
     PhaseDDataset,
     PhaseDLabelMaps,
@@ -43,7 +47,7 @@ class PhaseDTrainConfig:
     learning_rate: float = 2e-5
     layerwise_lr_decay: float = 1.0
     gradient_accumulation_steps: int = 1
-    mixed_precision: bool = False
+    precision: str = "fp32"
     resume_from: Optional[Path] = None
     scheduler_name: str = "linear"
     num_warmup_steps: int = 0
@@ -54,6 +58,7 @@ class PhaseDTrainConfig:
     save_every_steps: Optional[int] = None
     save_every_epochs: Optional[int] = None
     split_ratios: Dict[str, float] = None
+    execution_config: Dict[str, Any] = field(default_factory=dict)
 
 
 class PhaseDTrainer:
@@ -62,6 +67,25 @@ class PhaseDTrainer:
     def __init__(self, config: PhaseDTrainConfig) -> None:
         self.config = config
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self._execution_config = config.execution_config or {}
+        autotuning_cfg = self._execution_config.get("autotuning", {})
+        self._autotuning_enabled = bool(autotuning_cfg.get("enabled", False))
+        self._runtime_controller = (
+            RuntimeController.from_config({"execution": {"autotuning": autotuning_cfg}})
+            if self._autotuning_enabled
+            else None
+        )
+        self._dynamic_batching_cfg = self._execution_config.get("dynamic_batching", {})
+        self._dynamic_batching_enabled = bool(
+            self._dynamic_batching_cfg.get("enabled", self._autotuning_enabled)
+        )
+        self._telemetry_enabled = bool(
+            self._execution_config.get("telemetry", {}).get("enabled", False)
+            or self._autotuning_enabled
+        )
+        self._telemetry = TelemetryCollector.get_instance() if self._telemetry_enabled else None
+        self._static_token_budget = int(self.config.batch_size * self.config.max_length)
+        self._precision = str(self.config.precision or "fp32").lower()
 
     def _build_loader(
         self,
@@ -69,6 +93,8 @@ class PhaseDTrainer:
         text_field: str,
         label_maps: Optional[PhaseDLabelMaps] = None,
         split: Optional[str] = None,
+        shuffle: bool = False,
+        enable_dynamic_batching: bool = False,
     ) -> tuple[DataLoader, PhaseDLabelMaps]:
         dataset = PhaseDDataset(
             self.config.dataset_path,
@@ -78,19 +104,55 @@ class PhaseDTrainer:
             split=split,
             split_ratios=self.config.split_ratios,
         )
-        collator = PhaseDCollator(
-            PhaseDTokenizer(
-                model_name=self.config.model_name,
-                max_length=self.config.max_length,
-                taxonomy_path=self.config.taxonomy_path,
+        tokenizer = PhaseDTokenizer(
+            model_name=self.config.model_name,
+            max_length=self.config.max_length,
+            taxonomy_path=self.config.taxonomy_path,
+        )
+        collator = PhaseDCollator(tokenizer)
+
+        if enable_dynamic_batching and self._dynamic_batching_enabled:
+            max_batch_size = int(
+                self._dynamic_batching_cfg.get("max_batch_size", self.config.batch_size)
             )
-        )
-        loader = DataLoader(
-            dataset,
-            batch_size=self.config.batch_size,
-            shuffle=True,
-            collate_fn=collator,
-        )
+            min_batch_size = int(self._dynamic_batching_cfg.get("min_batch_size", 1))
+            drop_last = bool(self._dynamic_batching_cfg.get("drop_last", False))
+            shuffle_batches = bool(self._dynamic_batching_cfg.get("shuffle", shuffle))
+            seed = int(self._dynamic_batching_cfg.get("seed", 42))
+
+            def length_fn(index: int) -> int:
+                text = dataset.get_text(index)
+                length = tokenizer.estimate_length(text)
+                return min(int(length), int(self.config.max_length))
+
+            budget_provider = (
+                self._runtime_controller.get_next_budget
+                if self._runtime_controller
+                else lambda: self._static_token_budget
+            )
+            batch_sampler = PhaseDBudgetedBatchSampler(
+                dataset,
+                length_fn=length_fn,
+                budget_provider=budget_provider,
+                max_batch_size=max_batch_size,
+                min_batch_size=min_batch_size,
+                shuffle=shuffle_batches,
+                drop_last=drop_last,
+                seed=seed,
+            )
+            loader = DataLoader(
+                dataset,
+                batch_sampler=batch_sampler,
+                collate_fn=collator,
+                num_workers=0,
+            )
+        else:
+            loader = DataLoader(
+                dataset,
+                batch_size=self.config.batch_size,
+                shuffle=shuffle,
+                collate_fn=collator,
+            )
         return loader, dataset.label_maps
 
     def _build_model(self, *, use_affine_guard: bool) -> tuple[AffineGuardTransformer, MultiTaskHead]:
@@ -133,6 +195,7 @@ class PhaseDTrainer:
         model.eval()
         head.eval()
         metrics: Dict[str, Dict[str, float]] = {}
+        use_bf16 = self.device.type == "cuda" and self._precision in {"bf16", "bfloat16"}
 
         task_logits: Dict[str, list[torch.Tensor]] = {k: [] for k in num_classes}
         task_labels: Dict[str, list[torch.Tensor]] = {k: [] for k in num_classes}
@@ -142,8 +205,14 @@ class PhaseDTrainer:
             attention_mask = batch["attention_mask"].to(self.device)
             labels = {k: v.to(self.device) for k, v in batch["labels"].items()}
 
-            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-            logits = head(outputs["cls_embedding"])
+            autocast_ctx = (
+                torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+                if use_bf16
+                else nullcontext()
+            )
+            with autocast_ctx:
+                outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+                logits = head(outputs["cls_embedding"])
 
             for task, task_logits_batch in logits.items():
                 task_logits[task].append(task_logits_batch.detach().cpu())
@@ -176,6 +245,7 @@ class PhaseDTrainer:
         model.eval()
         head.eval()
         details: Dict[str, Dict[str, Any]] = {}
+        use_bf16 = self.device.type == "cuda" and self._precision in {"bf16", "bfloat16"}
 
         task_logits: Dict[str, list[torch.Tensor]] = {k: [] for k in num_classes}
         task_labels: Dict[str, list[torch.Tensor]] = {k: [] for k in num_classes}
@@ -185,8 +255,14 @@ class PhaseDTrainer:
             attention_mask = batch["attention_mask"].to(self.device)
             labels = {k: v.to(self.device) for k, v in batch["labels"].items()}
 
-            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-            logits = head(outputs["cls_embedding"])
+            autocast_ctx = (
+                torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+                if use_bf16
+                else nullcontext()
+            )
+            with autocast_ctx:
+                outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+                logits = head(outputs["cls_embedding"])
 
             for task, task_logits_batch in logits.items():
                 task_logits[task].append(task_logits_batch.detach().cpu())
@@ -217,8 +293,7 @@ class PhaseDTrainer:
         run_dir: Path,
     ) -> None:
         accum_steps = max(1, int(self.config.gradient_accumulation_steps))
-        use_amp = bool(self.config.mixed_precision) and self.device.type == "cuda"
-        scaler = GradScaler(enabled=use_amp)
+        use_bf16 = self.device.type == "cuda" and self._precision in {"bf16", "bfloat16"}
 
         param_groups = build_param_groups(
             model=model,
@@ -248,14 +323,11 @@ class PhaseDTrainer:
             model.load_state_dict(resume_payload["model_state"])
             head.load_state_dict(resume_payload["head_state"])
             optimizer.load_state_dict(resume_payload["optimizer_state"])
-            scaler_state = resume_payload.get("scaler_state")
             meta = resume_payload.get("metadata", {})
             checkpoint_meta = meta.get("checkpoint", {})
             start_epoch = int(checkpoint_meta.get("epoch", 0))
             step = int(checkpoint_meta.get("step", 0))
             optimizer_step = int(checkpoint_meta.get("optimizer_step", 0))
-            if scaler_state and use_amp:
-                scaler.load_state_dict(scaler_state)
 
         steps_per_epoch = len(loader)
         total_batch_steps = (
@@ -281,40 +353,81 @@ class PhaseDTrainer:
         for epoch in range(start_epoch, self.config.num_epochs):
             optimizer.zero_grad(set_to_none=True)
             accum_counter = 0
+            batch_sampler = getattr(loader, "batch_sampler", None)
+            if hasattr(batch_sampler, "set_epoch"):
+                batch_sampler.set_epoch(epoch)
             progress = tqdm(loader, desc=f"Epoch {epoch + 1}", leave=False)
             for batch in progress:
                 input_ids = batch["input_ids"].to(self.device)
                 attention_mask = batch["attention_mask"].to(self.device)
                 labels = {k: v.to(self.device) for k, v in batch["labels"].items()}
 
-                with autocast(enabled=use_amp):
-                    outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-                    logits = head(outputs["cls_embedding"])
-                    loss = head.compute_loss(logits, labels)
+                tokens = int(attention_mask.sum().item())
+                batch_size = int(attention_mask.size(0))
 
-                if loss is None:
-                    continue
-
-                loss_value = float(loss.item())
-                loss = loss / accum_steps
-                if use_amp:
-                    scaler.scale(loss).backward()
-                else:
-                    loss.backward()
-
-                accum_counter += 1
-                if accum_counter >= accum_steps:
-                    if use_amp:
-                        scaler.step(optimizer)
-                        scaler.update()
-                    else:
-                        optimizer.step()
+                def handle_oom(_event) -> None:
+                    nonlocal accum_counter
                     optimizer.zero_grad(set_to_none=True)
-                    if scheduler is not None:
-                        scheduler.step()
-                    optimizer_step += 1
                     accum_counter = 0
 
+                def run_step() -> tuple[Optional[float], bool]:
+                    nonlocal accum_counter, optimizer_step
+                    timer_ctx = CUDATimer() if self._telemetry_enabled else nullcontext()
+                    with timer_ctx as timer:
+                        autocast_ctx = (
+                            torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+                            if use_bf16
+                            else nullcontext()
+                        )
+                        with autocast_ctx:
+                            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+                            logits = head(outputs["cls_embedding"])
+                            loss = head.compute_loss(logits, labels)
+
+                        if loss is None:
+                            return None, False
+
+                        loss_value = float(loss.item())
+                        loss = loss / accum_steps
+                        loss.backward()
+
+                        did_step = False
+                        accum_counter += 1
+                        if accum_counter >= accum_steps:
+                            optimizer.step()
+                            optimizer.zero_grad(set_to_none=True)
+                            if scheduler is not None:
+                                scheduler.step()
+                            optimizer_step += 1
+                            accum_counter = 0
+                            did_step = True
+
+                    if self._telemetry_enabled and self._telemetry is not None and timer is not None:
+                        self._telemetry.record_batch(
+                            batch_size=batch_size,
+                            tokens=tokens,
+                            elapsed_ms=timer.elapsed_ms,
+                        )
+                        if self._runtime_controller is not None:
+                            runtime_metrics = create_runtime_metrics(
+                                timer,
+                                tokens=tokens,
+                                batch_size=batch_size,
+                            )
+                            self._runtime_controller.report_metrics(runtime_metrics)
+
+                    return loss_value, did_step
+
+                loss_value, did_step = execute_with_oom_protection(
+                    run_step,
+                    controller=self._runtime_controller,
+                    on_oom=handle_oom,
+                )
+
+                if loss_value is None:
+                    continue
+
+                if did_step:
                     step_metrics = {
                         "timestamp": datetime.now(timezone.utc).isoformat(),
                         "epoch": epoch + 1,
@@ -334,7 +447,6 @@ class PhaseDTrainer:
                             head_state=head.state_dict(),
                             optimizer_state=optimizer.state_dict(),
                             scheduler_state=scheduler.state_dict() if scheduler else None,
-                            scaler_state=scaler.state_dict() if use_amp else None,
                             metadata={
                                 "config": config_to_metadata(self.config),
                                 "label_maps": self.label_maps.maps,
@@ -348,11 +460,7 @@ class PhaseDTrainer:
                 if self.config.max_steps and step >= self.config.max_steps:
                     break
             if accum_counter > 0:
-                if use_amp:
-                    scaler.step(optimizer)
-                    scaler.update()
-                else:
-                    optimizer.step()
+                optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
                 if scheduler is not None:
                     scheduler.step()
@@ -364,7 +472,6 @@ class PhaseDTrainer:
                     head_state=head.state_dict(),
                     optimizer_state=optimizer.state_dict(),
                     scheduler_state=scheduler.state_dict() if scheduler else None,
-                    scaler_state=scaler.state_dict() if use_amp else None,
                     metadata={
                         "config": config_to_metadata(self.config),
                         "label_maps": self.label_maps.maps,
@@ -422,7 +529,6 @@ class PhaseDTrainer:
             head_state=head.state_dict(),
             optimizer_state=optimizer.state_dict(),
             scheduler_state=scheduler.state_dict() if scheduler else None,
-            scaler_state=scaler.state_dict() if use_amp else None,
             metadata={
                 "config": config_to_metadata(self.config),
                 "label_maps": self.label_maps.maps,
