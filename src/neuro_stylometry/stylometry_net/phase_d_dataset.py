@@ -98,30 +98,9 @@ class PhaseDDataset(Dataset):
 
         self._text_col = self.table[self.text_field]
         self._label_cols = {field: self.table[field] for field in self.label_fields}
-        token_prefix = f"{self.text_field}_"
-        token_names = {
-            "input_ids": f"{token_prefix}input_ids",
-            "attention_mask": f"{token_prefix}attention_mask",
-            "token_count": f"{token_prefix}token_count",
-        }
-        self._token_cols = {}
-        for key, column_name in token_names.items():
-            if column_name in self.table.column_names:
-                self._token_cols[key] = self.table[column_name]
-        if not self._token_cols:
-            for key in ("input_ids", "attention_mask", "token_count"):
-                if key in self.table.column_names:
-                    self._token_cols[key] = self.table[key]
-
         self._length_cols = {
             name: self.table[name]
-            for name in (
-                "text_length",
-                "token_length",
-                "masked_text_length",
-                "token_count",
-                token_names["token_count"],
-            )
+            for name in ("text_length", "token_length", "masked_text_length")
             if name in self.table.column_names
         }
 
@@ -143,50 +122,22 @@ class PhaseDDataset(Dataset):
             value = col[index].as_py()
             labels[field] = self._encode_label(field, value)
         post_id = self.table["post_id"][index].as_py() if "post_id" in self.table.column_names else None
-        sample = {"text": text or "", "labels": labels, "post_id": post_id}
-        if "input_ids" in self._token_cols:
-            sample["input_ids"] = self._token_cols["input_ids"][index].as_py()
-            if "attention_mask" in self._token_cols:
-                sample["attention_mask"] = self._token_cols["attention_mask"][index].as_py()
-            if "token_count" in self._token_cols:
-                sample["token_count"] = self._token_cols["token_count"][index].as_py()
-        return sample
+        return {"text": text or "", "labels": labels, "post_id": post_id}
 
     def get_text(self, index: int) -> str:
         text = self._text_col[index].as_py()
         return text or ""
 
     def get_length(self, index: int, column: str = "text_length") -> Optional[int]:
-        if column in self._token_cols and column == "token_count":
-            value = self._token_cols[column][index].as_py()
-        elif column in self._length_cols:
-            value = self._length_cols[column][index].as_py()
-        else:
+        if column not in self._length_cols:
             return None
+        value = self._length_cols[column][index].as_py()
         if value is None:
             return None
         try:
             return int(value)
         except (TypeError, ValueError):
             return None
-
-    def get_length_array(self, column: str = "text_length") -> Optional[List[int]]:
-        if column in self._token_cols and column == "token_count":
-            values = self._token_cols[column].to_pylist()
-        elif column in self._length_cols:
-            values = self._length_cols[column].to_pylist()
-        else:
-            return None
-        lengths: List[int] = []
-        for value in values:
-            if value is None:
-                lengths.append(0)
-            else:
-                try:
-                    lengths.append(int(value))
-                except (TypeError, ValueError):
-                    lengths.append(0)
-        return lengths
 
 
 class PhaseDCollator:
@@ -196,31 +147,8 @@ class PhaseDCollator:
         self.tokenizer = tokenizer
 
     def __call__(self, batch: List[Dict]) -> Dict[str, torch.Tensor | Dict]:
-        use_pretokenized = bool(batch and "input_ids" in batch[0])
-        if use_pretokenized:
-            sequences = [sample["input_ids"] for sample in batch]
-            max_len = max((len(seq) for seq in sequences), default=0)
-            pad_id = int(self.tokenizer.tokenizer.pad_token_id or 0)
-            input_ids = torch.full(
-                (len(sequences), max_len),
-                pad_id,
-                dtype=torch.long,
-            )
-            attention_mask = torch.zeros((len(sequences), max_len), dtype=torch.long)
-            for idx, seq in enumerate(sequences):
-                if not seq:
-                    continue
-                seq_len = len(seq)
-                input_ids[idx, :seq_len] = torch.tensor(seq, dtype=torch.long)
-                if "attention_mask" in batch[0]:
-                    mask_seq = batch[idx].get("attention_mask") or [1] * seq_len
-                    attention_mask[idx, :seq_len] = torch.tensor(mask_seq, dtype=torch.long)
-                else:
-                    attention_mask[idx, :seq_len] = 1
-            encoding = {"input_ids": input_ids, "attention_mask": attention_mask}
-        else:
-            texts = [sample["text"] for sample in batch]
-            encoding = self.tokenizer.encode_batch(texts)
+        texts = [sample["text"] for sample in batch]
+        encoding = self.tokenizer.encode_batch(texts)
 
         labels: Dict[str, torch.Tensor] = {}
         if batch:

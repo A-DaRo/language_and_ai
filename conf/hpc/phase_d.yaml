@@ -20,15 +20,6 @@ scheduler:
   num_warmup_steps: 500
 
 execution:
-  bucketing:
-    enabled: true
-    batch_size: 32
-    mega_batch_mult: 100
-    shuffle: true
-    drop_last: false
-    seed: 42
-    length_column: "token_count"
-    length_scale: 1.0
   autotuning:
     enabled: true
     warmup_batches: 10
@@ -43,7 +34,7 @@ execution:
     history_window: 10
     recovery_patience: 5
   dynamic_batching:
-    enabled: false
+    enabled: true
     max_batch_size: 128
     min_batch_size: 32
     drop_last: false
@@ -53,8 +44,6 @@ execution:
     length_scale: 1.0
   telemetry:
     enabled: true
-    sample_every: 50
-    synchronize: false
   data_loader:
     num_workers: 4
     pin_memory: true

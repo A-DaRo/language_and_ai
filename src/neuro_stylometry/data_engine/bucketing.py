@@ -7,7 +7,7 @@ and a PyTorch Sampler that groups similar-length sequences together.
 
 import torch
 from torch.utils.data import Sampler
-from typing import Iterable, List, Tuple, Optional
+from typing import List, Tuple, Optional
 import numpy as np
 from datasets import Dataset
 import logging
@@ -257,65 +257,3 @@ def create_bucketed_sampler(
         shuffle=shuffle,
         seed=seed
     )
-
-
-class SortishBatchSampler(Sampler[List[int]]):
-    """
-    Sortish batch sampler for offline length-based bucketing.
-
-    Precomputes batches by sorting indices by length, grouping into
-    mega-batches, shuffling mega-batches, then forming batches.
-    """
-
-    def __init__(
-        self,
-        lengths: Iterable[int],
-        *,
-        batch_size: int,
-        mega_batch_mult: int = 100,
-        shuffle: bool = True,
-        seed: int = 42,
-        drop_last: bool = False,
-    ) -> None:
-        self.lengths = np.asarray(list(lengths), dtype=np.int64)
-        self.batch_size = int(batch_size)
-        self.mega_batch_mult = int(mega_batch_mult)
-        self.shuffle = bool(shuffle)
-        self.seed = int(seed)
-        self.drop_last = bool(drop_last)
-        self.epoch = 0
-
-    def set_epoch(self, epoch: int) -> None:
-        self.epoch = int(epoch)
-
-    def __len__(self) -> int:
-        total = len(self.lengths)
-        if self.drop_last:
-            return total // self.batch_size
-        return (total + self.batch_size - 1) // self.batch_size
-
-    def __iter__(self):
-        indices = np.argsort(self.lengths, kind="stable")
-        rng = np.random.default_rng(self.seed + self.epoch)
-        mega = self.batch_size * max(1, self.mega_batch_mult)
-        mega_batches = [
-            indices[i:i + mega]
-            for i in range(0, len(indices), mega)
-        ]
-        if self.shuffle:
-            rng.shuffle(mega_batches)
-
-        batches: List[List[int]] = []
-        for mega_batch in mega_batches:
-            mega_list = mega_batch.tolist()
-            for i in range(0, len(mega_list), self.batch_size):
-                batch = mega_list[i:i + self.batch_size]
-                if len(batch) < self.batch_size and self.drop_last:
-                    continue
-                batches.append(batch)
-
-        if self.shuffle:
-            rng.shuffle(batches)
-
-        for batch in batches:
-            yield batch

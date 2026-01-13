@@ -69,15 +69,6 @@ SOBR_SCHEMA = pa.schema(_SOBR_BASE_FIELDS)
 # Extended schema including post_chunked for staged execution
 SOBR_SCHEMA_STAGED = pa.schema(_SOBR_BASE_FIELDS + [POST_CHUNKED_FIELD])
 
-# Tokenized schema for Phase D pre-processing (input_ids/attention_mask/token_count)
-_SOBR_TOKENIZED_FIELDS = [
-    ("input_ids", pa.list_(pa.uint16())),
-    ("attention_mask", pa.list_(pa.int8())),
-    ("token_count", pa.int32()),
-]
-
-SOBR_SCHEMA_TOKENIZED = pa.schema(_SOBR_BASE_FIELDS + _SOBR_TOKENIZED_FIELDS)
-
 
 # ==============================================================================
 # Pollution Detection Log Schema
@@ -237,11 +228,6 @@ def is_post_chunked_fully_populated(table: pa.Table) -> bool:
     if not has_post_chunked_column(table):
         return False
     return count_missing_post_chunked(table) == 0
-
-
-def has_tokenized_columns(table: pa.Table) -> bool:
-    """True iff input_ids and attention_mask columns exist."""
-    return "input_ids" in table.column_names and "attention_mask" in table.column_names
 
 
 def validate_schema_flexible(

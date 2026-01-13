@@ -134,7 +134,6 @@ def run_phase_d_training(
         split="train",
         shuffle=True,
         enable_dynamic_batching=True,
-        enable_bucketing=True,
     )
     baseline_trainer.label_maps = label_maps
 
@@ -242,7 +241,6 @@ def run_phase_d_training(
         split="train",
         shuffle=True,
         enable_dynamic_batching=True,
-        enable_bucketing=True,
     )
 
     val_loader_c, _ = constrained_trainer._build_loader(

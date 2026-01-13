@@ -19,7 +19,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.feather as feather
 
-from ..data_engine.schemas import SOBR_SCHEMA, get_demographic_columns, validate_schema_flexible
+from ..data_engine.schemas import SOBR_SCHEMA, get_demographic_columns, validate_schema
 
 logger = logging.getLogger(__name__)
 
@@ -48,7 +48,7 @@ def audit_dataset(arrow_path: Path, config: Optional[AuditConfig] = None) -> Dic
     schema_ok = True
     schema_error = None
     try:
-        validate_schema_flexible(table, SOBR_SCHEMA)
+        validate_schema(table, SOBR_SCHEMA)
     except Exception as exc:
         schema_ok = False
         schema_error = str(exc)
