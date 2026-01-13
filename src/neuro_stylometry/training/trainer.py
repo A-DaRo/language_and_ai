@@ -124,6 +124,8 @@ class PhaseDTrainConfig:
     use_aot_mode: bool = True  # Use pre-tokenized data + FastCollator
     use_torch_compile: bool = True  # Apply torch.compile to model
     torch_compile_mode: str = "reduce-overhead"  # CUDA Graph optimization
+    torch_compile_dynamic: bool = False
+    torch_compile_backend: str = "inductor"
     compile_train_step: bool = False  # Compile full train step (forward+loss+backward)
     torch_compile_disable_cudagraphs: bool = False
     use_cuda_graph_training: bool = False  # Manual CUDA-graph training path
@@ -184,6 +186,9 @@ class PhaseDTrainer:
         self._use_device_prefetch = bool(config.use_device_prefetch)
         self._use_torch_compile = bool(config.use_torch_compile)
         self._torch_compile_mode = str(config.torch_compile_mode)
+        self._torch_compile_dynamic = bool(config.torch_compile_dynamic)
+        self._torch_compile_backend = str(config.torch_compile_backend)
+        self._compile_train_step = bool(config.compile_train_step)
         self._torch_compile_disable_cudagraphs = bool(config.torch_compile_disable_cudagraphs)
         self._use_fused_optimizer = bool(config.use_fused_optimizer)
         self._quantize_step = int(config.quantize_step)
@@ -393,33 +398,40 @@ class PhaseDTrainer:
         
         # Apply torch.compile for kernel optimization
         if self._use_torch_compile and self.device.type == "cuda":
-            # Override to "default" mode if CUDA Graphs are disabled
-            # "reduce-overhead" uses CUDA Graphs which can cause tensor overwrite errors
-            # "default" still provides kernel fusion benefits without graph capture
-            effective_mode = (
-                "default" if self._torch_compile_disable_cudagraphs 
-                else self._torch_compile_mode
-            )
-            logger.info(
-                f"Applying torch.compile to transformer (mode={effective_mode}, "
-                f"cudagraphs={'disabled' if self._torch_compile_disable_cudagraphs else 'enabled'})"
-            )
-            try:
-                # Compile the transformer backbone
-                # mode="default": kernel fusion only (stable)
-                # mode="reduce-overhead": CUDA Graph capture (faster but can cause tensor aliasing)
-                model = torch.compile(
-                    model,
-                    mode=effective_mode,
-                    fullgraph=False,  # Allow graph breaks for flexibility
+            if self._compile_train_step:
+                logger.info("compile_train_step enabled; skipping model-only torch.compile")
+            else:
+                # Override to "default" mode if CUDA Graphs are disabled
+                # "reduce-overhead" uses CUDA Graphs which can cause tensor overwrite errors
+                # "default" still provides kernel fusion benefits without graph capture
+                effective_mode = (
+                    "default" if self._torch_compile_disable_cudagraphs
+                    else self._torch_compile_mode
                 )
-                # DO NOT compile head:
-                # - Head is <5% of compute (single linear per task)
-                # - Dict return can cause CUDA Graph tensor aliasing
-                # - Stability > marginal speedup
-                logger.info("torch.compile applied to transformer only (head excluded)")
-            except Exception as e:
-                logger.warning(f"torch.compile failed, continuing without: {e}")
+                logger.info(
+                    "Applying torch.compile to transformer "
+                    f"(mode={effective_mode}, backend={self._torch_compile_backend}, "
+                    f"dynamic={self._torch_compile_dynamic}, "
+                    f"cudagraphs={'disabled' if self._torch_compile_disable_cudagraphs else 'enabled'})"
+                )
+                try:
+                    # Compile the transformer backbone
+                    # mode="default": kernel fusion only (stable)
+                    # mode="reduce-overhead": CUDA Graph capture (faster but can cause tensor aliasing)
+                    model = torch.compile(
+                        model,
+                        mode=effective_mode,
+                        fullgraph=False,  # Allow graph breaks for flexibility
+                        dynamic=self._torch_compile_dynamic,
+                        backend=self._torch_compile_backend,
+                    )
+                    # DO NOT compile head:
+                    # - Head is <5% of compute (single linear per task)
+                    # - Dict return can cause CUDA Graph tensor aliasing
+                    # - Stability > marginal speedup
+                    logger.info("torch.compile applied to transformer only (head excluded)")
+                except Exception as e:
+                    logger.warning(f"torch.compile failed, continuing without: {e}")
         
         return model, head
 
@@ -608,6 +620,7 @@ class PhaseDTrainer:
                 max_cached_graphs=int(cg_conf.get("max_cached_graphs", 16)),
                 capture_pool_size_mb=int(cg_conf.get("capture_pool_size_mb", 256)),
                 use_cuda_graph_memory_pool=bool(cg_conf.get("use_cuda_graph_memory_pool", True)),
+                clone_outputs=bool(cg_conf.get("clone_outputs", True)),
             )
             graph_cache = GraphCache(config=cache_config)
             graph_trainer = GraphAwareTraining(
@@ -624,6 +637,11 @@ class PhaseDTrainer:
                     "Switching effective mode to 'default' to prevent double-graphing."
                 )
                 self._torch_compile_mode = "default"
+            if self._compile_train_step:
+                logger.warning(
+                    "compile_train_step ignored because use_cuda_graph_training is enabled."
+                )
+                self._compile_train_step = False
 
         run_dir.mkdir(parents=True, exist_ok=True)
         checkpoint_dir = run_dir / "checkpoints"
@@ -688,6 +706,72 @@ class PhaseDTrainer:
             if scheduler_state:
                 scheduler.load_state_dict(scheduler_state)
 
+        if self._compile_train_step and not self._use_torch_compile:
+            logger.warning(
+                "compile_train_step enabled but use_torch_compile is false; disabling."
+            )
+            self._compile_train_step = False
+
+        effective_compile_mode = (
+            "default" if self._torch_compile_disable_cudagraphs else self._torch_compile_mode
+        )
+
+        compiled_step_fn = None
+        label_keys: list[str] = []
+        if self._compile_train_step:
+            if hasattr(head, "task_order"):
+                label_keys = list(head.task_order)
+            if not label_keys:
+                logger.warning(
+                    "compile_train_step enabled but task order is unavailable; disabling."
+                )
+                self._compile_train_step = False
+
+        if self._compile_train_step:
+            if self.device.type != "cuda":
+                logger.warning(
+                    "compile_train_step enabled but CUDA is unavailable; disabling."
+                )
+                self._compile_train_step = False
+            else:
+                def _compiled_step(
+                    input_ids: torch.Tensor,
+                    attention_mask: torch.Tensor,
+                    *label_tensors: torch.Tensor,
+                ) -> torch.Tensor:
+                    outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+                    cls_embedding = outputs["cls_embedding"].clone()
+                    logits = head(cls_embedding)
+                    label_dict = {
+                        key: label for key, label in zip(label_keys, label_tensors)
+                    }
+                    loss = head.compute_loss(logits, label_dict)
+                    if loss is None:
+                        return torch.zeros((), device=input_ids.device)
+                    scaled_loss = loss / accum_steps
+                    scaled_loss.backward()
+                    return scaled_loss
+
+                try:
+                    compiled_step_fn = torch.compile(
+                        _compiled_step,
+                        mode=effective_compile_mode,
+                        fullgraph=False,
+                        dynamic=self._torch_compile_dynamic,
+                        backend=self._torch_compile_backend,
+                    )
+                    logger.info(
+                        "torch.compile applied to full train step "
+                        f"(mode={effective_compile_mode}, "
+                        f"backend={self._torch_compile_backend}, "
+                        f"dynamic={self._torch_compile_dynamic})"
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"torch.compile full train step failed, falling back: {e}"
+                    )
+                    compiled_step_fn = None
+
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
         best_score = None
         bad_epochs = 0
@@ -737,11 +821,14 @@ class PhaseDTrainer:
                 else loader
             )
             
-            # Determine batch count for progress bar - prefer loader length, handle dynamic cases
-            try:
-                epoch_total = len(loader)  # Re-check each epoch (samplers may update)
-            except TypeError:
-                epoch_total = steps_per_epoch  # Use cached estimate or None
+            # Determine batch count for progress bar - disable total for dynamic batching
+            if is_dynamic_batching:
+                epoch_total = None
+            else:
+                try:
+                    epoch_total = len(loader)  # Re-check each epoch (samplers may update)
+                except TypeError:
+                    epoch_total = steps_per_epoch  # Use cached estimate or None
             
             # Progress bar for batches within epoch - single persistent bar
             # Explicitly pass total to avoid tqdm guessing wrong on wrapped iterators
@@ -870,21 +957,34 @@ class PhaseDTrainer:
                         # Use precision-aware autocast context
                         autocast_ctx = self._get_autocast_context()
                         with autocast_ctx:
-                            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-                            # Clone cls_embedding to break CUDA Graph memory reuse dependency.
-                            # Without this, the backward pass may try to read tensors that have
-                            # been overwritten by a subsequent CUDA Graph execution.
-                            cls_embedding = outputs["cls_embedding"].clone()
-                            logits = head(cls_embedding)
-                            loss = head.compute_loss(logits, labels)
+                            if compiled_step_fn is not None:
+                                try:
+                                    label_tensors = tuple(labels[key] for key in label_keys)
+                                except KeyError as exc:
+                                    raise RuntimeError(
+                                        f"Missing label key for compile_train_step: {exc}"
+                                    ) from exc
+                                loss = compiled_step_fn(
+                                    input_ids,
+                                    attention_mask,
+                                    *label_tensors,
+                                )
+                            else:
+                                outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+                                # Clone cls_embedding to break CUDA Graph memory reuse dependency.
+                                # Without this, the backward pass may try to read tensors that have
+                                # been overwritten by a subsequent CUDA Graph execution.
+                                cls_embedding = outputs["cls_embedding"].clone()
+                                logits = head(cls_embedding)
+                                loss = head.compute_loss(logits, labels)
 
-                        if loss is None:
-                            return None, False, True  # loss_value, did_step, skip_batch
+                                if loss is None:
+                                    return None, False, True  # loss_value, did_step, skip_batch
 
-                        # Async loss logging: only extract scalar when needed for telemetry/logging
-                        # This avoids GPU→CPU sync on every batch, significantly improving throughput
-                        loss = loss / accum_steps
-                        loss.backward()
+                                # Async loss logging: only extract scalar when needed for telemetry/logging
+                                # This avoids GPU→CPU sync on every batch, significantly improving throughput
+                                loss = loss / accum_steps
+                                loss.backward()
                         
                         # Extract loss value only when we need it (strided telemetry or progress bar)
                         loss_value = float(loss.detach().item()) if should_measure else None

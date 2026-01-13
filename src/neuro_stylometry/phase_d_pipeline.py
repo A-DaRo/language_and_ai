@@ -153,6 +153,8 @@ def run_phase_d_training(
         use_aot_mode=opt_cfg.get('use_aot_mode', False),
         use_torch_compile=opt_cfg.get('use_torch_compile', False),
         torch_compile_mode=opt_cfg.get('torch_compile_mode', 'reduce-overhead'),
+        torch_compile_dynamic=opt_cfg.get('torch_compile_dynamic', False),
+        torch_compile_backend=opt_cfg.get('torch_compile_backend', 'inductor'),
         compile_train_step=opt_cfg.get('compile_train_step', False),
         torch_compile_disable_cudagraphs=opt_cfg.get(
             'torch_compile_disable_cudagraphs', False
@@ -273,6 +275,8 @@ def run_phase_d_training(
         use_aot_mode=opt_cfg.get('use_aot_mode', False),
         use_torch_compile=opt_cfg.get('use_torch_compile', False),
         torch_compile_mode=opt_cfg.get('torch_compile_mode', 'reduce-overhead'),
+        torch_compile_dynamic=opt_cfg.get('torch_compile_dynamic', False),
+        torch_compile_backend=opt_cfg.get('torch_compile_backend', 'inductor'),
         compile_train_step=opt_cfg.get('compile_train_step', False),
         torch_compile_disable_cudagraphs=opt_cfg.get(
             'torch_compile_disable_cudagraphs', False

@@ -53,12 +53,14 @@ class GraphCacheConfig:
         max_cached_graphs: Maximum number of graphs to cache (LRU eviction).
         capture_pool_size_mb: Memory pool size for graph capture (MB).
         use_cuda_graph_memory_pool: Use CUDA graph-specific memory pool.
+        clone_outputs: Return clones of output buffers on replay (safer, slower).
     """
     enabled: bool = False
     warmup_iterations: int = 3
     max_cached_graphs: int = 16
     capture_pool_size_mb: int = 256
     use_cuda_graph_memory_pool: bool = True
+    clone_outputs: bool = True
 
 
 @dataclass
@@ -105,6 +107,7 @@ class GraphCache:
         )
     
     Note: CUDA graphs require static shapes. Use bucketing to limit shape variety.
+    Note: Disable clone_outputs only if callers never mutate returned tensors.
     """
     
     def __init__(self, config: Optional[GraphCacheConfig] = None):
@@ -287,11 +290,7 @@ class GraphCache:
         # Replay the graph
         captured.graph.replay()
         
-        # Return clones of output buffers (avoid returning internal buffers)
-        return {
-            name: tensor.clone()
-            for name, tensor in captured.output_buffers.items()
-        }
+        return self._format_outputs(captured.output_buffers)
     
     def run_with_graph(
         self,
@@ -339,7 +338,7 @@ class GraphCache:
                 self._lru_order.append(shape_key)
                 
                 # Return outputs from capture (already computed)
-                return dict(captured.output_buffers)
+                return self._format_outputs(captured.output_buffers)
     
     def _update_lru(self, shape_key: Tuple[int, ...]) -> None:
         """Move shape_key to end of LRU list (most recently used)."""
@@ -356,6 +355,11 @@ class GraphCache:
         if oldest_key in self._cache:
             del self._cache[oldest_key]
             logger.debug(f"Evicted CUDA graph for shape_key={oldest_key}")
+
+    def _format_outputs(self, outputs: Dict[str, Tensor]) -> Dict[str, Tensor]:
+        if not self.config.clone_outputs:
+            return dict(outputs)
+        return {name: tensor.clone() for name, tensor in outputs.items()}
     
     def clear(self) -> int:
         """
@@ -1174,6 +1178,7 @@ def create_graph_aware_training_from_config(
             use_cuda_graph_memory_pool=bool(
                 graph_cfg.get("use_cuda_graph_memory_pool", True)
             ),
+            clone_outputs=bool(graph_cfg.get("clone_outputs", True)),
         )
     )
     bucket_config = ShapeBucketConfig(

@@ -100,6 +100,9 @@ optimization:
   # torch.compile settings for CUDA Graph caching
   use_torch_compile: true
   torch_compile_mode: "reduce-overhead"  # Enables automatic CUDA Graph capture
+  torch_compile_dynamic: false
+  torch_compile_backend: "inductor"
+  compile_train_step: false
   torch_compile_disable_cudagraphs: false
 
   # Manual CUDA-graph training (forward + loss + backward capture)
@@ -118,6 +121,7 @@ optimization:
     max_cached_graphs: 16
     capture_pool_size_mb: 256
     use_cuda_graph_memory_pool: true
+    clone_outputs: true
     pad_token_id: 1
     ignore_index: -1
   

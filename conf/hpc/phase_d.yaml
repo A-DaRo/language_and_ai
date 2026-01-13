@@ -42,6 +42,8 @@ optimization:
   # torch.compile with CUDA Graph capture
   use_torch_compile: true
   torch_compile_mode: "reduce-overhead"
+  torch_compile_dynamic: false
+  torch_compile_backend: "inductor"
   compile_train_step: true
   # IMPORTANT: Set to true to avoid "tensor output of CUDAGraphs overwritten" errors
   # This uses mode="default" (kernel fusion only) instead of CUDA Graph capture

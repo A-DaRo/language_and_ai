@@ -10,12 +10,14 @@ Quantized bucketing is critical for torch.compile + CUDA Graphs:
 - Snap-to-Grid (step=16) reduces to ~32 shapes -> 95%+ graph cache hits
 """
 
-import torch
-from torch.utils.data import Sampler
-from typing import List, Tuple, Optional, Literal, Union, Callable
-import numpy as np
-from datasets import Dataset
 import logging
+import math
+from typing import List, Tuple, Optional, Literal, Union, Callable
+
+import numpy as np
+import torch
+from datasets import Dataset
+from torch.utils.data import Sampler
 
 logger = logging.getLogger(__name__)
 
@@ -528,10 +530,21 @@ class QuantizedBucketSampler(Sampler):
     
     def __len__(self) -> int:
         """Estimate total number of batches per epoch."""
-        total_samples = len(self.lengths)
-        # Rough estimate: assume average batch uses half the token budget
-        avg_samples_per_batch = max(1, self.current_budget // (self.max_length // 2))
-        return max(1, (total_samples + avg_samples_per_batch - 1) // avg_samples_per_batch)
+        if self._budget_is_callable:
+            total_samples = len(self.lengths)
+            # Rough estimate: assume average batch uses half the token budget
+            avg_samples_per_batch = max(1, self.current_budget // (self.max_length // 2))
+            return max(1, (total_samples + avg_samples_per_batch - 1) // avg_samples_per_batch)
+
+        budget = max(1, int(self._token_budget))
+        total_batches = 0
+        for bucket_id, indices in enumerate(self._bucket_indices):
+            if not indices:
+                continue
+            bucket_max_length = self.boundaries[bucket_id]
+            batch_capacity = max(1, budget // bucket_max_length)
+            total_batches += math.ceil(len(indices) / batch_capacity)
+        return max(1, total_batches)
     
     def set_epoch(self, epoch: int) -> None:
         """Set the epoch for reproducible shuffling."""
