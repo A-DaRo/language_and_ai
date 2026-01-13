@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Iterable, Optional
 
@@ -11,6 +12,8 @@ from transformers import AutoConfig, AutoModel
 
 from .affine_guard import AffineGuard
 from .tokenizer import PhaseDTokenizer
+
+logger = logging.getLogger(__name__)
 
 
 class AffineGuardTransformer(nn.Module):
@@ -36,7 +39,18 @@ class AffineGuardTransformer(nn.Module):
         super().__init__()
 
         self.config = AutoConfig.from_pretrained(model_name)
-        self.model = AutoModel.from_pretrained(model_name)
+
+        # Enable Scaled Dot-Product Attention (SDPA) with Flash backend
+        # Requires: transformers >= 4.36, torch >= 2.0
+        try:
+            self.model = AutoModel.from_pretrained(
+                model_name,
+                attn_implementation="sdpa",  # Use PyTorch SDPA
+            )
+            logger.info(f"SDPA attention enabled for {model_name}")
+        except Exception as e:
+            logger.warning(f"SDPA not available, using default attention: {e}")
+            self.model = AutoModel.from_pretrained(model_name)
 
         if not hasattr(self.model, "embeddings") or not hasattr(self.model, "encoder"):
             raise TypeError(

@@ -62,6 +62,7 @@ class TokenizerConfig:
     model_name: str
     max_length: int
     taxonomy_path: Optional[Path] = None
+    pre_pad: bool = False  # If True, pad all sequences to max_length for zero-copy collation
 
 
 # Global tokenizer for worker processes (initialized once per worker)
@@ -70,7 +71,7 @@ _worker_tokenizer = None
 
 def _init_worker(config: TokenizerConfig) -> None:
     """Initialize tokenizer in worker process."""
-    global _worker_tokenizer
+    global _worker_tokenizer, _worker_pre_pad
     
     # Import here to avoid loading in main process
     from transformers import AutoTokenizer
@@ -82,11 +83,16 @@ def _init_worker(config: TokenizerConfig) -> None:
     
     # Configure for our schema
     _worker_tokenizer.model_max_length = config.max_length
+    _worker_pre_pad = config.pre_pad
+
+
+# Global flag for pre-padding mode
+_worker_pre_pad: bool = False
 
 
 def _tokenize_batch(
     batch: List[Tuple[int, str]],
-) -> List[Tuple[int, List[int], List[int], int]]:
+) -> List[Tuple[int, np.ndarray, np.ndarray, int]]:
     """
     Tokenize a batch of texts in a worker process.
     
@@ -95,30 +101,52 @@ def _tokenize_batch(
         
     Returns:
         List of (index, input_ids, attention_mask, token_count) tuples.
+        When pre_pad=True, arrays are fixed-length (max_length) for zero-copy collation.
     """
-    global _worker_tokenizer
+    global _worker_tokenizer, _worker_pre_pad
     
     if _worker_tokenizer is None:
         raise RuntimeError("Worker tokenizer not initialized")
     
     results = []
+    max_length = _worker_tokenizer.model_max_length
     
     for idx, text in batch:
         if text is None:
             text = ""
         
-        # Tokenize with truncation
-        encoding = _worker_tokenizer(
-            text,
-            padding=False,  # No padding - we'll pad in collator with quantized lengths
-            truncation=True,
-            max_length=_worker_tokenizer.model_max_length,
-            return_attention_mask=True,
-        )
-        
-        input_ids = encoding["input_ids"]
-        attention_mask = encoding["attention_mask"]
-        token_count = len(input_ids)
+        if _worker_pre_pad:
+            # Pre-padded mode: pad to fixed max_length for zero-copy collation
+            # This enables torch.stack() in collator without per-sample copying
+            encoding = _worker_tokenizer(
+                text,
+                padding="max_length",  # Pad to fixed length
+                truncation=True,
+                max_length=max_length,
+                return_attention_mask=True,
+            )
+            
+            # Store as fixed-size numpy arrays (enables zero-copy in collator)
+            # Use int32 for input_ids (tokenizer vocab can exceed uint16)
+            # Use int8 for attention_mask (0/1 values)
+            input_ids = np.array(encoding["input_ids"], dtype=np.int32)
+            attention_mask = np.array(encoding["attention_mask"], dtype=np.int8)
+            
+            # token_count is the actual (non-padded) length
+            token_count = int(attention_mask.sum())
+        else:
+            # Variable-length mode: no padding, collator handles dynamic padding
+            encoding = _worker_tokenizer(
+                text,
+                padding=False,
+                truncation=True,
+                max_length=max_length,
+                return_attention_mask=True,
+            )
+            
+            input_ids = np.array(encoding["input_ids"], dtype=np.uint16)
+            attention_mask = np.array(encoding["attention_mask"], dtype=np.uint8)
+            token_count = len(input_ids)
         
         results.append((idx, input_ids, attention_mask, token_count))
     
@@ -164,6 +192,7 @@ def preprocess_dataset(
     num_workers: Optional[int] = None,
     chunk_size: int = 500,
     taxonomy_path: Optional[Path] = None,
+    pre_pad: bool = False,
 ) -> Dict[str, Any]:
     """
     Preprocess dataset with parallel tokenization.
@@ -195,6 +224,7 @@ def preprocess_dataset(
     logger.info(f"Text field: {text_field}")
     logger.info(f"Tokenizer: {model_name}, max_length={max_length}")
     logger.info(f"Workers: {num_workers}")
+    logger.info(f"Pre-padding mode: {pre_pad} (zero-copy collation)")
     
     # Validate text field exists
     if text_field not in table.column_names:
@@ -206,11 +236,12 @@ def preprocess_dataset(
         model_name=model_name,
         max_length=max_length,
         taxonomy_path=taxonomy_path,
+        pre_pad=pre_pad,
     )
     
     # Pre-allocate result arrays
-    all_input_ids: List[Optional[List[int]]] = [None] * num_rows
-    all_attention_masks: List[Optional[List[int]]] = [None] * num_rows
+    all_input_ids: List[Optional[np.ndarray]] = [None] * num_rows
+    all_attention_masks: List[Optional[np.ndarray]] = [None] * num_rows
     all_token_counts: List[int] = [0] * num_rows
     
     # Tokenize in parallel
@@ -242,17 +273,33 @@ def preprocess_dataset(
     # Build tokenized columns
     logger.info("Building Arrow columns...")
     
-    # Convert to uint16/uint8 for memory efficiency
-    input_ids_arrays = [
-        np.array(ids, dtype=np.uint16) for ids in all_input_ids
-    ]
-    attention_mask_arrays = [
-        np.array(mask, dtype=np.uint8) for mask in all_attention_masks
-    ]
+    if pre_pad:
+        # Pre-padded mode: store as fixed-size tensors for zero-copy collation
+        # Use FixedSizeList for efficient memory layout and potential zero-copy
+        input_ids_col = pa.FixedSizeListArray.from_arrays(
+            pa.array(np.stack(all_input_ids).flatten(), type=pa.int32()),
+            max_length,
+        )
+        attention_mask_col = pa.FixedSizeListArray.from_arrays(
+            pa.array(np.stack(all_attention_masks).flatten(), type=pa.int8()),
+            max_length,
+        )
+        logger.info(f"Pre-padded storage: {max_length} tokens/sample (zero-copy ready)")
+    else:
+        # Variable-length mode: convert to uint16/uint8 for memory efficiency
+        input_ids_arrays = [
+            ids.astype(np.uint16) if ids.dtype != np.uint16 else ids
+            for ids in all_input_ids
+        ]
+        attention_mask_arrays = [
+            mask.astype(np.uint8) if mask.dtype != np.uint8 else mask
+            for mask in all_attention_masks
+        ]
+        
+        # Create PyArrow arrays (variable-length lists)
+        input_ids_col = pa.array(input_ids_arrays, type=pa.list_(pa.uint16()))
+        attention_mask_col = pa.array(attention_mask_arrays, type=pa.list_(pa.uint8()))
     
-    # Create PyArrow arrays
-    input_ids_col = pa.array(input_ids_arrays, type=pa.list_(pa.uint16()))
-    attention_mask_col = pa.array(attention_mask_arrays, type=pa.list_(pa.uint8()))
     token_count_col = pa.array(all_token_counts, type=pa.int16())
     
     # Build output table with new columns
@@ -270,6 +317,15 @@ def preprocess_dataset(
         [text_field] * num_rows, type=pa.string()
     )
     
+    # Store pre-pad metadata for downstream zero-copy optimization
+    output_columns["is_pre_padded"] = pa.array(
+        [pre_pad] * num_rows, type=pa.bool_()
+    )
+    if pre_pad:
+        output_columns["padded_length"] = pa.array(
+            [max_length] * num_rows, type=pa.int16()
+        )
+    
     # Create output table
     output_table = pa.table(output_columns)
     
@@ -277,10 +333,15 @@ def preprocess_dataset(
     logger.info(f"Writing output: {output_path}")
     output_path.parent.mkdir(parents=True, exist_ok=True)
     
+    # Use uncompressed for pre-padded data to enable true zero-copy mmap
+    # Use lz4 for variable-length data (better space efficiency)
+    compression = None if pre_pad else "lz4"
+    logger.info(f"Compression: {compression or 'none (zero-copy optimized)'}")
+    
     feather.write_feather(
         output_table,
         output_path,
-        compression="lz4",  # Fast compression for mmap access
+        compression=compression,
     )
     
     # Compute statistics
@@ -294,6 +355,7 @@ def preprocess_dataset(
         "model_name": model_name,
         "max_length": max_length,
         "num_workers": num_workers,
+        "pre_pad": pre_pad,
         "elapsed_seconds": round(elapsed, 2),
         "rows_per_second": round(num_rows / elapsed, 1),
         "token_stats": {
@@ -362,6 +424,12 @@ def main() -> None:
         default=500,
         help="Samples per worker chunk",
     )
+    parser.add_argument(
+        "--pre-pad",
+        action="store_true",
+        default=False,
+        help="Pre-pad all sequences to max-length for zero-copy collation (HPC mode)",
+    )
     
     args = parser.parse_args()
     
@@ -377,6 +445,7 @@ def main() -> None:
         text_field=args.text_field,
         num_workers=args.workers,
         chunk_size=args.chunk_size,
+        pre_pad=args.pre_pad,
     )
     
     logger.info("Preprocessing complete!")

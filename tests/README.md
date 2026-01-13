@@ -47,9 +47,11 @@ tests/
 │   ├── test_config.py    # Configuration validation
 │   ├── test_leace.py     # LEACE mathematical properties
 │   ├── test_masker.py    # SpanMasker functionality
-│   └── test_dataset.py   # Dataset loading
+│   ├── test_dataset.py   # Dataset loading
+│   └── test_phase_d_tokenizer.py  # Phase D tokenizer alignment
 ├── integration/          # Component integration tests
 │   ├── test_phase_a_handover.py  # Handover contract validation
+│   ├── test_phase_d_training.py  # Phase D training pipeline
 │   ├── test_gliner_guard.py      # GLiNER pollution detection
 │   ├── test_data_engine.py       # Data pipeline integration
 │   ├── test_dual_mode.py         # Laptop/HPC mode switching

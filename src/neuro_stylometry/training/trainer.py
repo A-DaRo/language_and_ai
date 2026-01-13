@@ -255,13 +255,23 @@ class PhaseDTrainer:
             token_counts = dataset.get_all_token_counts()
             
             if token_counts is not None:
-                logger.info(
-                    f"Using QuantizedBucketSampler: {len(token_counts)} samples, "
-                    f"token_budget={self._token_budget}, step={self._quantize_step}"
-                )
+                # Use dynamic budget from RuntimeController if autotuning enabled
+                if self._runtime_controller is not None:
+                    budget_provider = self._runtime_controller.get_next_budget
+                    logger.info(
+                        f"Using QuantizedBucketSampler with dynamic budget: {len(token_counts)} samples, "
+                        f"step={self._quantize_step}, autotuning=enabled"
+                    )
+                else:
+                    budget_provider = self._token_budget
+                    logger.info(
+                        f"Using QuantizedBucketSampler: {len(token_counts)} samples, "
+                        f"token_budget={self._token_budget}, step={self._quantize_step}"
+                    )
+                
                 batch_sampler = create_quantized_sampler(
                     lengths=token_counts,
-                    token_budget=self._token_budget,
+                    token_budget=budget_provider,
                     max_length=self.config.max_length,
                     quantize_step=self._quantize_step,
                     shuffle=shuffle,
@@ -371,7 +381,7 @@ class PhaseDTrainer:
         # Apply torch.compile for kernel optimization (CUDA Graphs)
         if self._use_torch_compile and self.device.type == "cuda":
             logger.info(
-                f"Applying torch.compile to model (mode={self._torch_compile_mode})"
+                f"Applying torch.compile to transformer (mode={self._torch_compile_mode})"
             )
             try:
                 # Compile the transformer backbone for CUDA Graph caching
@@ -381,13 +391,11 @@ class PhaseDTrainer:
                     mode=self._torch_compile_mode,
                     fullgraph=False,  # Allow graph breaks for flexibility
                 )
-                # Also compile the classification head
-                head = torch.compile(
-                    head,
-                    mode=self._torch_compile_mode,
-                    fullgraph=False,
-                )
-                logger.info("torch.compile applied successfully")
+                # DO NOT compile head:
+                # - Head is <5% of compute (single linear per task)
+                # - Dict return can cause CUDA Graph tensor aliasing
+                # - Stability > marginal speedup
+                logger.info("torch.compile applied to transformer only (head excluded)")
             except Exception as e:
                 logger.warning(f"torch.compile failed, continuing without: {e}")
         
@@ -620,18 +628,41 @@ class PhaseDTrainer:
             f"{total_batches * num_epochs} total batches"
         )
         
+        # Validate and wire DevicePrefetcher for async H2D transfers
+        use_device_prefetch = self._use_device_prefetch and self.device.type == "cuda"
+        if use_device_prefetch:
+            # DevicePrefetcher requires AOT mode (tensor outputs from collator)
+            dataset = loader.dataset
+            if hasattr(dataset, "is_aot_mode") and not dataset.is_aot_mode:
+                logger.warning(
+                    "DevicePrefetcher requires AOT mode. Falling back to sync transfers. "
+                    "Run preprocess_tokens.py first."
+                )
+                use_device_prefetch = False
+            else:
+                from ..stylometry_net.phase_d_dataset import DevicePrefetcher
+                logger.info("DevicePrefetcher enabled: async H2D transfers active")
+        
         for epoch in range(start_epoch, num_epochs):
             optimizer.zero_grad(set_to_none=True)
             accum_counter = 0
             epoch_loss_sum = 0.0
             epoch_loss_count = 0
+            last_loss_value: Optional[float] = None  # Track last synced loss for async display
             batch_sampler = getattr(loader, "batch_sampler", None)
             if hasattr(batch_sampler, "set_epoch"):
                 batch_sampler.set_epoch(epoch)
             
+            # Wrap loader with DevicePrefetcher if enabled (async H2D transfers)
+            train_iterator = (
+                DevicePrefetcher(loader, device=self.device)
+                if use_device_prefetch
+                else loader
+            )
+            
             # Progress bar for batches within epoch - single persistent bar
             batch_pbar = tqdm(
-                loader,
+                train_iterator,
                 desc=f"Epoch {epoch + 1}/{num_epochs}",
                 unit="batch",
                 leave=True,  # Keep bar visible after epoch completes
@@ -639,12 +670,21 @@ class PhaseDTrainer:
             )
             
             for batch in batch_pbar:
-                input_ids = batch["input_ids"].to(self.device)
-                attention_mask = batch["attention_mask"].to(self.device)
-                labels = {k: v.to(self.device) for k, v in batch["labels"].items()}
+                # When using DevicePrefetcher, tensors are ALREADY on device
+                if use_device_prefetch:
+                    input_ids = batch["input_ids"]
+                    attention_mask = batch["attention_mask"]
+                    labels = batch["labels"]
+                else:
+                    input_ids = batch["input_ids"].to(self.device)
+                    attention_mask = batch["attention_mask"].to(self.device)
+                    labels = {k: v.to(self.device) for k, v in batch["labels"].items()}
 
-                tokens = int(attention_mask.sum().item())
-                batch_size = int(attention_mask.size(0))
+                # CPU-side token counting: avoid GPU→CPU sync by using collator metadata
+                # FastCollator provides padded_length; fall back to tensor shape if unavailable
+                batch_size = input_ids.size(0)
+                padded_length = batch.get("padded_length", input_ids.size(1))
+                tokens = batch_size * padded_length  # Approximate token count (no GPU sync)
                 
                 # Strided telemetry: only measure every Nth batch to reduce overhead
                 self._telemetry_step_counter += 1
@@ -678,11 +718,15 @@ class PhaseDTrainer:
                             loss = head.compute_loss(logits, labels)
 
                         if loss is None:
-                            return None, False
+                            return None, False, True  # loss_value, did_step, skip_batch
 
-                        loss_value = float(loss.item())
+                        # Async loss logging: only extract scalar when needed for telemetry/logging
+                        # This avoids GPU→CPU sync on every batch, significantly improving throughput
                         loss = loss / accum_steps
                         loss.backward()
+                        
+                        # Extract loss value only when we need it (strided telemetry or progress bar)
+                        loss_value = float(loss.detach().item()) if should_measure else None
 
                         did_step = False
                         accum_counter += 1
@@ -710,28 +754,39 @@ class PhaseDTrainer:
                             )
                             self._runtime_controller.report_metrics(runtime_metrics)
 
-                    return loss_value, did_step
+                    return loss_value, did_step, False  # loss_value, did_step, skip_batch
 
-                loss_value, did_step = execute_with_oom_protection(
+                result = execute_with_oom_protection(
                     run_step,
                     controller=self._runtime_controller,
                     on_oom=handle_oom,
                 )
-
-                if loss_value is None:
+                
+                # Handle OOM protection returning None (OOM recovery failed)
+                if result is None:
+                    continue
+                    
+                loss_value, did_step, skip_batch = result
+                
+                # Skip batch only when loss computation failed (not when async sync skipped)
+                if skip_batch:
                     continue
 
-                # Track epoch loss for averaging
-                epoch_loss_sum += loss_value
-                epoch_loss_count += 1
+                # Track epoch loss for averaging (only when we synced)
+                if loss_value is not None:
+                    epoch_loss_sum += loss_value
+                    epoch_loss_count += 1
+                    last_loss_value = loss_value  # Track for progress bar on non-sync steps
                 
-                # Update batch progress bar with current loss
-                batch_pbar.set_postfix({
-                    "loss": f"{loss_value:.4f}",
-                    "avg": f"{epoch_loss_sum / epoch_loss_count:.4f}",
-                })
+                # Update batch progress bar with current or last known loss
+                if epoch_loss_count > 0:
+                    display_loss = loss_value if loss_value is not None else last_loss_value
+                    batch_pbar.set_postfix({
+                        "loss": f"{display_loss:.4f}" if display_loss else "...",
+                        "avg": f"{epoch_loss_sum / epoch_loss_count:.4f}",
+                    })
 
-                if did_step:
+                if did_step and loss_value is not None:
                     step_metrics = {
                         "timestamp": datetime.now(timezone.utc).isoformat(),
                         "epoch": epoch + 1,

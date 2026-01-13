@@ -12,7 +12,7 @@ Quantized bucketing is critical for torch.compile + CUDA Graphs:
 
 import torch
 from torch.utils.data import Sampler
-from typing import List, Tuple, Optional, Literal
+from typing import List, Tuple, Optional, Literal, Union, Callable
 import numpy as np
 from datasets import Dataset
 import logging
@@ -371,7 +371,7 @@ class QuantizedBucketSampler(Sampler):
         self,
         lengths: np.ndarray,
         *,
-        token_budget: int,
+        token_budget: Union[int, Callable[[], int]],
         max_length: int = 512,
         quantize_step: int = DEFAULT_QUANTIZE_STEP,
         shuffle: bool = True,
@@ -383,7 +383,9 @@ class QuantizedBucketSampler(Sampler):
         
         Args:
             lengths: Array of sequence lengths (token counts).
-            token_budget: Maximum tokens per batch (replaces max_batch_size).
+            token_budget: Maximum tokens per batch. Can be:
+                - int: Static budget value
+                - Callable[[], int]: Dynamic budget provider (e.g., RuntimeController.get_next_budget)
             max_length: Maximum sequence length for boundary computation.
             quantize_step: Quantization step (default 16).
             shuffle: Whether to shuffle within buckets and batch order.
@@ -393,7 +395,8 @@ class QuantizedBucketSampler(Sampler):
         super().__init__(data_source=None)  # type: ignore
         
         self.lengths = np.asarray(lengths, dtype=np.int32)
-        self.token_budget = max(1, int(token_budget))
+        self._token_budget = token_budget
+        self._budget_is_callable = callable(token_budget)
         self.max_length = max_length
         self.quantize_step = quantize_step
         self.shuffle = shuffle
@@ -420,11 +423,27 @@ class QuantizedBucketSampler(Sampler):
         # Log bucket distribution
         bucket_sizes = [len(b) for b in self._bucket_indices]
         non_empty = sum(1 for s in bucket_sizes if s > 0)
+        budget_desc = "dynamic" if self._budget_is_callable else str(self.current_budget)
         logger.info(
             f"QuantizedBucketSampler: {len(self.lengths)} samples, "
             f"{non_empty}/{len(self.boundaries)} active buckets, "
-            f"token_budget={token_budget}, step={quantize_step}"
+            f"token_budget={budget_desc}, step={quantize_step}"
         )
+    
+    @property
+    def current_budget(self) -> int:
+        """
+        Get the current token budget.
+        
+        If token_budget was provided as a callable (e.g., RuntimeController.get_next_budget),
+        it will be invoked to get the current dynamic value. Otherwise, returns the static value.
+        
+        Returns:
+            Current token budget for batch formation.
+        """
+        if self._budget_is_callable:
+            return max(1, int(self._token_budget()))  # type: ignore
+        return max(1, int(self._token_budget))
     
     def _assign_to_buckets(self) -> np.ndarray:
         """Assign each sample to a bucket based on quantized length."""
@@ -478,15 +497,18 @@ class QuantizedBucketSampler(Sampler):
                 rng.shuffle(indices)
                 indices = indices.tolist()
             
-            # Form batches using token budget
+            # Form batches using token budget (may be dynamic)
             batch: List[int] = []
             batch_tokens = 0
             
             for idx in indices:
                 sample_tokens = bucket_max_length  # All samples pad to bucket max
                 
+                # Get current budget (may change dynamically via RuntimeController)
+                current_token_budget = self.current_budget
+                
                 # Check if adding this sample would exceed budget
-                if batch and (batch_tokens + sample_tokens > self.token_budget):
+                if batch and (batch_tokens + sample_tokens > current_token_budget):
                     all_batches.append(batch)
                     batch = []
                     batch_tokens = 0
@@ -508,7 +530,7 @@ class QuantizedBucketSampler(Sampler):
         """Estimate total number of batches per epoch."""
         total_samples = len(self.lengths)
         # Rough estimate: assume average batch uses half the token budget
-        avg_samples_per_batch = max(1, self.token_budget // (self.max_length // 2))
+        avg_samples_per_batch = max(1, self.current_budget // (self.max_length // 2))
         return max(1, (total_samples + avg_samples_per_batch - 1) // avg_samples_per_batch)
     
     def set_epoch(self, epoch: int) -> None:
@@ -527,7 +549,7 @@ class QuantizedBucketSampler(Sampler):
 
 def create_quantized_sampler(
     lengths: np.ndarray,
-    token_budget: int,
+    token_budget: Union[int, Callable[[], int]],
     max_length: int = 512,
     quantize_step: int = DEFAULT_QUANTIZE_STEP,
     shuffle: bool = True,
@@ -542,7 +564,9 @@ def create_quantized_sampler(
     
     Args:
         lengths: Array of token counts for all samples.
-        token_budget: Maximum tokens per batch.
+        token_budget: Maximum tokens per batch. Can be:
+            - int: Static budget value
+            - Callable[[], int]: Dynamic budget provider (e.g., RuntimeController.get_next_budget)
         max_length: Maximum sequence length.
         quantize_step: Snap-to-Grid step (default 16).
         shuffle: Whether to shuffle.

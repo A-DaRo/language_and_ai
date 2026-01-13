@@ -51,8 +51,14 @@ execution:
     enabled: false  # Disable for speed
     stride: 10  # More frequent sampling for debugging
     
+  # DataLoader settings for laptop (conservative, stability-focused)
   data_loader:
-    num_workers: 0  # Single-threaded for stability
+    num_workers: 0  # Single-threaded for stability on laptops
     pin_memory: true
     persistent_workers: false  # N/A with 0 workers
     prefetch_factor: 2
+    
+  # OOM recovery configuration (laptop-appropriate)
+  oom_recovery:
+    epoch_level_protection: false  # Keep batch-level for safety on laptops
+    max_epoch_retries: 3  # More retries since laptop runs are shorter
