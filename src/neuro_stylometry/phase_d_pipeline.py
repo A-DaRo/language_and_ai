@@ -219,6 +219,22 @@ def run_phase_d_training(
     # ========== Save Comparative Summary ==========
     _save_comparative_summary(results, output_dir, label_maps.num_classes())
 
+    # ========== Optional Report Generation ==========
+    if config.get("evaluation", {}).get("write_report", True):
+        reports_dir = config.get("output", {}).get("reports_dir")
+        reports_dir = Path(reports_dir) if reports_dir else output_dir / "reports"
+        try:
+            from .evaluation.comparative_report import generate_phase_d_report
+
+            report_path = generate_phase_d_report(
+                phase_d_dir=output_dir,
+                output_dir=reports_dir,
+                dataset_path=dataset_path,
+            )
+            logger.info(f"Phase D report written to {report_path}")
+        except Exception as exc:
+            logger.warning("Phase D report generation failed: %s", exc)
+
     logger.info("=" * 80)
     logger.info("Phase D Training Complete!")
     logger.info(f"Baseline artifacts: {baseline_dir}")

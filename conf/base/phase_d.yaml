@@ -56,9 +56,11 @@ evaluation:
   eval_on_val: true
   eval_on_test: true
   eval_every_epochs: 1
+  write_report: true
 
 # Output
 output:
   save_model: true
   save_logs: true
   save_metrics: true
+  reports_dir: "artifacts/reports"

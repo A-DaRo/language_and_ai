@@ -514,6 +514,42 @@ def verify(
     click.echo(f"Verification complete. Outputs in: {output_dir}")
 
 
+@cli.command("report-phase-d")
+@click.option(
+    "--phase-d-dir",
+    type=click.Path(exists=True, path_type=Path),
+    required=True,
+    help="Phase D artifacts directory with baseline/constrained runs",
+)
+@click.option(
+    "--output-dir",
+    type=click.Path(path_type=Path),
+    default=Path("artifacts/reports"),
+    show_default=True,
+    help="Output directory for Phase D report",
+)
+@click.option(
+    "--dataset",
+    type=click.Path(exists=True, path_type=Path),
+    default=None,
+    help="Optional dataset path for report metadata",
+)
+def report_phase_d(
+    phase_d_dir: Path,
+    output_dir: Path,
+    dataset: Path | None,
+):
+    """Generate Phase D report from existing artifacts."""
+    from .evaluation.comparative_report import generate_phase_d_report
+
+    report_path = generate_phase_d_report(
+        phase_d_dir=phase_d_dir,
+        output_dir=output_dir,
+        dataset_path=dataset,
+    )
+    click.echo(f"Report generated: {report_path}")
+
+
 @cli.command("hardware-info")
 def hardware_info():
     """Display detected hardware profile."""
