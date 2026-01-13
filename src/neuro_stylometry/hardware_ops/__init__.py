@@ -11,9 +11,11 @@ from .cuda_graphs import (
     GraphCache,
     GraphCacheConfig,
     CapturedGraph,
+    GraphAwareTraining,
     CompileConfig,
     compile_model_if_enabled,
     create_graph_cache_from_config,
+    create_graph_aware_training_from_config,
     create_compile_config_from_dict,
 )
 from .sequence_packing import (
@@ -69,9 +71,11 @@ __all__ = [
     "GraphCache",
     "GraphCacheConfig",
     "CapturedGraph",
+    "GraphAwareTraining",
     "CompileConfig",
     "compile_model_if_enabled",
     "create_graph_cache_from_config",
+    "create_graph_aware_training_from_config",
     "create_compile_config_from_dict",
     # Sequence Packing & GPU Filtering
     "SequencePacker",

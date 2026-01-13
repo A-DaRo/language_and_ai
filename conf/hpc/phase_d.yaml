@@ -39,6 +39,9 @@ optimization:
   use_torch_compile: true
   torch_compile_mode: "default"
   compile_train_step: false
+
+  # Manual CUDA-graph training (disabled by default)
+  use_cuda_graph_training: false
   
   # Fused optimizer eliminates Python loop overhead
   use_fused_optimizer: true

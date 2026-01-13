@@ -120,6 +120,8 @@ class PhaseDTrainConfig:
     use_torch_compile: bool = True  # Apply torch.compile to model
     torch_compile_mode: str = "reduce-overhead"  # CUDA Graph optimization
     compile_train_step: bool = False  # Compile full train step (forward+loss+backward)
+    use_cuda_graph_training: bool = False  # Manual CUDA-graph training path
+    cuda_graph_training: Dict[str, Any] = field(default_factory=dict)
     use_fused_optimizer: bool = True  # Fused AdamW kernel
     use_device_prefetch: bool = True  # Async H2D transfers
     quantize_step: int = DEFAULT_QUANTIZE_STEP  # Snap-to-Grid step (16)
@@ -177,10 +179,13 @@ class PhaseDTrainer:
         self._use_torch_compile = bool(config.use_torch_compile)
         self._torch_compile_mode = str(config.torch_compile_mode)
         self._compile_train_step = bool(config.compile_train_step)
+        self._use_cuda_graph_training = bool(config.use_cuda_graph_training)
+        self._cuda_graph_training_cfg = config.cuda_graph_training or {}
         self._use_fused_optimizer = bool(config.use_fused_optimizer)
         self._quantize_step = int(config.quantize_step)
         self._token_budget = int(config.token_budget)
         self._model_compiled = False
+        self._graph_training = None
         
         # FP8 support check
         if self._precision == "fp8":
@@ -196,8 +201,33 @@ class PhaseDTrainer:
         logger.info(
             f"PhaseDTrainer initialized: device={self.device}, precision={self._precision}, "
             f"aot_mode={self._aot_mode_requested}, torch_compile={self._use_torch_compile}, "
-            f"compile_train_step={self._compile_train_step}"
+            f"compile_train_step={self._compile_train_step}, "
+            f"cuda_graph_training={self._use_cuda_graph_training}"
         )
+
+        if self._use_cuda_graph_training:
+            if self.device.type != "cuda":
+                logger.warning("CUDA graph training requested but CUDA unavailable - disabling.")
+                self._use_cuda_graph_training = False
+            else:
+                from ..hardware_ops.cuda_graphs import create_graph_aware_training_from_config
+
+                if self._use_torch_compile:
+                    logger.info(
+                        "Disabling torch.compile because CUDA graph training is enabled."
+                    )
+                    self._use_torch_compile = False
+                    self._compile_train_step = False
+
+                graph_cfg = {"cuda_graph_training": self._cuda_graph_training_cfg}
+                self._graph_training = create_graph_aware_training_from_config(
+                    graph_cfg,
+                    default_max_seq_len=self.config.max_length,
+                )
+                logger.info(
+                    "CUDA graph training enabled: ensure bucketed static shapes; "
+                    "dropout masks may repeat across graph replays."
+                )
 
     def _build_loader(
         self,
@@ -671,7 +701,7 @@ class PhaseDTrainer:
             logger.info("torch.compile applied to full train step")
 
         for epoch in range(start_epoch, num_epochs):
-            optimizer.zero_grad(set_to_none=True)
+            optimizer.zero_grad(set_to_none=not self._use_cuda_graph_training)
             accum_counter = 0
             epoch_loss_sum = 0.0
             epoch_loss_count = 0
@@ -705,7 +735,7 @@ class PhaseDTrainer:
 
                 def handle_oom(_event) -> None:
                     nonlocal accum_counter
-                    optimizer.zero_grad(set_to_none=True)
+                    optimizer.zero_grad(set_to_none=not self._use_cuda_graph_training)
                     accum_counter = 0
 
                 def run_step() -> tuple[Optional[float], bool]:
@@ -714,7 +744,11 @@ class PhaseDTrainer:
                     # Mark CUDA Graph step boundary BEFORE any computation to prevent
                     # tensor overwrite errors when using torch.compile with mode="reduce-overhead"
                     # This must be called before both forward AND backward passes
-                    if self._use_torch_compile and self.device.type == "cuda":
+                    if (
+                        self._use_torch_compile
+                        and self.device.type == "cuda"
+                        and not self._use_cuda_graph_training
+                    ):
                         torch.compiler.cudagraph_mark_step_begin()
                     
                     # Use strided telemetry to avoid synchronization overhead
@@ -733,6 +767,26 @@ class PhaseDTrainer:
                                     labels_tuple,
                                 )
                                 did_backward = bool(did_backward.item())
+                            elif self._graph_training is not None:
+                                labels_tuple = tuple(
+                                    labels[task] for task in head.task_order
+                                )
+                                pad_token_id = getattr(
+                                    getattr(model, "tokenizer", None),
+                                    "tokenizer",
+                                    None,
+                                )
+                                pad_token_id = getattr(pad_token_id, "pad_token_id", None)
+                                loss_tensor, valid_flag, _ = self._graph_training.run(
+                                    model=model,
+                                    head=head,
+                                    input_ids=input_ids,
+                                    attention_mask=attention_mask,
+                                    labels=labels_tuple,
+                                    accum_steps=accum_steps,
+                                    pad_token_id=pad_token_id,
+                                )
+                                did_backward = bool(valid_flag.item())
                             else:
                                 outputs = model(
                                     input_ids=input_ids,
@@ -758,7 +812,7 @@ class PhaseDTrainer:
                         accum_counter += 1
                         if accum_counter >= accum_steps:
                             optimizer.step()
-                            optimizer.zero_grad(set_to_none=True)
+                            optimizer.zero_grad(set_to_none=not self._use_cuda_graph_training)
                             if scheduler is not None:
                                 scheduler.step()
                             optimizer_step += 1

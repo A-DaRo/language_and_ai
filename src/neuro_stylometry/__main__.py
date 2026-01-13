@@ -374,6 +374,12 @@ def validate_handover(artifacts_dir: Path):
     show_default=True,
     help="Rewrite dataset split column for small test runs",
 )
+@click.option(
+    "--graph-train",
+    is_flag=True,
+    default=False,
+    help="Enable manual CUDA graph training path (static bucket capture).",
+)
 def run_phase_d(
     dataset: Path,
     output_dir: Path,
@@ -383,6 +389,7 @@ def run_phase_d(
     mode: str,
     config_path: Path | None,
     data_change: str,
+    graph_train: bool,
 ):
     """Train Phase D baseline and constrained models."""
     from .config import find_config_root, load_phase_d_config
@@ -445,6 +452,7 @@ def run_phase_d(
             mode=mode,
             config_path=config_path,
             data_change=(data_change == "yes"),
+            graph_train=graph_train,
         )
 
         click.echo("\n" + "=" * 80)

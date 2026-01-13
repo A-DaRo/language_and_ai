@@ -203,11 +203,8 @@ class GraphCache:
         with torch.cuda.graph(graph, stream=self._capture_stream):
             output_dict = forward_fn(**input_buffers)
         
-        # Clone output buffers (these will hold results during replay)
-        output_buffers = {
-            name: tensor.clone().detach()
-            for name, tensor in output_dict.items()
-        }
+        # Keep captured output tensors so replay writes into the same buffers.
+        output_buffers = {name: tensor.detach() for name, tensor in output_dict.items()}
         
         self._captures += 1
         
@@ -883,6 +880,183 @@ class GraphAwareInference:
         }
 
 
+class GraphAwareTraining:
+    """
+    CUDA graph-accelerated training with shape bucketing and static buffers.
+
+    Captures forward + loss + backward for repeated (batch, seq) shapes.
+    Optimizer step remains outside the graph.
+    """
+
+    def __init__(
+        self,
+        graph_cache: GraphCache,
+        bucket_config: Optional[ShapeBucketConfig] = None,
+        *,
+        pad_token_id: int = 0,
+        ignore_index: int = -1,
+    ):
+        self.graph_cache = graph_cache
+        self.bucketer = ShapeBucketer(bucket_config)
+        self.pad_token_id = int(pad_token_id)
+        self.ignore_index = int(ignore_index)
+        self._label_keys: Optional[list[str]] = None
+        self._accum_steps: Optional[int] = None
+        self._direct_calls = 0
+        self._graph_calls = 0
+        self._fallback_calls = 0
+
+    @property
+    def is_enabled(self) -> bool:
+        return self.graph_cache.is_enabled
+
+    def _pad_labels(
+        self,
+        labels: tuple[Tensor, ...],
+        target_batch: int,
+    ) -> tuple[Tensor, ...]:
+        if not labels:
+            return labels
+        current_batch = labels[0].size(0)
+        if current_batch >= target_batch:
+            return labels
+        pad = target_batch - current_batch
+        padded = []
+        for label in labels:
+            padded.append(
+                torch.nn.functional.pad(label, (0, pad), value=self.ignore_index)
+            )
+        return tuple(padded)
+
+    def _train_step_fn(
+        self,
+        *,
+        model: Any,
+        head: Any,
+        accum_steps: int,
+        label_keys: list[str],
+    ) -> Callable[..., Dict[str, Tensor]]:
+        ignore_index = self.ignore_index
+
+        def _step(input_ids: Tensor, attention_mask: Tensor, **label_inputs: Tensor):
+            labels = tuple(label_inputs[key] for key in label_keys)
+            cls_embedding = model.forward_cls(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+            )
+            logits = head.forward_compiled(cls_embedding)
+            loss, valid_flag = head.compute_loss_compiled(
+                logits,
+                labels,
+                ignore_index=ignore_index,
+            )
+            (loss / accum_steps).backward()
+            return {"loss": loss, "valid": valid_flag}
+
+        return _step
+
+    def run(
+        self,
+        *,
+        model: Any,
+        head: Any,
+        input_ids: Tensor,
+        attention_mask: Tensor,
+        labels: tuple[Tensor, ...],
+        accum_steps: int,
+        pad_token_id: Optional[int] = None,
+    ) -> tuple[Tensor, Tensor, bool]:
+        if self._accum_steps is None:
+            self._accum_steps = int(accum_steps)
+        elif int(accum_steps) != self._accum_steps:
+            raise RuntimeError("accum_steps changed during CUDA graph training")
+
+        if self._label_keys is None:
+            self._label_keys = [f"label_{i}" for i in range(len(labels))]
+
+        if not self.is_enabled:
+            self._direct_calls += 1
+            step_fn = self._train_step_fn(
+                model=model,
+                head=head,
+                accum_steps=self._accum_steps,
+                label_keys=self._label_keys,
+            )
+            outputs = step_fn(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                **{k: v for k, v in zip(self._label_keys, labels)},
+            )
+            return outputs["loss"], outputs["valid"], False
+
+        original_batch, original_seq = input_ids.shape
+        bucket = self.bucketer.find_bucket(original_batch, original_seq)
+        if bucket is None:
+            self._fallback_calls += 1
+            step_fn = self._train_step_fn(
+                model=model,
+                head=head,
+                accum_steps=self._accum_steps,
+                label_keys=self._label_keys,
+            )
+            outputs = step_fn(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                **{k: v for k, v in zip(self._label_keys, labels)},
+            )
+            return outputs["loss"], outputs["valid"], False
+
+        pad_token_id = (
+            int(pad_token_id)
+            if pad_token_id is not None
+            else int(self.pad_token_id)
+        )
+        padded_ids, padded_mask = self.bucketer.pad_tensors(
+            bucket,
+            input_ids,
+            attention_mask,
+            pad_token_id=pad_token_id,
+        )
+        padded_labels = self._pad_labels(labels, bucket.batch_size)
+
+        label_inputs = {k: v for k, v in zip(self._label_keys, padded_labels)}
+        step_fn = self._train_step_fn(
+            model=model,
+            head=head,
+            accum_steps=self._accum_steps,
+            label_keys=self._label_keys,
+        )
+
+        if not self.bucketer.should_capture_graph(bucket):
+            self._direct_calls += 1
+            outputs = step_fn(
+                input_ids=padded_ids,
+                attention_mask=padded_mask,
+                **label_inputs,
+            )
+            return outputs["loss"], outputs["valid"], False
+
+        self._graph_calls += 1
+        outputs = self.graph_cache.run_with_graph(
+            bucket.shape_key,
+            step_fn,
+            input_ids=padded_ids,
+            attention_mask=padded_mask,
+            **label_inputs,
+        )
+        return outputs["loss"], outputs["valid"], True
+
+    def get_stats(self) -> Dict[str, Any]:
+        return {
+            "graph_cache": self.graph_cache.get_stats(),
+            "bucketer": self.bucketer.get_stats(),
+            "direct_calls": self._direct_calls,
+            "graph_calls": self._graph_calls,
+            "fallback_calls": self._fallback_calls,
+            "graph_call_ratio": self._graph_calls / max(self._direct_calls + self._graph_calls, 1),
+        }
+
+
 def create_graph_aware_inference_from_config(config: Dict[str, Any]) -> GraphAwareInference:
     """
     Create GraphAwareInference from pipeline configuration.
@@ -915,3 +1089,36 @@ def create_graph_aware_inference_from_config(config: Dict[str, Any]) -> GraphAwa
     )
     
     return GraphAwareInference(graph_cache, bucket_config)
+
+
+def create_graph_aware_training_from_config(
+    config: Dict[str, Any],
+    *,
+    default_max_seq_len: int = 512,
+) -> GraphAwareTraining:
+    graph_cfg = config.get("cuda_graph_training", {})
+    graph_cache = GraphCache(
+        GraphCacheConfig(
+            enabled=bool(graph_cfg.get("enabled", True)),
+            warmup_iterations=int(graph_cfg.get("warmup_iterations", 0)),
+            max_cached_graphs=int(graph_cfg.get("max_cached_graphs", 16)),
+            capture_pool_size_mb=int(graph_cfg.get("capture_pool_size_mb", 256)),
+            use_cuda_graph_memory_pool=bool(
+                graph_cfg.get("use_cuda_graph_memory_pool", True)
+            ),
+        )
+    )
+    bucket_config = ShapeBucketConfig(
+        batch_buckets=graph_cfg.get("batch_buckets", [8, 16, 32, 64]),
+        seq_len_buckets=graph_cfg.get("seq_len_buckets", [128, 256, 384, 512]),
+        max_batch_size=int(graph_cfg.get("max_batch_size", 64)),
+        max_seq_len=int(graph_cfg.get("max_seq_len", default_max_seq_len)),
+        adaptive_buckets=bool(graph_cfg.get("adaptive_buckets", False)),
+        min_bucket_usage=int(graph_cfg.get("min_bucket_usage", 2)),
+    )
+    return GraphAwareTraining(
+        graph_cache,
+        bucket_config,
+        pad_token_id=int(graph_cfg.get("pad_token_id", 0)),
+        ignore_index=int(graph_cfg.get("ignore_index", -1)),
+    )

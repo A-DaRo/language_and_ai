@@ -44,6 +44,7 @@ def run_phase_d_training(
     mode: str = "laptop",
     config_path: Path | None = None,
     data_change: bool = False,
+    graph_train: bool | None = None,
 ) -> Dict[str, Any]:
     """
     Run Phase D training: baseline + constrained models.
@@ -75,6 +76,9 @@ def run_phase_d_training(
     # Override paths from CLI
     config['data']['dataset_path'] = str(dataset_path)
     config['data']['artifacts_dir'] = str(artifacts_dir)
+    if graph_train:
+        config.setdefault("optimization", {})
+        config["optimization"]["use_cuda_graph_training"] = True
 
     # Extract optimization config for AOT pipeline
     opt_cfg = config.get('optimization', {})
@@ -131,6 +135,8 @@ def run_phase_d_training(
         use_torch_compile=opt_cfg.get('use_torch_compile', False),
         torch_compile_mode=opt_cfg.get('torch_compile_mode', 'reduce-overhead'),
         compile_train_step=opt_cfg.get('compile_train_step', False),
+        use_cuda_graph_training=opt_cfg.get('use_cuda_graph_training', False),
+        cuda_graph_training=opt_cfg.get('cuda_graph_training', {}),
         use_fused_optimizer=opt_cfg.get('use_fused_optimizer', False),
         use_device_prefetch=opt_cfg.get('use_device_prefetch', False),
         quantize_step=opt_cfg.get('quantize_step', 16),
@@ -246,6 +252,8 @@ def run_phase_d_training(
         use_torch_compile=opt_cfg.get('use_torch_compile', False),
         torch_compile_mode=opt_cfg.get('torch_compile_mode', 'reduce-overhead'),
         compile_train_step=opt_cfg.get('compile_train_step', False),
+        use_cuda_graph_training=opt_cfg.get('use_cuda_graph_training', False),
+        cuda_graph_training=opt_cfg.get('cuda_graph_training', {}),
         use_fused_optimizer=opt_cfg.get('use_fused_optimizer', False),
         use_device_prefetch=opt_cfg.get('use_device_prefetch', False),
         quantize_step=opt_cfg.get('quantize_step', 16),
