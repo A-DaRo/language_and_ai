@@ -1,34 +1,34 @@
 {
   "birth_year": {
-    "accuracy": 0.0,
-    "f1_macro": 0.0
+    "accuracy": 0.0009541984763927758,
+    "f1_macro": 0.0006669797043995035
   },
   "extrovert": {
-    "accuracy": 0.0,
-    "f1_macro": 0.0
+    "accuracy": 0.8266221880912781,
+    "f1_macro": 0.45254142094917155
   },
   "feeling": {
-    "accuracy": 0.0,
-    "f1_macro": 0.0
+    "accuracy": 0.6979425549507141,
+    "f1_macro": 0.41105191684947245
   },
   "female": {
-    "accuracy": 1.0,
-    "f1_macro": 1.0
+    "accuracy": 0.4715266525745392,
+    "f1_macro": 0.32043364896390836
   },
   "judging": {
-    "accuracy": 0.0,
-    "f1_macro": 0.0
+    "accuracy": 0.4205290973186493,
+    "f1_macro": 0.3023065805226883
   },
   "nationality": {
-    "accuracy": 0.0,
-    "f1_macro": 0.0
+    "accuracy": 0.08950260281562805,
+    "f1_macro": 0.00825560990840166
   },
   "political_leaning": {
-    "accuracy": 0.0,
-    "f1_macro": 0.0
+    "accuracy": 0.4397905766963959,
+    "f1_macro": 0.2042099046654855
   },
   "sensing": {
-    "accuracy": 0.0,
-    "f1_macro": 0.0
+    "accuracy": 0.05111683905124664,
+    "f1_macro": 0.048630976706170816
   }
 }

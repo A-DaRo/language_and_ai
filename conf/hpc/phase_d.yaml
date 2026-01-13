@@ -100,5 +100,5 @@ execution:
     # Epoch-level OOM protection for extreme throughput scenarios
     # Batch-level protection has minimal overhead, but epoch-level allows
     # more aggressive optimizations within the hot loop
-    epoch_level_protection: false  # Set true for experimental max throughput
+    epoch_level_protection: true  # Set true for experimental max throughput
     max_epoch_retries: 2  # Retry epoch up to N times after OOM
