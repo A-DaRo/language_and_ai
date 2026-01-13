@@ -41,6 +41,8 @@ def run_phase_d_training(
     dataset_path: Path,
     output_dir: Path,
     artifacts_dir: Path,
+    dataset_path_post: Path | None = None,
+    dataset_path_masked: Path | None = None,
     mode: str = "laptop",
     config_path: Path | None = None,
     data_change: bool = False,
@@ -53,6 +55,8 @@ def run_phase_d_training(
         dataset_path: Path to clean_dataset.arrow from Phase A
         output_dir: Output directory for Phase D artifacts
         artifacts_dir: Phase A artifacts directory (for projection_matrix.pt)
+        dataset_path_post: Optional tokenized dataset for raw posts
+        dataset_path_masked: Optional tokenized dataset for masked posts
         mode: Hardware mode (laptop/hpc)
         config_path: Optional experiment config override
 
@@ -61,6 +65,16 @@ def run_phase_d_training(
     """
     config_root = find_config_root("phase_d.yaml")
     dataset_path = _resolve_phase_d_path(dataset_path, config_root=config_root)
+    dataset_path_post = (
+        _resolve_phase_d_path(dataset_path_post, config_root=config_root)
+        if dataset_path_post
+        else None
+    )
+    dataset_path_masked = (
+        _resolve_phase_d_path(dataset_path_masked, config_root=config_root)
+        if dataset_path_masked
+        else None
+    )
     output_dir = _resolve_phase_d_path(output_dir, config_root=config_root)
     artifacts_dir = _resolve_phase_d_path(artifacts_dir, config_root=config_root)
     if config_path is not None:
@@ -68,7 +82,12 @@ def run_phase_d_training(
 
     # Optionally enforce split column for small dataset runs
     if data_change:
-        _ensure_split_column(Path(dataset_path))
+        if dataset_path_post is not None:
+            _ensure_split_column(Path(dataset_path_post))
+        if dataset_path_masked is not None:
+            _ensure_split_column(Path(dataset_path_masked))
+        if dataset_path_post is None and dataset_path_masked is None:
+            _ensure_split_column(Path(dataset_path))
 
     # Load configuration
     config = load_phase_d_config(mode=mode, experiment_config_path=config_path)
@@ -106,7 +125,7 @@ def run_phase_d_training(
 
     baseline_dir = output_dir / "baseline"
     baseline_config = PhaseDTrainConfig(
-        dataset_path=Path(config['data']['dataset_path']),
+        dataset_path=Path(dataset_path_post or dataset_path),
         artifacts_dir=Path(config['data']['artifacts_dir']),
         output_dir=baseline_dir,
         model_name=config['model']['name'],
@@ -226,7 +245,7 @@ def run_phase_d_training(
 
     constrained_dir = output_dir / "constrained"
     constrained_config = PhaseDTrainConfig(
-        dataset_path=Path(config['data']['dataset_path']),
+        dataset_path=Path(dataset_path_masked or dataset_path),
         artifacts_dir=Path(config['data']['artifacts_dir']),
         output_dir=constrained_dir,
         model_name=config['model']['name'],

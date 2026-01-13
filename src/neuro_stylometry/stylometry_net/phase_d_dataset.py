@@ -249,15 +249,15 @@ class PhaseDDataset(Dataset):
                 
                 # Try to get numpy view without copy (works for FixedSizeList)
                 try:
-                    input_ids = input_ids_chunk.values.to_numpy(zero_copy_only=True).astype(np.int64)
+                    input_ids = input_ids_chunk.values.to_numpy(zero_copy_only=True)
                 except (pa.ArrowInvalid, AttributeError):
                     # Fallback: convert via as_py() (still fixed-length)
-                    input_ids = np.array(input_ids_chunk.as_py(), dtype=np.int64)
+                    input_ids = np.array(input_ids_chunk.as_py())
                 
                 try:
-                    attention_mask = attention_mask_chunk.values.to_numpy(zero_copy_only=True).astype(np.int64)
+                    attention_mask = attention_mask_chunk.values.to_numpy(zero_copy_only=True)
                 except (pa.ArrowInvalid, AttributeError):
-                    attention_mask = np.array(attention_mask_chunk.as_py(), dtype=np.int64)
+                    attention_mask = np.array(attention_mask_chunk.as_py())
             else:
                 # Variable-length AOT mode
                 input_ids = self._input_ids_col[index].as_py()
@@ -266,12 +266,17 @@ class PhaseDDataset(Dataset):
                 # Convert to numpy arrays for efficient collation
                 input_ids = np.array(input_ids, dtype=np.int64)
                 attention_mask = np.array(attention_mask, dtype=np.int64)
+            token_count = None
+            if self._token_count_col is not None:
+                token_count = self._token_count_col[index].as_py()
             
             return {
                 "input_ids": input_ids,
                 "attention_mask": attention_mask,
                 "labels": labels,
                 "post_id": post_id,
+                "token_count": token_count,
+                "padded_length": self._pre_padded_length,
                 "_is_pre_padded": self._is_pre_padded,  # Signal to collator
             }
         else:
@@ -339,11 +344,16 @@ class PhaseDCollator:
                     dtype=torch.long,
                 )
 
+        padded_length = int(encoding["input_ids"].size(1))
+        tokens = int(encoding["attention_mask"].sum().item())
+
         return {
             "input_ids": encoding["input_ids"],
             "attention_mask": encoding["attention_mask"],
             "labels": labels,
             "post_id": [sample.get("post_id") for sample in batch],
+            "padded_length": padded_length,
+            "tokens": tokens,
         }
 
 
@@ -436,9 +446,14 @@ class FastCollator:
             attention_mask_stacked = np.stack([s["attention_mask"] for s in batch])
             
             # Convert to torch tensors (single memcpy per tensor)
-            input_ids = torch.from_numpy(input_ids_stacked)
-            attention_mask = torch.from_numpy(attention_mask_stacked)
-            padded_length = input_ids.size(1)
+            input_ids = torch.from_numpy(input_ids_stacked).to(dtype=torch.long)
+            attention_mask = torch.from_numpy(attention_mask_stacked).to(dtype=torch.long)
+            padded_length = int(batch[0].get("padded_length") or input_ids.size(1))
+            token_counts = [sample.get("token_count") for sample in batch]
+            if all(tc is not None for tc in token_counts):
+                tokens = int(sum(int(tc) for tc in token_counts))
+            else:
+                tokens = int(attention_mask_stacked.sum())
         else:
             # ===== STANDARD AOT PATH: Variable-length with dynamic padding =====
             # Still optimized: pre-allocate numpy, single torch conversion
@@ -482,7 +497,11 @@ class FastCollator:
             
             # Pre-allocate numpy arrays with correct dtype from the start
             # This enables single numpy->torch conversion (not per-sample)
-            input_ids_np = np.zeros((batch_size, padded_length), dtype=np.int64)
+            input_ids_np = np.full(
+                (batch_size, padded_length),
+                self.pad_token_id,
+                dtype=np.int64,
+            )
             attention_mask_np = np.zeros((batch_size, padded_length), dtype=np.int64)
             
             # Fill arrays (vectorized where possible)
@@ -494,6 +513,7 @@ class FastCollator:
             # Single numpy→torch conversion (not per-sample)
             input_ids = torch.from_numpy(input_ids_np)
             attention_mask = torch.from_numpy(attention_mask_np)
+            tokens = int(sum(lengths))
         
         # Collate labels (same for both paths)
         labels: Dict[str, torch.Tensor] = {}
@@ -509,6 +529,7 @@ class FastCollator:
             "labels": labels,
             "post_id": [sample.get("post_id") for sample in batch],
             "padded_length": padded_length,  # For telemetry
+            "tokens": tokens,
         }
 
 

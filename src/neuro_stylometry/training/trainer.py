@@ -219,6 +219,8 @@ class PhaseDTrainer:
         
         if aot_mode_active:
             logger.info("AOT mode active: using FastCollator (zero tokenization)")
+            if getattr(dataset, "is_pre_padded", False):
+                logger.info("AOT dataset is pre-padded (zero-copy collation enabled)")
             collator = FastCollator(
                 max_length=self.config.max_length,
                 pad_token_id=1,  # RoBERTa pad token
