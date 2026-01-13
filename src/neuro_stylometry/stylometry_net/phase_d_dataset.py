@@ -582,12 +582,26 @@ class DevicePrefetcher:
         self._stream: Optional[torch.cuda.Stream] = None
         self._iterator: Optional[Iterable] = None
         self._next_batch: Optional[Dict] = None
+        self._paused = False
         
         # Only use async prefetching on CUDA
         self._use_async = device.type == "cuda" and torch.cuda.is_available()
         
         if self._use_async:
             self._stream = torch.cuda.Stream(device=device)
+
+    def pause_prefetch(self) -> None:
+        """Disable async prefetch (used during CUDA graph capture)."""
+        self._paused = True
+
+    def resume_prefetch(self) -> None:
+        """Re-enable async prefetch."""
+        self._paused = False
+
+    def synchronize(self) -> None:
+        """Wait for any in-flight prefetch copy to complete."""
+        if self._use_async and self._stream is not None:
+            self._stream.synchronize()
     
     def __iter__(self) -> "DevicePrefetcher":
         """Start iteration with prefetching."""
@@ -624,7 +638,7 @@ class DevicePrefetcher:
             self._next_batch = None
             return
         
-        if self._use_async and self._stream is not None:
+        if self._use_async and self._stream is not None and not self._paused:
             # Transfer on dedicated stream (non-blocking)
             with torch.cuda.stream(self._stream):
                 self._next_batch = self._to_device(batch)

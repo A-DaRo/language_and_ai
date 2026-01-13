@@ -828,6 +828,11 @@ class PhaseDTrainer:
                 if use_device_prefetch
                 else loader
             )
+            prefetcher = (
+                train_iterator
+                if hasattr(train_iterator, "pause_prefetch")
+                else None
+            )
             
             # Determine batch count for progress bar - disable total for dynamic batching
             if is_dynamic_batching:
@@ -888,11 +893,16 @@ class PhaseDTrainer:
                     if graph_trainer is not None and graph_trainer.is_enabled:
                          # 1. Prepare labels ordered by head.task_order inside graph trainer
                          labels_dict = labels
+                         capture_guard = {"active": False}
                          
                          def _pre_capture_hook() -> bool:
                              if accum_counter != 0:
                                  return False
+                             if prefetcher is not None:
+                                 prefetcher.pause_prefetch()
+                                 prefetcher.synchronize()
                              optimizer.zero_grad(set_to_none=True)
+                             capture_guard["active"] = True
                              return True
                          
                          # 2. Timer (strided)
@@ -902,16 +912,21 @@ class PhaseDTrainer:
                              # Enclose in autocast so capture records correct precision
                              autocast_ctx = self._get_autocast_context()
                              with autocast_ctx:
-                                 loss_tensor, valid_flag, did_run = graph_trainer.run(
-                                     model=model,
-                                     head=head,
-                                     input_ids=input_ids,
-                                     attention_mask=attention_mask,
-                                     labels=labels_dict,
-                                     accum_steps=accum_steps,
-                                     pad_token_id=1,
-                                     pre_capture_hook=_pre_capture_hook,
-                                 )
+                                 try:
+                                     loss_tensor, valid_flag, did_run = graph_trainer.run(
+                                         model=model,
+                                         head=head,
+                                         input_ids=input_ids,
+                                         attention_mask=attention_mask,
+                                         labels=labels_dict,
+                                         accum_steps=accum_steps,
+                                         pad_token_id=1,
+                                         pre_capture_hook=_pre_capture_hook,
+                                     )
+                                 finally:
+                                     if capture_guard["active"] and prefetcher is not None:
+                                         prefetcher.resume_prefetch()
+                                         capture_guard["active"] = False
 
                              # 4. Check validity (if valid_flag is 0, loss was NaN/skipped)
                              if valid_flag.item() == 0:
