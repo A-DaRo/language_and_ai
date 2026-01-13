@@ -371,9 +371,11 @@ def run_phase_d(
     data_change: str,
 ):
     """Train Phase D baseline and constrained models."""
+    from .config import find_config_root
     from .phase_d_pipeline import run_phase_d_training
 
     try:
+        logger.info("Phase D config root: %s", find_config_root("phase_d.yaml"))
         results = run_phase_d_training(
             dataset_path=dataset,
             output_dir=output_dir,

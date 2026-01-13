@@ -501,6 +501,11 @@ def _find_config_root(config_name: str) -> Path:
     return repo_root
 
 
+def find_config_root(config_name: str) -> Path:
+    """Public helper for resolving config roots (useful for CLI diagnostics)."""
+    return _find_config_root(config_name)
+
+
 def load_phase_d_config(
     *,
     mode: Literal["auto", "laptop", "hpc"] = "laptop",
