@@ -25,7 +25,7 @@ execution:
     warmup_batches: 10
     initial_token_budget: 65536
     min_token_budget: 8192
-    max_token_budget: 262144
+    max_token_budget: 393216
     memory_headroom_mb: 2048
     scale_up_factor: 1.25
     scale_down_factor: 0.85
@@ -35,8 +35,8 @@ execution:
     recovery_patience: 5
   dynamic_batching:
     enabled: true
-    max_batch_size: 32
-    min_batch_size: 1
+    max_batch_size: 512
+    min_batch_size: 32
     drop_last: false
     shuffle: true
     seed: 42
