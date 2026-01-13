@@ -446,6 +446,10 @@ class PhaseDTrainer:
             attention_mask = batch["attention_mask"].to(self.device)
             labels = {k: v.to(self.device) for k, v in batch["labels"].items()}
 
+            # Mark CUDA Graph step boundary for compiled models
+            if self._use_torch_compile and self.device.type == "cuda":
+                torch.compiler.cudagraph_mark_step_begin()
+
             autocast_ctx = (
                 torch.autocast(device_type="cuda", dtype=torch.bfloat16)
                 if use_bf16
@@ -505,6 +509,10 @@ class PhaseDTrainer:
             input_ids = batch["input_ids"].to(self.device)
             attention_mask = batch["attention_mask"].to(self.device)
             labels = {k: v.to(self.device) for k, v in batch["labels"].items()}
+
+            # Mark CUDA Graph step boundary for compiled models
+            if self._use_torch_compile and self.device.type == "cuda":
+                torch.compiler.cudagraph_mark_step_begin()
 
             autocast_ctx = (
                 torch.autocast(device_type="cuda", dtype=torch.bfloat16)
@@ -655,6 +663,11 @@ class PhaseDTrainer:
                     # Use strided telemetry to avoid synchronization overhead
                     timer_ctx = CUDATimer(synchronize=False) if should_measure else nullcontext()
                     with timer_ctx as timer:
+                        # Mark CUDA Graph step boundary to prevent tensor overwrite errors
+                        # when using torch.compile with mode="reduce-overhead"
+                        if self._use_torch_compile and self.device.type == "cuda":
+                            torch.compiler.cudagraph_mark_step_begin()
+                        
                         # Use precision-aware autocast context
                         autocast_ctx = self._get_autocast_context()
                         with autocast_ctx:
