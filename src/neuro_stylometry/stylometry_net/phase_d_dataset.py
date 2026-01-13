@@ -303,7 +303,6 @@ class FastCollator:
     Features:
         - Zero tokenization overhead in training loop
         - Quantized padding for CUDA Graph stability
-        - Pinned memory allocation for async H2D transfers
         - Direct numpy -> torch conversion (no Python list intermediates)
     
     Requirements:
@@ -311,6 +310,12 @@ class FastCollator:
         - input_ids: List[uint16] (from preprocess_tokens.py)
         - attention_mask: List[uint8]
         - token_count: int16
+    
+    Pinned Memory:
+        Do NOT allocate pinned memory inside the collator - this causes
+        CUDA initialization errors when used with num_workers > 0.
+        Instead, use DataLoader(pin_memory=True) which correctly pins
+        memory in the main process after receiving data from workers.
     
     Reference: Phase D Final Optimization Blueprint Section 2.2
     """
@@ -320,7 +325,7 @@ class FastCollator:
         max_length: int = 512,
         pad_token_id: int = 1,  # RoBERTa pad token
         quantize_step: int = DEFAULT_QUANTIZE_STEP,
-        use_pinned_memory: bool = True,
+        use_pinned_memory: bool = True,  # Deprecated, kept for API compat
     ) -> None:
         """
         Initialize fast collator.
@@ -329,12 +334,16 @@ class FastCollator:
             max_length: Maximum sequence length (for safety clamping).
             pad_token_id: Token ID to use for padding.
             quantize_step: Snap-to-Grid step for stable tensor shapes.
-            use_pinned_memory: Whether to use pinned memory for async transfers.
+            use_pinned_memory: DEPRECATED - ignored. Use DataLoader(pin_memory=True)
+                instead. Pinned memory cannot be allocated in worker processes.
         """
         self.max_length = max_length
         self.pad_token_id = pad_token_id
         self.quantize_step = quantize_step
-        self.use_pinned_memory = use_pinned_memory and torch.cuda.is_available()
+        # NOTE: Pinned memory must be handled by DataLoader(pin_memory=True),
+        # NOT inside the collator. CUDA operations in forked worker processes
+        # cause cudaErrorInitializationError. The DataLoader pins memory in
+        # the main process after receiving data from workers.
     
     def __call__(
         self,
@@ -390,21 +399,10 @@ class FastCollator:
             self.max_length
         )
         
-        # Pre-allocate tensors with pinned memory for async H2D
-        if self.use_pinned_memory:
-            input_ids = torch.zeros(
-                (batch_size, padded_length),
-                dtype=torch.long,
-                pin_memory=True,
-            )
-            attention_mask = torch.zeros(
-                (batch_size, padded_length),
-                dtype=torch.long,
-                pin_memory=True,
-            )
-        else:
-            input_ids = torch.zeros((batch_size, padded_length), dtype=torch.long)
-            attention_mask = torch.zeros((batch_size, padded_length), dtype=torch.long)
+        # Pre-allocate tensors (pinned memory is handled by DataLoader's pin_memory=True,
+        # NOT here - CUDA ops in worker processes cause initialization errors)
+        input_ids = torch.zeros((batch_size, padded_length), dtype=torch.long)
+        attention_mask = torch.zeros((batch_size, padded_length), dtype=torch.long)
         
         # Fill tensors (pad on right with pad_token_id / 0)
         for i, (ids, mask) in enumerate(zip(input_ids_list, attention_mask_list)):
@@ -413,18 +411,13 @@ class FastCollator:
             attention_mask[i, :seq_len] = torch.from_numpy(mask[:seq_len])
             # Padding positions already 0 from zeros initialization
         
-        # Collate labels
+        # Collate labels (pinned memory handled by DataLoader, not here)
         labels: Dict[str, torch.Tensor] = {}
         if batch and "labels" in batch[0]:
             label_keys = batch[0]["labels"].keys()
             for field in label_keys:
                 label_values = [sample["labels"][field] for sample in batch]
-                if self.use_pinned_memory:
-                    labels[field] = torch.tensor(
-                        label_values, dtype=torch.long, pin_memory=True
-                    )
-                else:
-                    labels[field] = torch.tensor(label_values, dtype=torch.long)
+                labels[field] = torch.tensor(label_values, dtype=torch.long)
         
         return {
             "input_ids": input_ids,
