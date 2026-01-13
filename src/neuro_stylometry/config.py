@@ -428,6 +428,7 @@ def load_pipeline_config(
     mode: Literal["auto", "laptop", "hpc"] = "auto",
     experiment_config_path: Optional[Path] = None,
     validate: bool = True,
+    base_filename: str = "pipeline.yaml",
 ) -> Dict[str, Any]:
     """Load Phase A pipeline configuration from YAML.
 
@@ -449,8 +450,8 @@ def load_pipeline_config(
     Raises:
         ConfigValidationError: If validation is enabled and config is invalid.
     """
-    repo_root = Path(__file__).resolve().parents[2]
-    base_path = repo_root / "conf" / "base" / "pipeline.yaml"
+    repo_root = _find_config_root(base_filename)
+    base_path = repo_root / "conf" / "base" / base_filename
 
     if mode == "auto":
         from .hardware_ops.detection import HardwareDetector
@@ -458,7 +459,7 @@ def load_pipeline_config(
         profile = HardwareDetector.detect()
         mode = "hpc" if profile.profile_type.value.lower() == "hpc" else "laptop"
 
-    mode_path = repo_root / "conf" / mode / "pipeline.yaml"
+    mode_path = repo_root / "conf" / mode / base_filename
 
     base_cfg = OmegaConf.load(base_path)
     mode_cfg = OmegaConf.load(mode_path)
@@ -481,6 +482,25 @@ def load_pipeline_config(
     return merged
 
 
+def _find_config_root(config_name: str) -> Path:
+    repo_root = Path(__file__).resolve().parents[2]
+    candidate = repo_root / "conf" / "base" / config_name
+    if candidate.exists():
+        return repo_root
+
+    cwd = Path.cwd()
+    candidate = cwd / "conf" / "base" / config_name
+    if candidate.exists():
+        return cwd
+
+    for parent in cwd.parents:
+        candidate = parent / "conf" / "base" / config_name
+        if candidate.exists():
+            return parent
+
+    return repo_root
+
+
 def load_phase_d_config(
     *,
     mode: Literal["auto", "laptop", "hpc"] = "laptop",
@@ -501,33 +521,9 @@ def load_phase_d_config(
     Raises:
         FileNotFoundError: If base Phase D config not found.
     """
-    repo_root = Path(__file__).resolve().parents[2]
-
-    if mode == "auto":
-        from .hardware_ops.detection import HardwareDetector
-        profile = HardwareDetector.detect()
-        mode = "hpc" if profile.profile_type.value.lower() == "hpc" else "laptop"
-
-    # Load base Phase D config
-    base_config_path = repo_root / "conf" / "base" / "phase_d.yaml"
-    if not base_config_path.exists():
-        raise FileNotFoundError(f"Base Phase D config not found: {base_config_path}")
-
-    base_config = OmegaConf.load(base_config_path)
-
-    # Load mode-specific Phase D config
-    mode_config_path = repo_root / "conf" / mode / "phase_d.yaml"
-    if mode_config_path.exists():
-        mode_config = OmegaConf.load(mode_config_path)
-        base_config = OmegaConf.merge(base_config, mode_config)
-
-    # Merge experiment config if provided
-    if experiment_config_path:
-        exp_config = OmegaConf.load(experiment_config_path)
-        base_config = OmegaConf.merge(base_config, exp_config)
-
-    merged = OmegaConf.to_container(base_config, resolve=True)
-    if not isinstance(merged, dict):
-        raise TypeError("Loaded config did not resolve to a mapping")
-
-    return merged
+    return load_pipeline_config(
+        mode=mode,
+        experiment_config_path=experiment_config_path,
+        validate=False,
+        base_filename="phase_d.yaml",
+    )
