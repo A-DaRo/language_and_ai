@@ -35,7 +35,7 @@ execution:
     recovery_patience: 5
   dynamic_batching:
     enabled: true
-    max_batch_size: 512
+    max_batch_size: 128
     min_batch_size: 32
     drop_last: false
     shuffle: true
