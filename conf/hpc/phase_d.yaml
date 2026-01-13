@@ -1,51 +1,91 @@
 # Phase D Training Configuration (HPC Overrides)
+# ==============================================================================
+# Maximum throughput settings for high-end GPUs (RTX 5090 / A100 / H100)
+# Target: 100+ iterations/second via AOT pipeline optimization
+# ==============================================================================
 
+# HPC training overrides
 training:
   num_epochs: 10
-  batch_size: 32
+  batch_size: 64  # Base batch (dynamic batching uses token budget instead)
   learning_rate: 3e-5
   layerwise_lr_decay: 0.9
   gradient_accumulation_steps: 2
-  precision: "bf16"
+  
+  # FP8 for maximum tensor core throughput (requires TransformerEngine)
+  # Falls back to BF16 if TransformerEngine not installed
+  precision: "fp8"
+  
   max_steps: null
   resume_from: null
+  
   early_stopping:
     enabled: true
     patience: 2
     min_delta: 0.0
     metric: "f1_macro"
 
+# Scheduler optimized for longer training
 scheduler:
   name: "cosine"
   num_warmup_steps: 500
 
+# HPC optimization overrides - MAXIMUM THROUGHPUT
+optimization:
+  # AOT mode mandatory for 100+ it/s
+  use_aot_mode: true
+  
+  # torch.compile with CUDA Graph capture
+  use_torch_compile: true
+  torch_compile_mode: "reduce-overhead"
+  
+  # Fused optimizer eliminates Python loop overhead
+  use_fused_optimizer: true
+  
+  # Async prefetch for pipeline parallelism
+  use_device_prefetch: true
+  
+  # Quantized bucketing for compilation stability
+  quantize_step: 16
+  
+  # High token budget for large batches
+  # RTX 5090 (32GB): ~256 samples @ 512 tokens
+  # A100 (80GB): ~512 samples @ 512 tokens
+  token_budget: 131072  # Aggressive for HPC VRAM
+
+# HPC execution overrides
 execution:
   autotuning:
-    enabled: true
+    enabled: true  # Let runtime find optimal budget
     warmup_batches: 10
-    initial_token_budget: 65536
-    min_token_budget: 8192
-    max_token_budget: 393216
-    memory_headroom_mb: 2048
+    initial_token_budget: 131072
+    min_token_budget: 16384
+    max_token_budget: 524288  # Very high ceiling for 80GB+ GPUs
+    memory_headroom_mb: 4096
     scale_up_factor: 1.25
     scale_down_factor: 0.85
     oom_slash_factor: 0.5
     stability_threshold: 0.1
     history_window: 10
     recovery_patience: 5
+    
   dynamic_batching:
     enabled: true
-    max_batch_size: 128
-    min_batch_size: 32
+    # NO artificial cap - token budget controls batch size
+    max_batch_size: 4096  # Effectively uncapped
+    min_batch_size: 32  # Minimum for GPU efficiency
     drop_last: false
     shuffle: true
     seed: 42
-    length_column: "text_length"
+    length_column: "token_count"
     length_scale: 1.0
+    
   telemetry:
-    enabled: true
+    enabled: true  # Monitor for profiling
+    stride: 50  # Strided sampling to avoid sync overhead
+    
   data_loader:
-    num_workers: 4
-    pin_memory: true
-    persistent_workers: true
-    prefetch_factor: 2
+    num_workers: 8  # High parallelism for data loading
+    pin_memory: true  # Required for async H2D
+    persistent_workers: true  # Avoid worker respawn overhead
+    prefetch_factor: 4  # Aggressive prefetching

@@ -1,0 +1,94 @@
+{
+  "timestamp": "2026-01-12T23:42:06.291954+00:00",
+  "config_hash": "60ba85f1de5d9a61",
+  "dataset": {
+    "num_samples": 291521,
+    "num_with_masks": 0,
+    "mask_rate": 0.0,
+    "mask_token_counts": {},
+    "text_length": {
+      "mean": 8230.441728040176,
+      "std": 862.6568231797767,
+      "min": 1500,
+      "max": 56836
+    },
+    "masked_text_length": {
+      "mean": 8230.441728040176,
+      "std": 862.6568231797767
+    },
+    "demographic_coverage": {
+      "birth_year": 0.14363630750443365,
+      "female": 0.15311075359922613,
+      "nationality": 0.2833929631141496,
+      "political_leaning": 0.19615739517907801,
+      "extrovert": 0.13875844278799812,
+      "sensing": 0.1445487632108836,
+      "feeling": 0.1358221191612268,
+      "judging": 0.1433378727433015
+    }
+  },
+  "gliner": {
+    "num_spans_detected": 0,
+    "spans_per_sample": {
+      "mean": 0.0,
+      "std": 0.0,
+      "max": 0
+    },
+    "confidence": {
+      "mean": 0.0,
+      "std": 0.0,
+      "min": 0.0,
+      "max": 0.0
+    },
+    "by_entity_type": {},
+    "span_length": {
+      "mean": 0.0,
+      "std": 0.0,
+      "max": 0
+    }
+  },
+  "leace": {
+    "shape": [
+      768,
+      768
+    ],
+    "dtype": "torch.float32",
+    "idempotence_error": 3.737737301889865e-07,
+    "idempotence_satisfied": true,
+    "frobenius_norm": 44.765132904052734,
+    "is_finite": true,
+    "singular_values": {
+      "top_10": [
+        11.183101654052734,
+        8.940112113952637,
+        8.742158889770508,
+        8.1048583984375,
+        7.826581954956055,
+        7.39609432220459,
+        6.727362632751465,
+        6.670882701873779,
+        6.387172222137451,
+        5.983485221862793
+      ],
+      "bottom_10": [
+        4.509846718292465e-08,
+        4.076060022839556e-08,
+        3.5160564237912695e-08,
+        3.290275429890244e-08,
+        3.26210667367377e-08,
+        2.2953260625513394e-08,
+        2.0951942403257817e-08,
+        1.5838436340231965e-08,
+        1.2658258441433645e-08,
+        4.814433740563118e-09
+      ],
+      "effective_rank": 695,
+      "n_erased_directions": 73
+    }
+  },
+  "execution": {
+    "mode": "unknown",
+    "staged_execution": true,
+    "num_samples": 291521
+  }
+}

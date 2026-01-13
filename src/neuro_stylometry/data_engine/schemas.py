@@ -36,6 +36,26 @@ POST_CHUNKED_FIELD = pa.field("post_chunked", pa.list_(CHUNK_STRUCT), nullable=T
 
 
 # ==============================================================================
+# AOT (Ahead-Of-Time) Tokenization Schema (Phase D Optimization)
+# ==============================================================================
+# Pre-computed token tensors for zero-JIT training loops.
+# Using uint16 for input_ids reduces PCIe bus pressure by 4x vs int64.
+# uint8 for attention_mask since values are binary (0/1).
+#
+# Reference: Phase D Final Optimization Blueprint Section 2.1
+# ==============================================================================
+
+TOKENIZED_FIELDS = [
+    # Pre-computed token IDs (vocab size < 65536 for all major tokenizers)
+    ("input_ids", pa.list_(pa.uint16())),
+    # Binary attention mask (1=attend, 0=ignore/pad)
+    ("attention_mask", pa.list_(pa.uint8())),
+    # Exact token count for O(1) bucketing (max 32767 tokens per sequence)
+    ("token_count", pa.int16()),
+]
+
+
+# ==============================================================================
 # SOBR Unified Dataset Schema
 # ==============================================================================
 
@@ -68,6 +88,9 @@ SOBR_SCHEMA = pa.schema(_SOBR_BASE_FIELDS)
 
 # Extended schema including post_chunked for staged execution
 SOBR_SCHEMA_STAGED = pa.schema(_SOBR_BASE_FIELDS + [POST_CHUNKED_FIELD])
+
+# AOT-tokenized schema for Phase D high-throughput training (includes pre-computed tensors)
+SOBR_SCHEMA_TOKENIZED = pa.schema(_SOBR_BASE_FIELDS + TOKENIZED_FIELDS)
 
 
 # ==============================================================================

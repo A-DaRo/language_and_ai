@@ -1,16 +1,27 @@
-"""Phase D training loop (baseline vs constrained)."""
+"""Phase D training loop (baseline vs constrained).
+
+Optimized for high-throughput training on modern GPUs:
+- torch.compile with mode="reduce-overhead" for CUDA Graph caching
+- FP8 precision via TransformerEngine (Blackwell/Hopper architecture)
+- Fused AdamW optimizer to eliminate Python loop overhead
+- Async prefetching via DevicePrefetcher
+- Quantized bucketing for stable tensor shapes
+"""
 
 from __future__ import annotations
 
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+import logging
 import math
 import json
 from pathlib import Path
-from typing import Dict, Optional, Any
+from typing import Dict, Optional, Any, Union
 
+import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -18,8 +29,15 @@ from ..hardware_ops.oom_guard import execute_with_oom_protection
 from ..hardware_ops.runtime import RuntimeController
 from ..hardware_ops.telemetry import CUDATimer, TelemetryCollector, create_runtime_metrics
 from ..data_engine.schemas import get_demographic_columns
+from ..data_engine.bucketing import (
+    QuantizedBucketSampler,
+    DEFAULT_QUANTIZE_STEP,
+    create_quantized_sampler,
+)
 from ..stylometry_net.classification_head import MultiTaskHead
 from ..stylometry_net.phase_d_dataset import (
+    DevicePrefetcher,
+    FastCollator,
     PhaseDBudgetedBatchSampler,
     PhaseDCollator,
     PhaseDDataset,
@@ -32,9 +50,46 @@ from .checkpointing import config_to_metadata, load_checkpoint, save_checkpoint,
 from .metrics import compute_task_metrics
 from .optimizer import build_optimizer, build_param_groups, build_scheduler
 
+logger = logging.getLogger(__name__)
+
+
+# ==============================================================================
+# FP8 Support Detection (TransformerEngine for Blackwell/Hopper)
+# ==============================================================================
+
+_FP8_AVAILABLE = False
+_TE_MODULE = None
+
+try:
+    import transformer_engine.pytorch as te
+    from transformer_engine.common.recipe import Format, DelayedScaling
+    _FP8_AVAILABLE = True
+    _TE_MODULE = te
+    logger.info("TransformerEngine FP8 support available")
+except ImportError:
+    logger.debug("TransformerEngine not available, FP8 disabled")
+
+
+def is_fp8_available() -> bool:
+    """Check if FP8 precision is available (requires TransformerEngine)."""
+    return _FP8_AVAILABLE
+
+
+def get_fp8_recipe() -> Optional[Any]:
+    """Get FP8 recipe for TransformerEngine autocast."""
+    if not _FP8_AVAILABLE:
+        return None
+    return DelayedScaling(
+        fp8_format=Format.HYBRID,
+        amax_history_len=16,
+        amax_compute_algo="max",
+    )
+
 
 @dataclass
 class PhaseDTrainConfig:
+    """Configuration for Phase D training with AOT optimizations."""
+    
     dataset_path: Path
     artifacts_dir: Path
     output_dir: Path
@@ -47,7 +102,7 @@ class PhaseDTrainConfig:
     learning_rate: float = 2e-5
     layerwise_lr_decay: float = 1.0
     gradient_accumulation_steps: int = 1
-    precision: str = "fp32"
+    precision: str = "fp32"  # "fp32", "bf16", "fp8"
     resume_from: Optional[Path] = None
     scheduler_name: str = "linear"
     num_warmup_steps: int = 0
@@ -59,10 +114,29 @@ class PhaseDTrainConfig:
     save_every_epochs: Optional[int] = None
     split_ratios: Dict[str, float] = None
     execution_config: Dict[str, Any] = field(default_factory=dict)
+    
+    # AOT Pipeline Optimization Settings
+    use_aot_mode: bool = True  # Use pre-tokenized data + FastCollator
+    use_torch_compile: bool = True  # Apply torch.compile to model
+    torch_compile_mode: str = "reduce-overhead"  # CUDA Graph optimization
+    use_fused_optimizer: bool = True  # Fused AdamW kernel
+    use_device_prefetch: bool = True  # Async H2D transfers
+    quantize_step: int = DEFAULT_QUANTIZE_STEP  # Snap-to-Grid step (16)
+    token_budget: int = 65536  # Default token budget for quantized sampler
 
 
 class PhaseDTrainer:
-    """Train baseline vs constrained models on Phase A outputs."""
+    """
+    Train baseline vs constrained models on Phase A outputs.
+    
+    Supports two execution modes:
+    1. Legacy mode: JIT tokenization, standard DataLoader
+    2. AOT mode: Pre-tokenized data, quantized bucketing, async prefetch
+    
+    AOT mode is automatically enabled when:
+    - Dataset has 'input_ids' column (from preprocess_tokens.py)
+    - config.use_aot_mode is True
+    """
 
     def __init__(self, config: PhaseDTrainConfig) -> None:
         self.config = config
@@ -79,13 +153,43 @@ class PhaseDTrainer:
         self._dynamic_batching_enabled = bool(
             self._dynamic_batching_cfg.get("enabled", self._autotuning_enabled)
         )
+        
+        # Telemetry configuration with strided sampling support
+        telemetry_cfg = self._execution_config.get("telemetry", {})
         self._telemetry_enabled = bool(
-            self._execution_config.get("telemetry", {}).get("enabled", False)
-            or self._autotuning_enabled
+            telemetry_cfg.get("enabled", False) or self._autotuning_enabled
         )
+        self._telemetry_stride = int(telemetry_cfg.get("stride", 1))  # Measure every Nth batch
         self._telemetry = TelemetryCollector.get_instance() if self._telemetry_enabled else None
+        self._telemetry_step_counter = 0
+        
         self._static_token_budget = int(self.config.batch_size * self.config.max_length)
         self._precision = str(self.config.precision or "fp32").lower()
+        
+        # AOT mode settings
+        self._aot_mode_requested = bool(config.use_aot_mode)
+        self._use_device_prefetch = bool(config.use_device_prefetch)
+        self._use_torch_compile = bool(config.use_torch_compile)
+        self._torch_compile_mode = str(config.torch_compile_mode)
+        self._use_fused_optimizer = bool(config.use_fused_optimizer)
+        self._quantize_step = int(config.quantize_step)
+        self._token_budget = int(config.token_budget)
+        
+        # FP8 support check
+        if self._precision == "fp8":
+            if not is_fp8_available():
+                logger.warning(
+                    "FP8 precision requested but TransformerEngine not available. "
+                    "Falling back to BF16."
+                )
+                self._precision = "bf16"
+            else:
+                logger.info("FP8 precision enabled via TransformerEngine")
+        
+        logger.info(
+            f"PhaseDTrainer initialized: device={self.device}, precision={self._precision}, "
+            f"aot_mode={self._aot_mode_requested}, torch_compile={self._use_torch_compile}"
+        )
 
     def _build_loader(
         self,
@@ -103,13 +207,28 @@ class PhaseDTrainer:
             label_maps=label_maps,
             split=split,
             split_ratios=self.config.split_ratios,
+            use_aot_tokens=self._aot_mode_requested,
         )
-        tokenizer = PhaseDTokenizer(
-            model_name=self.config.model_name,
-            max_length=self.config.max_length,
-            taxonomy_path=self.config.taxonomy_path,
-        )
-        collator = PhaseDCollator(tokenizer)
+        
+        # Determine collator based on dataset mode
+        aot_mode_active = dataset.is_aot_mode
+        
+        if aot_mode_active:
+            logger.info("AOT mode active: using FastCollator (zero tokenization)")
+            collator = FastCollator(
+                max_length=self.config.max_length,
+                pad_token_id=1,  # RoBERTa pad token
+                quantize_step=self._quantize_step,
+                use_pinned_memory=self.device.type == "cuda",
+            )
+        else:
+            logger.info("JIT mode: using PhaseDCollator (runtime tokenization)")
+            tokenizer = PhaseDTokenizer(
+                model_name=self.config.model_name,
+                max_length=self.config.max_length,
+                taxonomy_path=self.config.taxonomy_path,
+            )
+            collator = PhaseDCollator(tokenizer)
 
         loader_cfg = self._execution_config.get("data_loader", {})
         num_workers = int(loader_cfg.get("num_workers", 0))
@@ -127,7 +246,39 @@ class PhaseDTrainer:
             loader_kwargs["persistent_workers"] = persistent_workers
             loader_kwargs["prefetch_factor"] = prefetch_factor
 
+        # Use QuantizedBucketSampler in AOT mode for CUDA Graph stability
+        if aot_mode_active and enable_dynamic_batching:
+            token_counts = dataset.get_all_token_counts()
+            
+            if token_counts is not None:
+                logger.info(
+                    f"Using QuantizedBucketSampler: {len(token_counts)} samples, "
+                    f"token_budget={self._token_budget}, step={self._quantize_step}"
+                )
+                batch_sampler = create_quantized_sampler(
+                    lengths=token_counts,
+                    token_budget=self._token_budget,
+                    max_length=self.config.max_length,
+                    quantize_step=self._quantize_step,
+                    shuffle=shuffle,
+                    drop_last=False,
+                    seed=42,
+                )
+                loader = DataLoader(
+                    dataset,
+                    batch_sampler=batch_sampler,
+                    collate_fn=collator,
+                    **loader_kwargs,
+                )
+                return loader, dataset.label_maps
+            else:
+                logger.warning(
+                    "AOT mode but token_count column not found. "
+                    "Falling back to budgeted sampler."
+                )
+
         if enable_dynamic_batching and self._dynamic_batching_enabled:
+            # Legacy budgeted batch sampler
             max_batch_size = int(
                 self._dynamic_batching_cfg.get("max_batch_size", self.config.batch_size)
             )
@@ -138,7 +289,20 @@ class PhaseDTrainer:
             length_column = str(self._dynamic_batching_cfg.get("length_column", "text_length"))
             length_scale = float(self._dynamic_batching_cfg.get("length_scale", 1.0))
 
+            # Create tokenizer only if not in AOT mode
+            if not aot_mode_active:
+                tokenizer = PhaseDTokenizer(
+                    model_name=self.config.model_name,
+                    max_length=self.config.max_length,
+                    taxonomy_path=self.config.taxonomy_path,
+                )
+
             def length_fn(index: int) -> int:
+                # Prefer token_count in AOT mode
+                if aot_mode_active:
+                    tc = dataset.get_token_count(index)
+                    if tc is not None:
+                        return min(tc, int(self.config.max_length))
                 cached = dataset.get_length(index, length_column)
                 if cached is not None:
                     scaled = max(1, int(cached * length_scale))
@@ -199,12 +363,54 @@ class PhaseDTrainer:
             hidden_dim=model.config.hidden_size,
             num_labels_per_task=self.label_maps.num_classes(),
         ).to(self.device)
+        
+        # Apply torch.compile for kernel optimization (CUDA Graphs)
+        if self._use_torch_compile and self.device.type == "cuda":
+            logger.info(
+                f"Applying torch.compile to model (mode={self._torch_compile_mode})"
+            )
+            try:
+                # Compile the transformer backbone for CUDA Graph caching
+                # mode="reduce-overhead" enables automatic CUDA Graph capture
+                model = torch.compile(
+                    model,
+                    mode=self._torch_compile_mode,
+                    fullgraph=False,  # Allow graph breaks for flexibility
+                )
+                # Also compile the classification head
+                head = torch.compile(
+                    head,
+                    mode=self._torch_compile_mode,
+                    fullgraph=False,
+                )
+                logger.info("torch.compile applied successfully")
+            except Exception as e:
+                logger.warning(f"torch.compile failed, continuing without: {e}")
+        
         return model, head
 
     def _log_jsonl(self, path: Path, payload: Dict[str, Any]) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(payload) + "\n")
+    
+    def _get_autocast_context(self):
+        """Get appropriate autocast context based on precision setting."""
+        if self.device.type != "cuda":
+            return nullcontext()
+        
+        if self._precision == "fp8" and is_fp8_available():
+            # FP8 via TransformerEngine
+            return _TE_MODULE.fp8_autocast(
+                enabled=True,
+                fp8_recipe=get_fp8_recipe(),
+            )
+        elif self._precision in {"bf16", "bfloat16"}:
+            return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+        elif self._precision in {"fp16", "float16"}:
+            return torch.autocast(device_type="cuda", dtype=torch.float16)
+        else:
+            return nullcontext()
 
     @torch.no_grad()
     def _evaluate(
@@ -316,7 +522,6 @@ class PhaseDTrainer:
         run_dir: Path,
     ) -> None:
         accum_steps = max(1, int(self.config.gradient_accumulation_steps))
-        use_bf16 = self.device.type == "cuda" and self._precision in {"bf16", "bfloat16"}
 
         param_groups = build_param_groups(
             model=model,
@@ -327,6 +532,7 @@ class PhaseDTrainer:
         optimizer = build_optimizer(
             param_groups=param_groups,
             base_lr=self.config.learning_rate,
+            use_fused=self._use_fused_optimizer,
         )
 
         run_dir.mkdir(parents=True, exist_ok=True)
@@ -387,6 +593,13 @@ class PhaseDTrainer:
 
                 tokens = int(attention_mask.sum().item())
                 batch_size = int(attention_mask.size(0))
+                
+                # Strided telemetry: only measure every Nth batch to reduce overhead
+                self._telemetry_step_counter += 1
+                should_measure = (
+                    self._telemetry_enabled 
+                    and self._telemetry_step_counter % self._telemetry_stride == 0
+                )
 
                 def handle_oom(_event) -> None:
                     nonlocal accum_counter
@@ -395,13 +608,11 @@ class PhaseDTrainer:
 
                 def run_step() -> tuple[Optional[float], bool]:
                     nonlocal accum_counter, optimizer_step
-                    timer_ctx = CUDATimer() if self._telemetry_enabled else nullcontext()
+                    # Use strided telemetry to avoid synchronization overhead
+                    timer_ctx = CUDATimer(synchronize=False) if should_measure else nullcontext()
                     with timer_ctx as timer:
-                        autocast_ctx = (
-                            torch.autocast(device_type="cuda", dtype=torch.bfloat16)
-                            if use_bf16
-                            else nullcontext()
-                        )
+                        # Use precision-aware autocast context
+                        autocast_ctx = self._get_autocast_context()
                         with autocast_ctx:
                             outputs = model(input_ids=input_ids, attention_mask=attention_mask)
                             logits = head(outputs["cls_embedding"])
@@ -425,7 +636,8 @@ class PhaseDTrainer:
                             accum_counter = 0
                             did_step = True
 
-                    if self._telemetry_enabled and self._telemetry is not None and timer is not None:
+                    # Record telemetry only on strided steps (no synchronize in CUDATimer)
+                    if should_measure and self._telemetry is not None and timer is not None:
                         self._telemetry.record_batch(
                             batch_size=batch_size,
                             tokens=tokens,

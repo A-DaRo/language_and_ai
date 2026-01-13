@@ -5,6 +5,12 @@ Provides tools for measuring and collecting GPU inference performance:
 - @timed_cuda_block decorator for precise CUDA timing.
 - TelemetryCollector singleton for aggregating metrics across batches.
 - Integration with RuntimeController for feedback-based tuning.
+- Strided sampling support to decouple telemetry from the hot path.
+
+CRITICAL for high-throughput training:
+- Use CUDATimer(synchronize=False) to avoid pipeline stalls
+- Use strided sampling (every Nth batch) to reduce overhead
+- Never call synchronize() in the hot loop
 
 Usage:
     # Decorator for timing functions
@@ -12,10 +18,16 @@ Usage:
     def run_inference(batch):
         return model(batch)
     
-    # Manual timing
-    with CUDATimer() as timer:
+    # Manual timing (NO synchronization for throughput)
+    with CUDATimer(synchronize=False) as timer:
         result = model(batch)
     print(f"Elapsed: {timer.elapsed_ms:.2f}ms")
+    
+    # Strided telemetry (measure every 50th step)
+    if step % 50 == 0:
+        with CUDATimer() as timer:
+            ...
+        collector.record_batch(...)
     
     # Metrics collection
     collector = TelemetryCollector.get_instance()
@@ -25,6 +37,8 @@ Usage:
         elapsed_ms=timer.elapsed_ms,
     )
     summary = collector.get_summary()
+
+Reference: Phase D Final Optimization Blueprint Section 3.2
 """
 
 from __future__ import annotations
@@ -44,20 +58,39 @@ logger = logging.getLogger(__name__)
 T = TypeVar("T")
 
 
+# ==============================================================================
+# Telemetry Configuration Constants
+# ==============================================================================
+
+# Default stride for strided sampling (measure every Nth batch)
+DEFAULT_TELEMETRY_STRIDE: int = 50
+
+# Whether to synchronize by default (DISABLE for throughput)
+DEFAULT_SYNCHRONIZE: bool = False
+
+
 class CUDATimer:
     """
     Precise CUDA event-based timer for GPU operations.
     
-    Uses CUDA events with synchronization for accurate timing
-    of GPU operations, accounting for async execution.
+    Uses CUDA events for timing. By default, synchronization is DISABLED
+    to avoid pipeline stalls in high-throughput training.
+    
+    IMPORTANT: For accurate timing with synchronize=False, query elapsed_ms
+    after the GPU has completed the work (e.g., after next batch starts).
     
     Usage:
-        with CUDATimer() as timer:
+        # High-throughput mode (no sync, approximate timing)
+        with CUDATimer(synchronize=False) as timer:
             result = model(batch)
         print(f"Elapsed: {timer.elapsed_ms:.2f}ms")
+        
+        # Accurate mode (syncs, use sparingly)
+        with CUDATimer(synchronize=True) as timer:
+            result = model(batch)
     """
     
-    def __init__(self, synchronize: bool = False):
+    def __init__(self, synchronize: bool = DEFAULT_SYNCHRONIZE):
         """
         Initialize CUDA timer.
         
