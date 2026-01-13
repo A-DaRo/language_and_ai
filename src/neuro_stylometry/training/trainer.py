@@ -473,8 +473,16 @@ class PhaseDTrainer:
         task_logits: Dict[str, list[torch.Tensor]] = {k: [] for k in num_classes}
         task_labels: Dict[str, list[torch.Tensor]] = {k: [] for k in num_classes}
 
+        use_prefetch = self._use_device_prefetch and self.device.type == "cuda"
+        batch_iter = (
+            DevicePrefetcher(loader, self.device, non_blocking=True)
+            if use_prefetch
+            else loader
+        )
+        non_blocking = self.device.type == "cuda"
+
         eval_pbar = tqdm(
-            loader,
+            batch_iter,
             desc="Evaluating",
             unit="batch",
             leave=False,
@@ -482,9 +490,19 @@ class PhaseDTrainer:
         )
         
         for batch in eval_pbar:
-            input_ids = batch["input_ids"].to(self.device)
-            attention_mask = batch["attention_mask"].to(self.device)
-            labels = {k: v.to(self.device) for k, v in batch["labels"].items()}
+            if use_prefetch:
+                input_ids = batch["input_ids"]
+                attention_mask = batch["attention_mask"]
+                labels = batch["labels"]
+            else:
+                input_ids = batch["input_ids"].to(self.device, non_blocking=non_blocking)
+                attention_mask = batch["attention_mask"].to(
+                    self.device, non_blocking=non_blocking
+                )
+                labels = {
+                    k: v.to(self.device, non_blocking=non_blocking)
+                    for k, v in batch["labels"].items()
+                }
 
             # Mark CUDA Graph step boundary for compiled models
             if self._model_compiled and self.device.type == "cuda":
@@ -541,8 +559,16 @@ class PhaseDTrainer:
         task_logits: Dict[str, list[torch.Tensor]] = {k: [] for k in num_classes}
         task_labels: Dict[str, list[torch.Tensor]] = {k: [] for k in num_classes}
 
+        use_prefetch = self._use_device_prefetch and self.device.type == "cuda"
+        batch_iter = (
+            DevicePrefetcher(loader, self.device, non_blocking=True)
+            if use_prefetch
+            else loader
+        )
+        non_blocking = self.device.type == "cuda"
+
         eval_pbar = tqdm(
-            loader,
+            batch_iter,
             desc="Detailed Eval",
             unit="batch",
             leave=False,
@@ -550,9 +576,19 @@ class PhaseDTrainer:
         )
         
         for batch in eval_pbar:
-            input_ids = batch["input_ids"].to(self.device)
-            attention_mask = batch["attention_mask"].to(self.device)
-            labels = {k: v.to(self.device) for k, v in batch["labels"].items()}
+            if use_prefetch:
+                input_ids = batch["input_ids"]
+                attention_mask = batch["attention_mask"]
+                labels = batch["labels"]
+            else:
+                input_ids = batch["input_ids"].to(self.device, non_blocking=non_blocking)
+                attention_mask = batch["attention_mask"].to(
+                    self.device, non_blocking=non_blocking
+                )
+                labels = {
+                    k: v.to(self.device, non_blocking=non_blocking)
+                    for k, v in batch["labels"].items()
+                }
 
             # Mark CUDA Graph step boundary for compiled models
             if self._model_compiled and self.device.type == "cuda":
@@ -700,6 +736,9 @@ class PhaseDTrainer:
             )
             logger.info("torch.compile applied to full train step")
 
+        use_prefetch = self._use_device_prefetch and self.device.type == "cuda"
+        non_blocking = self.device.type == "cuda"
+
         for epoch in range(start_epoch, num_epochs):
             optimizer.zero_grad(set_to_none=not self._use_cuda_graph_training)
             accum_counter = 0
@@ -710,8 +749,13 @@ class PhaseDTrainer:
                 batch_sampler.set_epoch(epoch)
             
             # Progress bar for batches within epoch - single persistent bar
+            batch_iter = (
+                DevicePrefetcher(loader, self.device, non_blocking=True)
+                if use_prefetch
+                else loader
+            )
             batch_pbar = tqdm(
-                loader,
+                batch_iter,
                 desc=f"Epoch {epoch + 1}/{num_epochs}",
                 unit="batch",
                 leave=True,  # Keep bar visible after epoch completes
@@ -719,9 +763,21 @@ class PhaseDTrainer:
             )
             
             for batch in batch_pbar:
-                input_ids = batch["input_ids"].to(self.device)
-                attention_mask = batch["attention_mask"].to(self.device)
-                labels = {k: v.to(self.device) for k, v in batch["labels"].items()}
+                if use_prefetch:
+                    input_ids = batch["input_ids"]
+                    attention_mask = batch["attention_mask"]
+                    labels = batch["labels"]
+                else:
+                    input_ids = batch["input_ids"].to(
+                        self.device, non_blocking=non_blocking
+                    )
+                    attention_mask = batch["attention_mask"].to(
+                        self.device, non_blocking=non_blocking
+                    )
+                    labels = {
+                        k: v.to(self.device, non_blocking=non_blocking)
+                        for k, v in batch["labels"].items()
+                    }
 
                 tokens = int(attention_mask.sum().item())
                 batch_size = int(attention_mask.size(0))
