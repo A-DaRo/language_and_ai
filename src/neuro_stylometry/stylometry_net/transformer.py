@@ -39,18 +39,18 @@ class AffineGuardTransformer(nn.Module):
         super().__init__()
 
         self.config = AutoConfig.from_pretrained(model_name)
-        model_kwargs = {}
-        if hasattr(self.config, "attn_implementation"):
-            self.config.attn_implementation = "sdpa"
-            logger.info("Using attention implementation: sdpa")
-        else:
-            model_kwargs["attn_implementation"] = "sdpa"
+
+        # Enable Scaled Dot-Product Attention (SDPA) with Flash backend
+        # Requires: transformers >= 4.36, torch >= 2.0
         try:
-            self.model = AutoModel.from_pretrained(model_name, config=self.config, **model_kwargs)
-        except TypeError:
-            if model_kwargs:
-                logger.debug("attn_implementation not supported by model; using default.")
-            self.model = AutoModel.from_pretrained(model_name, config=self.config)
+            self.model = AutoModel.from_pretrained(
+                model_name,
+                attn_implementation="sdpa",  # Use PyTorch SDPA
+            )
+            logger.info(f"SDPA attention enabled for {model_name}")
+        except Exception as e:
+            logger.warning(f"SDPA not available, using default attention: {e}")
+            self.model = AutoModel.from_pretrained(model_name)
 
         if not hasattr(self.model, "embeddings") or not hasattr(self.model, "encoder"):
             raise TypeError(
@@ -147,37 +147,3 @@ class AffineGuardTransformer(nn.Module):
             output["hidden_states"] = encoder_outputs.hidden_states
 
         return output
-
-    def forward_cls(
-        self,
-        input_ids: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        *,
-        head_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        if attention_mask is None:
-            attention_mask = torch.ones_like(input_ids, dtype=torch.long)
-
-        embedding_output = self.model.embeddings(input_ids)
-        if self.affine_guard is not None:
-            embedding_output = self.affine_guard(embedding_output)
-
-        extended_attention_mask = self.model.get_extended_attention_mask(
-            attention_mask, input_ids.shape
-        )
-        if head_mask is not None:
-            head_mask = self.model.get_head_mask(
-                head_mask, self.model.config.num_hidden_layers
-            )
-
-        encoder_outputs = self.model.encoder(
-            embedding_output,
-            attention_mask=extended_attention_mask,
-            head_mask=head_mask,
-            output_attentions=False,
-            output_hidden_states=False,
-            return_dict=True,
-        )
-
-        sequence_output = encoder_outputs.last_hidden_state
-        return sequence_output[:, 0, :]

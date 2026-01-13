@@ -119,10 +119,6 @@ class PhaseDTrainConfig:
     use_aot_mode: bool = True  # Use pre-tokenized data + FastCollator
     use_torch_compile: bool = True  # Apply torch.compile to model
     torch_compile_mode: str = "reduce-overhead"  # CUDA Graph optimization
-    compile_train_step: bool = False  # Compile full train step (forward+loss+backward)
-    torch_compile_disable_cudagraphs: bool = False
-    use_cuda_graph_training: bool = False  # Manual CUDA-graph training path
-    cuda_graph_training: Dict[str, Any] = field(default_factory=dict)
     use_fused_optimizer: bool = True  # Fused AdamW kernel
     use_device_prefetch: bool = True  # Async H2D transfers
     quantize_step: int = DEFAULT_QUANTIZE_STEP  # Snap-to-Grid step (16)
@@ -149,13 +145,6 @@ class PhaseDTrainer:
         # Enable TF32 tensor cores for faster float32 matmuls on Ampere+ GPUs
         if self.device.type == "cuda":
             torch.set_float32_matmul_precision("high")
-            try:
-                torch.backends.cuda.enable_flash_sdp(True)
-                torch.backends.cuda.enable_mem_efficient_sdp(True)
-                torch.backends.cuda.enable_math_sdp(True)
-                logger.info("Enabled SDPA backends (flash/mem_efficient/math)")
-            except Exception as exc:
-                logger.debug("SDPA backend configuration unavailable: %s", exc)
         self._execution_config = config.execution_config or {}
         autotuning_cfg = self._execution_config.get("autotuning", {})
         self._autotuning_enabled = bool(autotuning_cfg.get("enabled", False))
@@ -175,12 +164,6 @@ class PhaseDTrainer:
             telemetry_cfg.get("enabled", False) or self._autotuning_enabled
         )
         self._telemetry_stride = int(telemetry_cfg.get("stride", 1))  # Measure every Nth batch
-        loss_log_stride = self._execution_config.get("loss_log_stride")
-        if loss_log_stride is None:
-            loss_log_stride = telemetry_cfg.get("loss_log_stride")
-        if loss_log_stride is None:
-            loss_log_stride = 50
-        self._loss_log_stride = max(1, int(loss_log_stride))
         self._telemetry = TelemetryCollector.get_instance() if self._telemetry_enabled else None
         self._telemetry_step_counter = 0
         
@@ -192,17 +175,9 @@ class PhaseDTrainer:
         self._use_device_prefetch = bool(config.use_device_prefetch)
         self._use_torch_compile = bool(config.use_torch_compile)
         self._torch_compile_mode = str(config.torch_compile_mode)
-        self._compile_train_step = bool(config.compile_train_step)
-        self._torch_compile_disable_cudagraphs = bool(
-            config.torch_compile_disable_cudagraphs
-        )
-        self._use_cuda_graph_training = bool(config.use_cuda_graph_training)
-        self._cuda_graph_training_cfg = config.cuda_graph_training or {}
         self._use_fused_optimizer = bool(config.use_fused_optimizer)
         self._quantize_step = int(config.quantize_step)
         self._token_budget = int(config.token_budget)
-        self._model_compiled = False
-        self._graph_training = None
         
         # FP8 support check
         if self._precision == "fp8":
@@ -217,36 +192,8 @@ class PhaseDTrainer:
         
         logger.info(
             f"PhaseDTrainer initialized: device={self.device}, precision={self._precision}, "
-            f"aot_mode={self._aot_mode_requested}, torch_compile={self._use_torch_compile}, "
-            f"compile_train_step={self._compile_train_step}, "
-            f"cuda_graph_training={self._use_cuda_graph_training}, "
-            f"loss_log_stride={self._loss_log_stride}, "
-            f"torch_compile_disable_cudagraphs={self._torch_compile_disable_cudagraphs}"
+            f"aot_mode={self._aot_mode_requested}, torch_compile={self._use_torch_compile}"
         )
-
-        if self._use_cuda_graph_training:
-            if self.device.type != "cuda":
-                logger.warning("CUDA graph training requested but CUDA unavailable - disabling.")
-                self._use_cuda_graph_training = False
-            else:
-                from ..hardware_ops.cuda_graphs import create_graph_aware_training_from_config
-
-                if self._use_torch_compile:
-                    logger.info(
-                        "Disabling torch.compile because CUDA graph training is enabled."
-                    )
-                    self._use_torch_compile = False
-                    self._compile_train_step = False
-
-                graph_cfg = {"cuda_graph_training": self._cuda_graph_training_cfg}
-                self._graph_training = create_graph_aware_training_from_config(
-                    graph_cfg,
-                    default_max_seq_len=self.config.max_length,
-                )
-                logger.info(
-                    "CUDA graph training enabled: ensure bucketed static shapes; "
-                    "dropout masks may repeat across graph replays."
-                )
 
     def _build_loader(
         self,
@@ -308,13 +255,23 @@ class PhaseDTrainer:
             token_counts = dataset.get_all_token_counts()
             
             if token_counts is not None:
-                logger.info(
-                    f"Using QuantizedBucketSampler: {len(token_counts)} samples, "
-                    f"token_budget={self._token_budget}, step={self._quantize_step}"
-                )
+                # Use dynamic budget from RuntimeController if autotuning enabled
+                if self._runtime_controller is not None:
+                    budget_provider = self._runtime_controller.get_next_budget
+                    logger.info(
+                        f"Using QuantizedBucketSampler with dynamic budget: {len(token_counts)} samples, "
+                        f"step={self._quantize_step}, autotuning=enabled"
+                    )
+                else:
+                    budget_provider = self._token_budget
+                    logger.info(
+                        f"Using QuantizedBucketSampler: {len(token_counts)} samples, "
+                        f"token_budget={self._token_budget}, step={self._quantize_step}"
+                    )
+                
                 batch_sampler = create_quantized_sampler(
                     lengths=token_counts,
-                    token_budget=self._token_budget,
+                    token_budget=budget_provider,
                     max_length=self.config.max_length,
                     quantize_step=self._quantize_step,
                     shuffle=shuffle,
@@ -422,29 +379,11 @@ class PhaseDTrainer:
         ).to(self.device)
         
         # Apply torch.compile for kernel optimization (CUDA Graphs)
-        self._model_compiled = False
-        if (
-            self._use_torch_compile
-            and self.device.type == "cuda"
-            and not self._compile_train_step
-        ):
+        if self._use_torch_compile and self.device.type == "cuda":
             logger.info(
                 f"Applying torch.compile to transformer (mode={self._torch_compile_mode})"
             )
             try:
-                if self._torch_compile_disable_cudagraphs:
-                    try:
-                        import torch._inductor.config as inductor_config
-
-                        if hasattr(inductor_config, "triton") and hasattr(
-                            inductor_config.triton, "cudagraphs"
-                        ):
-                            inductor_config.triton.cudagraphs = False
-                        if hasattr(inductor_config, "cudagraphs"):
-                            inductor_config.cudagraphs = False
-                        logger.info("Disabled torch.compile CUDA graphs via Inductor config")
-                    except Exception as e:
-                        logger.warning(f"Failed to disable CUDA graphs: {e}")
                 # Compile the transformer backbone for CUDA Graph caching
                 # mode="reduce-overhead" enables automatic CUDA Graph capture
                 model = torch.compile(
@@ -452,16 +391,13 @@ class PhaseDTrainer:
                     mode=self._torch_compile_mode,
                     fullgraph=False,  # Allow graph breaks for flexibility
                 )
-                # Keep the classification head eager to avoid multi-graph
-                # CUDA tensor overwrite issues at the graph boundary.
-                self._model_compiled = True
-                logger.info("torch.compile applied to transformer (head excluded)")
+                # DO NOT compile head:
+                # - Head is <5% of compute (single linear per task)
+                # - Dict return can cause CUDA Graph tensor aliasing
+                # - Stability > marginal speedup
+                logger.info("torch.compile applied to transformer only (head excluded)")
             except Exception as e:
                 logger.warning(f"torch.compile failed, continuing without: {e}")
-        elif self._use_torch_compile and self.device.type == "cuda":
-            logger.info(
-                "Skipping torch.compile on transformer because compile_train_step is enabled"
-            )
         
         return model, head
 
@@ -505,16 +441,8 @@ class PhaseDTrainer:
         task_logits: Dict[str, list[torch.Tensor]] = {k: [] for k in num_classes}
         task_labels: Dict[str, list[torch.Tensor]] = {k: [] for k in num_classes}
 
-        use_prefetch = self._use_device_prefetch and self.device.type == "cuda"
-        batch_iter = (
-            DevicePrefetcher(loader, self.device, non_blocking=True)
-            if use_prefetch
-            else loader
-        )
-        non_blocking = self.device.type == "cuda"
-
         eval_pbar = tqdm(
-            batch_iter,
+            loader,
             desc="Evaluating",
             unit="batch",
             leave=False,
@@ -522,22 +450,12 @@ class PhaseDTrainer:
         )
         
         for batch in eval_pbar:
-            if use_prefetch:
-                input_ids = batch["input_ids"]
-                attention_mask = batch["attention_mask"]
-                labels = batch["labels"]
-            else:
-                input_ids = batch["input_ids"].to(self.device, non_blocking=non_blocking)
-                attention_mask = batch["attention_mask"].to(
-                    self.device, non_blocking=non_blocking
-                )
-                labels = {
-                    k: v.to(self.device, non_blocking=non_blocking)
-                    for k, v in batch["labels"].items()
-                }
+            input_ids = batch["input_ids"].to(self.device)
+            attention_mask = batch["attention_mask"].to(self.device)
+            labels = {k: v.to(self.device) for k, v in batch["labels"].items()}
 
             # Mark CUDA Graph step boundary for compiled models
-            if self._model_compiled and self.device.type == "cuda":
+            if self._use_torch_compile and self.device.type == "cuda":
                 torch.compiler.cudagraph_mark_step_begin()
 
             autocast_ctx = (
@@ -547,11 +465,7 @@ class PhaseDTrainer:
             )
             with autocast_ctx:
                 outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-                cls_embedding = outputs["cls_embedding"]
-                if self._model_compiled and self.device.type == "cuda":
-                    # Break CUDAGraph output aliasing before eager head usage.
-                    cls_embedding = cls_embedding.clone()
-                logits = head(cls_embedding)
+                logits = head(outputs["cls_embedding"])
 
             for task, task_logits_batch in logits.items():
                 task_logits[task].append(task_logits_batch.detach().cpu())
@@ -591,16 +505,8 @@ class PhaseDTrainer:
         task_logits: Dict[str, list[torch.Tensor]] = {k: [] for k in num_classes}
         task_labels: Dict[str, list[torch.Tensor]] = {k: [] for k in num_classes}
 
-        use_prefetch = self._use_device_prefetch and self.device.type == "cuda"
-        batch_iter = (
-            DevicePrefetcher(loader, self.device, non_blocking=True)
-            if use_prefetch
-            else loader
-        )
-        non_blocking = self.device.type == "cuda"
-
         eval_pbar = tqdm(
-            batch_iter,
+            loader,
             desc="Detailed Eval",
             unit="batch",
             leave=False,
@@ -608,22 +514,12 @@ class PhaseDTrainer:
         )
         
         for batch in eval_pbar:
-            if use_prefetch:
-                input_ids = batch["input_ids"]
-                attention_mask = batch["attention_mask"]
-                labels = batch["labels"]
-            else:
-                input_ids = batch["input_ids"].to(self.device, non_blocking=non_blocking)
-                attention_mask = batch["attention_mask"].to(
-                    self.device, non_blocking=non_blocking
-                )
-                labels = {
-                    k: v.to(self.device, non_blocking=non_blocking)
-                    for k, v in batch["labels"].items()
-                }
+            input_ids = batch["input_ids"].to(self.device)
+            attention_mask = batch["attention_mask"].to(self.device)
+            labels = {k: v.to(self.device) for k, v in batch["labels"].items()}
 
             # Mark CUDA Graph step boundary for compiled models
-            if self._model_compiled and self.device.type == "cuda":
+            if self._use_torch_compile and self.device.type == "cuda":
                 torch.compiler.cudagraph_mark_step_begin()
 
             autocast_ctx = (
@@ -633,11 +529,7 @@ class PhaseDTrainer:
             )
             with autocast_ctx:
                 outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-                cls_embedding = outputs["cls_embedding"]
-                if self._model_compiled and self.device.type == "cuda":
-                    # Break CUDAGraph output aliasing before eager head usage.
-                    cls_embedding = cls_embedding.clone()
-                logits = head(cls_embedding)
+                logits = head(outputs["cls_embedding"])
 
             for task, task_logits_batch in logits.items():
                 task_logits[task].append(task_logits_batch.detach().cpu())
@@ -736,59 +628,41 @@ class PhaseDTrainer:
             f"{total_batches * num_epochs} total batches"
         )
         
-        compiled_step = None
-        if (
-            self._use_torch_compile
-            and self.device.type == "cuda"
-            and self._compile_train_step
-        ):
-            logger.info(
-                f"Compiling full train step (forward+loss+backward) "
-                f"(mode={self._torch_compile_mode})"
-            )
-
-            def _compiled_step(
-                input_ids: torch.Tensor,
-                attention_mask: torch.Tensor,
-                labels: tuple[torch.Tensor, ...],
-            ) -> tuple[torch.Tensor, torch.Tensor]:
-                cls_embedding = model.forward_cls(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
+        # Validate and wire DevicePrefetcher for async H2D transfers
+        use_device_prefetch = self._use_device_prefetch and self.device.type == "cuda"
+        if use_device_prefetch:
+            # DevicePrefetcher requires AOT mode (tensor outputs from collator)
+            dataset = loader.dataset
+            if hasattr(dataset, "is_aot_mode") and not dataset.is_aot_mode:
+                logger.warning(
+                    "DevicePrefetcher requires AOT mode. Falling back to sync transfers. "
+                    "Run preprocess_tokens.py first."
                 )
-                logits = head.forward_compiled(cls_embedding)
-                loss, valid_flag = head.compute_loss_compiled(logits, labels)
-                (loss / accum_steps).backward()
-                return loss, valid_flag
-
-            compiled_step = torch.compile(
-                _compiled_step,
-                mode=self._torch_compile_mode,
-                fullgraph=True,
-            )
-            logger.info("torch.compile applied to full train step")
-
-        use_prefetch = self._use_device_prefetch and self.device.type == "cuda"
-        non_blocking = self.device.type == "cuda"
-
+                use_device_prefetch = False
+            else:
+                from ..stylometry_net.phase_d_dataset import DevicePrefetcher
+                logger.info("DevicePrefetcher enabled: async H2D transfers active")
+        
         for epoch in range(start_epoch, num_epochs):
-            optimizer.zero_grad(set_to_none=not self._use_cuda_graph_training)
+            optimizer.zero_grad(set_to_none=True)
             accum_counter = 0
             epoch_loss_sum = 0.0
             epoch_loss_count = 0
-            last_loss_value: Optional[float] = None
+            last_loss_value: Optional[float] = None  # Track last synced loss for async display
             batch_sampler = getattr(loader, "batch_sampler", None)
             if hasattr(batch_sampler, "set_epoch"):
                 batch_sampler.set_epoch(epoch)
             
-            # Progress bar for batches within epoch - single persistent bar
-            batch_iter = (
-                DevicePrefetcher(loader, self.device, non_blocking=True)
-                if use_prefetch
+            # Wrap loader with DevicePrefetcher if enabled (async H2D transfers)
+            train_iterator = (
+                DevicePrefetcher(loader, device=self.device)
+                if use_device_prefetch
                 else loader
             )
+            
+            # Progress bar for batches within epoch - single persistent bar
             batch_pbar = tqdm(
-                batch_iter,
+                train_iterator,
                 desc=f"Epoch {epoch + 1}/{num_epochs}",
                 unit="batch",
                 leave=True,  # Keep bar visible after epoch completes
@@ -796,34 +670,21 @@ class PhaseDTrainer:
             )
             
             for batch in batch_pbar:
-                if use_prefetch:
+                # When using DevicePrefetcher, tensors are ALREADY on device
+                if use_device_prefetch:
                     input_ids = batch["input_ids"]
                     attention_mask = batch["attention_mask"]
                     labels = batch["labels"]
                 else:
-                    input_ids = batch["input_ids"].to(
-                        self.device, non_blocking=non_blocking
-                    )
-                    attention_mask = batch["attention_mask"].to(
-                        self.device, non_blocking=non_blocking
-                    )
-                    labels = {
-                        k: v.to(self.device, non_blocking=non_blocking)
-                        for k, v in batch["labels"].items()
-                    }
+                    input_ids = batch["input_ids"].to(self.device)
+                    attention_mask = batch["attention_mask"].to(self.device)
+                    labels = {k: v.to(self.device) for k, v in batch["labels"].items()}
 
-                batch_size = int(attention_mask.size(0))
-                padded_length = batch.get("padded_length")
-                tokens = batch.get("tokens")
-                if tokens is None:
-                    if padded_length is not None:
-                        tokens = int(padded_length) * batch_size
-                    elif attention_mask.device.type == "cpu":
-                        tokens = int(attention_mask.sum().item())
-                    else:
-                        tokens = int(attention_mask.numel())
-                else:
-                    tokens = int(tokens)
+                # CPU-side token counting: avoid GPU→CPU sync by using collator metadata
+                # FastCollator provides padded_length; fall back to tensor shape if unavailable
+                batch_size = input_ids.size(0)
+                padded_length = batch.get("padded_length", input_ids.size(1))
+                tokens = batch_size * padded_length  # Approximate token count (no GPU sync)
                 
                 # Strided telemetry: only measure every Nth batch to reduce overhead
                 self._telemetry_step_counter += 1
@@ -831,24 +692,19 @@ class PhaseDTrainer:
                     self._telemetry_enabled 
                     and self._telemetry_step_counter % self._telemetry_stride == 0
                 )
-                should_log_loss = self._loss_log_stride > 0 and step % self._loss_log_stride == 0
 
                 def handle_oom(_event) -> None:
                     nonlocal accum_counter
-                    optimizer.zero_grad(set_to_none=not self._use_cuda_graph_training)
+                    optimizer.zero_grad(set_to_none=True)
                     accum_counter = 0
 
-                def run_step() -> tuple[Optional[float], bool, bool]:
+                def run_step() -> tuple[Optional[float], bool]:
                     nonlocal accum_counter, optimizer_step
                     
                     # Mark CUDA Graph step boundary BEFORE any computation to prevent
                     # tensor overwrite errors when using torch.compile with mode="reduce-overhead"
                     # This must be called before both forward AND backward passes
-                    if (
-                        self._use_torch_compile
-                        and self.device.type == "cuda"
-                        and not self._use_cuda_graph_training
-                    ):
+                    if self._use_torch_compile and self.device.type == "cuda":
                         torch.compiler.cudagraph_mark_step_begin()
                     
                     # Use strided telemetry to avoid synchronization overhead
@@ -857,64 +713,26 @@ class PhaseDTrainer:
                         # Use precision-aware autocast context
                         autocast_ctx = self._get_autocast_context()
                         with autocast_ctx:
-                            if compiled_step is not None:
-                                labels_tuple = tuple(
-                                    labels[task] for task in head.task_order
-                                )
-                                loss_tensor, did_backward = compiled_step(
-                                    input_ids,
-                                    attention_mask,
-                                    labels_tuple,
-                                )
-                                did_backward = bool(did_backward.item())
-                            elif self._graph_training is not None:
-                                labels_tuple = tuple(
-                                    labels[task] for task in head.task_order
-                                )
-                                pad_token_id = getattr(
-                                    getattr(model, "tokenizer", None),
-                                    "tokenizer",
-                                    None,
-                                )
-                                pad_token_id = getattr(pad_token_id, "pad_token_id", None)
-                                loss_tensor, valid_flag, _ = self._graph_training.run(
-                                    model=model,
-                                    head=head,
-                                    input_ids=input_ids,
-                                    attention_mask=attention_mask,
-                                    labels=labels_tuple,
-                                    accum_steps=accum_steps,
-                                    pad_token_id=pad_token_id,
-                                )
-                                did_backward = bool(valid_flag.item())
-                            else:
-                                outputs = model(
-                                    input_ids=input_ids,
-                                    attention_mask=attention_mask,
-                                )
-                                cls_embedding = outputs["cls_embedding"]
-                                if self._model_compiled and self.device.type == "cuda":
-                                    # Break CUDAGraph output aliasing before eager head usage.
-                                    cls_embedding = cls_embedding.clone()
-                                logits = head(cls_embedding)
-                                loss_tensor = head.compute_loss(logits, labels)
-                                if loss_tensor is None:
-                                    return None, False, False
-                                (loss_tensor / accum_steps).backward()
-                                did_backward = True
+                            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+                            logits = head(outputs["cls_embedding"])
+                            loss = head.compute_loss(logits, labels)
 
-                        if not did_backward:
-                            return None, False, False
+                        if loss is None:
+                            return None, False, True  # loss_value, did_step, skip_batch
 
-                        loss_value = None
-                        if should_log_loss:
-                            loss_value = float(loss_tensor.detach().float().item())
+                        # Async loss logging: only extract scalar when needed for telemetry/logging
+                        # This avoids GPU→CPU sync on every batch, significantly improving throughput
+                        loss = loss / accum_steps
+                        loss.backward()
+                        
+                        # Extract loss value only when we need it (strided telemetry or progress bar)
+                        loss_value = float(loss.detach().item()) if should_measure else None
 
                         did_step = False
                         accum_counter += 1
                         if accum_counter >= accum_steps:
                             optimizer.step()
-                            optimizer.zero_grad(set_to_none=not self._use_cuda_graph_training)
+                            optimizer.zero_grad(set_to_none=True)
                             if scheduler is not None:
                                 scheduler.step()
                             optimizer_step += 1
@@ -936,38 +754,46 @@ class PhaseDTrainer:
                             )
                             self._runtime_controller.report_metrics(runtime_metrics)
 
-                    return loss_value, did_step, True
+                    return loss_value, did_step, False  # loss_value, did_step, skip_batch
 
-                loss_value, did_step, did_backward = execute_with_oom_protection(
+                result = execute_with_oom_protection(
                     run_step,
                     controller=self._runtime_controller,
                     on_oom=handle_oom,
                 )
-
-                if not did_backward:
+                
+                # Handle OOM protection returning None (OOM recovery failed)
+                if result is None:
+                    continue
+                    
+                loss_value, did_step, skip_batch = result
+                
+                # Skip batch only when loss computation failed (not when async sync skipped)
+                if skip_batch:
                     continue
 
+                # Track epoch loss for averaging (only when we synced)
                 if loss_value is not None:
-                    last_loss_value = loss_value
                     epoch_loss_sum += loss_value
                     epoch_loss_count += 1
+                    last_loss_value = loss_value  # Track for progress bar on non-sync steps
                 
-                # Update batch progress bar with current loss
-                if last_loss_value is not None and epoch_loss_count > 0:
+                # Update batch progress bar with current or last known loss
+                if epoch_loss_count > 0:
+                    display_loss = loss_value if loss_value is not None else last_loss_value
                     batch_pbar.set_postfix({
-                        "loss": f"{last_loss_value:.4f}",
+                        "loss": f"{display_loss:.4f}" if display_loss else "...",
                         "avg": f"{epoch_loss_sum / epoch_loss_count:.4f}",
                     })
 
-                if did_step:
+                if did_step and loss_value is not None:
                     step_metrics = {
                         "timestamp": datetime.now(timezone.utc).isoformat(),
                         "epoch": epoch + 1,
                         "step": step,
                         "optimizer_step": optimizer_step,
+                        "loss": loss_value,
                     }
-                    if last_loss_value is not None:
-                        step_metrics["loss"] = last_loss_value
                     self._log_jsonl(log_path, step_metrics)
 
                 step += 1

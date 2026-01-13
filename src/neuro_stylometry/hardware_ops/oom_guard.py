@@ -362,3 +362,220 @@ def oom_protected(
             )
         return wrapper
     return decorator
+
+
+# ==============================================================================
+# Epoch-Level OOM Protection (Experimental - for extreme throughput)
+# ==============================================================================
+
+@dataclass
+class EpochOOMState:
+    """
+    State tracking for epoch-level OOM recovery.
+    
+    This enables more aggressive in-loop optimizations by moving
+    OOM protection to epoch boundaries instead of per-batch.
+    """
+    epoch: int = 0
+    oom_occurred: bool = False
+    retry_count: int = 0
+    oom_events: list = None
+    budget_before_epoch: int = 0
+    budget_after_recovery: int = 0
+    
+    def __post_init__(self):
+        if self.oom_events is None:
+            self.oom_events = []
+
+
+def execute_epoch_with_oom_protection(
+    epoch_fn: Callable[[], T],
+    controller: Optional["RuntimeController"] = None,
+    max_retries: int = 2,
+    on_epoch_oom: Optional[Callable[[EpochOOMState], None]] = None,
+) -> tuple[Optional[T], EpochOOMState]:
+    """
+    Execute an entire epoch with OOM recovery at epoch level.
+    
+    This is an alternative to batch-level OOM protection that allows
+    more aggressive optimizations within the training loop by moving
+    the try/except overhead to epoch boundaries.
+    
+    Benefits:
+        - Eliminates per-batch try/except overhead (~0.1μs × batches/epoch)
+        - Allows tighter CUDA Graph capture without exception handling
+        - Better for extreme throughput scenarios (100+ batches/s)
+    
+    Trade-offs:
+        - OOM recovery loses entire epoch progress (must restart epoch)
+        - Less granular budget adjustment than batch-level
+        - Should only be used when batch-level overhead is measurable
+    
+    Usage:
+        def run_epoch():
+            for batch in loader:
+                # No per-batch OOM protection needed
+                loss = model(batch)
+                loss.backward()
+            return epoch_metrics
+        
+        result, state = execute_epoch_with_oom_protection(
+            run_epoch,
+            controller=runtime_controller,
+            max_retries=2,
+        )
+        
+        if state.oom_occurred:
+            logger.warning(f"Epoch recovered from OOM, new budget: {state.budget_after_recovery}")
+    
+    Args:
+        epoch_fn: Zero-argument callable that runs one epoch and returns metrics.
+        controller: Optional RuntimeController for budget feedback.
+        max_retries: Maximum epoch retry attempts after OOM.
+        on_epoch_oom: Optional callback invoked on OOM before retry.
+        
+    Returns:
+        Tuple of (epoch_result, EpochOOMState).
+        epoch_result is None if all retries exhausted.
+        
+    Raises:
+        OOMRecoveryError: If recovery fails after all retries.
+    """
+    from .runtime import RuntimeController
+    
+    state = EpochOOMState()
+    state.budget_before_epoch = controller.current_budget if controller else 0
+    
+    for attempt in range(max_retries + 1):
+        state.retry_count = attempt
+        
+        try:
+            result = epoch_fn()
+            # Success - return result with state
+            return result, state
+            
+        except Exception as e:
+            if not is_cuda_oom(e):
+                # Re-raise non-OOM exceptions immediately
+                raise
+            
+            state.oom_occurred = True
+            
+            # Record OOM event
+            allocated, reserved = get_memory_snapshot()
+            budget_before = controller.current_budget if controller else 0
+            
+            # Clear cache before handling
+            clear_cuda_cache()
+            
+            # Let controller slash budget aggressively for epoch recovery
+            budget_after = budget_before
+            if controller:
+                # Call handle_oom which typically uses oom_slash_factor (e.g., 0.5)
+                budget_after = controller.handle_oom()
+            
+            event = OOMEvent(
+                budget_before=budget_before,
+                budget_after=budget_after,
+                memory_allocated_mb=allocated,
+                memory_reserved_mb=reserved,
+                retry_count=attempt,
+                exception_msg=str(e),
+                traceback_str=traceback.format_exc()[-500:],
+            )
+            state.oom_events.append(event)
+            state.budget_after_recovery = budget_after
+            
+            # Invoke epoch-level callback if provided
+            if on_epoch_oom:
+                try:
+                    on_epoch_oom(state)
+                except Exception as callback_err:
+                    logger.warning(f"Epoch OOM callback error: {callback_err}")
+            
+            logger.warning(
+                f"Epoch OOM #{attempt + 1}/{max_retries + 1}: "
+                f"budget {budget_before} -> {budget_after}, "
+                f"allocated={allocated:.0f}MB, reserved={reserved:.0f}MB. "
+                f"Restarting epoch..."
+            )
+            
+            if attempt >= max_retries:
+                # All retries exhausted
+                raise OOMRecoveryError(
+                    f"Epoch failed after {max_retries + 1} attempts due to OOM. "
+                    f"Final budget: {budget_after}. Consider reducing initial budget.",
+                    state.oom_events,
+                )
+    
+    # Should not reach here
+    return None, state
+
+
+@contextmanager
+def epoch_oom_guard(
+    controller: Optional["RuntimeController"] = None,
+) -> Generator[EpochOOMState, None, None]:
+    """
+    Context manager for epoch-level OOM detection (no auto-retry).
+    
+    This is a lighter-weight alternative to execute_epoch_with_oom_protection
+    that only detects OOM and updates budget, leaving retry logic to the caller.
+    
+    Usage:
+        for epoch in range(num_epochs):
+            with epoch_oom_guard(controller) as guard:
+                for batch in loader:
+                    # Fast path - no per-batch try/except
+                    train_step(batch)
+            
+            if guard.oom_occurred:
+                # Epoch failed, budget already reduced
+                logger.warning(f"Epoch {epoch} OOM, retrying with budget {guard.budget_after_recovery}")
+                continue  # Retry epoch
+    
+    Args:
+        controller: Optional RuntimeController for budget feedback.
+        
+    Yields:
+        EpochOOMState for checking oom_occurred after epoch.
+    """
+    from .runtime import RuntimeController
+    
+    state = EpochOOMState()
+    state.budget_before_epoch = controller.current_budget if controller else 0
+    
+    try:
+        yield state
+        
+    except Exception as e:
+        if is_cuda_oom(e):
+            state.oom_occurred = True
+            
+            allocated, reserved = get_memory_snapshot()
+            budget_before = controller.current_budget if controller else 0
+            
+            clear_cuda_cache()
+            
+            budget_after = budget_before
+            if controller:
+                budget_after = controller.handle_oom()
+            
+            event = OOMEvent(
+                budget_before=budget_before,
+                budget_after=budget_after,
+                memory_allocated_mb=allocated,
+                memory_reserved_mb=reserved,
+                retry_count=0,
+                exception_msg=str(e),
+                traceback_str=traceback.format_exc()[-500:],
+            )
+            state.oom_events.append(event)
+            state.budget_after_recovery = budget_after
+            
+            logger.warning(
+                f"Epoch OOM detected: budget {budget_before} -> {budget_after}"
+            )
+        else:
+            # Re-raise non-OOM exceptions
+            raise

@@ -327,6 +327,115 @@ CHG analyzes which attention heads facilitate vs. suppress pollution information
 
 ---
 
+### AOT (Ahead-Of-Time) Pipeline
+
+For maximum throughput, pre-tokenize the dataset:
+
+```bash
+# Standard AOT tokenization (variable-length)
+python scripts/preprocess_tokens.py \
+    --input artifacts/phase_a/clean_dataset.arrow \
+    --output artifacts/phase_d/tokenized_dataset.arrow \
+    --model roberta-base \
+    --max-length 512 \
+    --workers 8
+
+# Zero-copy mode (pre-padded fixed-length arrays)
+python scripts/preprocess_tokens.py \
+    --input artifacts/phase_a/clean_dataset.arrow \
+    --output artifacts/phase_d/tokenized_dataset.arrow \
+    --model roberta-base \
+    --max-length 512 \
+    --workers 8 \
+    --pre-pad
+```
+
+The `--pre-pad` flag creates fixed-length arrays that enable single `torch.stack()` collation (~2ms vs ~15ms/batch).
+
+### Configuration Examples
+
+**HPC Mode** (`conf/hpc/phase_d.yaml`):
+```yaml
+optimization:
+  use_aot_mode: true
+  use_torch_compile: true
+  torch_compile_mode: "reduce-overhead"
+  use_fused_optimizer: true
+  use_device_prefetch: true
+  quantize_step: 16
+  token_budget: 32768
+
+training:
+  precision: "fp8"  # Falls back to BF16 if unavailable
+  batch_size: 64
+
+execution:
+  autotuning:
+    enabled: true
+    max_token_budget: 393216
+  data_loader:
+    num_workers: 16
+    pin_memory: true
+    persistent_workers: true
+    prefetch_factor: 8
+```
+
+**Laptop Mode** (`conf/laptop/phase_d.yaml`):
+```yaml
+optimization:
+  use_aot_mode: true
+  use_torch_compile: false  # Compilation overhead > benefit for small runs
+  use_fused_optimizer: true
+  use_device_prefetch: true
+  quantize_step: 16
+  token_budget: 8192
+
+training:
+  precision: "fp32"  # Stability on consumer GPUs
+  batch_size: 4
+
+execution:
+  autotuning:
+    enabled: false
+  data_loader:
+    num_workers: 0  # Single-threaded for stability
+    pin_memory: true
+```
+
+### Data Flow Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         AOT Pipeline Data Flow                               │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  preprocess_tokens.py          PhaseDDataset           FastCollator          │
+│  ┌─────────────────┐          ┌─────────────┐         ┌─────────────┐       │
+│  │ Parallel        │          │ Memory-mapped│         │ Zero-copy   │       │
+│  │ tokenization    │ ──Arrow──│ Arrow table │ ──AOT───│ tensor stack│       │
+│  │ (CPU workers)   │          │ (mmap)      │         │ (no Python) │       │
+│  └─────────────────┘          └─────────────┘         └─────────────┘       │
+│                                      │                       │               │
+│                                      ▼                       ▼               │
+│                              QuantizedBucketSampler   DevicePrefetcher      │
+│                              ┌─────────────────┐     ┌─────────────────┐    │
+│                              │ Snap-to-Grid    │     │ CUDA stream     │    │
+│                              │ token budgeting │     │ async H2D       │    │
+│                              └─────────────────┘     └─────────────────┘    │
+│                                                              │               │
+│                                                              ▼               │
+│                                                      Trainer._train()       │
+│                                                      ┌─────────────────┐    │
+│                                                      │ torch.compile   │    │
+│                                                      │ CUDA Graphs     │    │
+│                                                      │ Strided telemetry│   │
+│                                                      └─────────────────┘    │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
 ## Complete I/O Summary
 
 ### Inputs

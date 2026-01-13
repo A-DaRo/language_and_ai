@@ -164,11 +164,50 @@ class PhaseDDataset(Dataset):
                 self._token_count_col = self._length_cols["token_count"]
             else:
                 self._token_count_col = None
+            
+            # Detect pre-padded mode for zero-copy collation
+            self._is_pre_padded = False
+            self._pre_padded_length: Optional[int] = None
+            
+            if "is_pre_padded" in self.table.column_names:
+                first_pre_pad = self.table["is_pre_padded"][0].as_py()
+                self._is_pre_padded = bool(first_pre_pad)
+            elif pa.types.is_fixed_size_list(self._input_ids_col.type):
+                # Infer from fixed-size list type
+                self._is_pre_padded = True
+            
+            if self._is_pre_padded:
+                # Get padded length from metadata or infer from type
+                if "padded_length" in self.table.column_names:
+                    self._pre_padded_length = int(self.table["padded_length"][0].as_py())
+                elif pa.types.is_fixed_size_list(self._input_ids_col.type):
+                    self._pre_padded_length = self._input_ids_col.type.list_size
+                else:
+                    # Infer from first sample
+                    self._pre_padded_length = len(self._input_ids_col[0].as_py())
+                
+                logger.info(
+                    f"Pre-padded AOT mode enabled: {self._pre_padded_length} tokens/sample "
+                    f"(zero-copy collation ready)"
+                )
+        else:
+            self._is_pre_padded = False
+            self._pre_padded_length = None
 
     @property
     def is_aot_mode(self) -> bool:
         """Whether dataset provides pre-tokenized data."""
         return self._aot_mode
+    
+    @property
+    def is_pre_padded(self) -> bool:
+        """Whether dataset has pre-padded fixed-length sequences for zero-copy."""
+        return self._is_pre_padded
+    
+    @property
+    def pre_padded_length(self) -> Optional[int]:
+        """Fixed sequence length if pre-padded, None otherwise."""
+        return self._pre_padded_length
 
     def __len__(self) -> int:
         return self.table.num_rows
@@ -202,18 +241,38 @@ class PhaseDDataset(Dataset):
         
         if self._aot_mode:
             # AOT mode: return pre-tokenized tensors
-            input_ids = self._input_ids_col[index].as_py()
-            attention_mask = self._attention_mask_col[index].as_py()
-            
-            # Convert to numpy arrays for efficient collation
-            input_ids = np.array(input_ids, dtype=np.uint16)
-            attention_mask = np.array(attention_mask, dtype=np.uint8)
+            if self._is_pre_padded:
+                # Pre-padded mode: fixed-length arrays, optimized for zero-copy
+                # Use numpy buffer protocol when possible for zero-copy
+                input_ids_chunk = self._input_ids_col[index]
+                attention_mask_chunk = self._attention_mask_col[index]
+                
+                # Try to get numpy view without copy (works for FixedSizeList)
+                try:
+                    input_ids = input_ids_chunk.values.to_numpy(zero_copy_only=True).astype(np.int64)
+                except (pa.ArrowInvalid, AttributeError):
+                    # Fallback: convert via as_py() (still fixed-length)
+                    input_ids = np.array(input_ids_chunk.as_py(), dtype=np.int64)
+                
+                try:
+                    attention_mask = attention_mask_chunk.values.to_numpy(zero_copy_only=True).astype(np.int64)
+                except (pa.ArrowInvalid, AttributeError):
+                    attention_mask = np.array(attention_mask_chunk.as_py(), dtype=np.int64)
+            else:
+                # Variable-length AOT mode
+                input_ids = self._input_ids_col[index].as_py()
+                attention_mask = self._attention_mask_col[index].as_py()
+                
+                # Convert to numpy arrays for efficient collation
+                input_ids = np.array(input_ids, dtype=np.int64)
+                attention_mask = np.array(attention_mask, dtype=np.int64)
             
             return {
                 "input_ids": input_ids,
                 "attention_mask": attention_mask,
                 "labels": labels,
                 "post_id": post_id,
+                "_is_pre_padded": self._is_pre_padded,  # Signal to collator
             }
         else:
             # JIT mode: return text for tokenization in collator
@@ -280,16 +339,11 @@ class PhaseDCollator:
                     dtype=torch.long,
                 )
 
-        padded_length = int(encoding["input_ids"].size(1))
-        tokens = int(encoding["attention_mask"].sum().item())
-
         return {
             "input_ids": encoding["input_ids"],
             "attention_mask": encoding["attention_mask"],
             "labels": labels,
             "post_id": [sample.get("post_id") for sample in batch],
-            "padded_length": padded_length,
-            "tokens": tokens,
         }
 
 
@@ -357,6 +411,10 @@ class FastCollator:
         """
         Collate pre-tokenized samples with quantized padding.
         
+        Supports two paths:
+        1. Pre-padded: Single torch.stack() (zero-copy, ~2ms/batch)
+        2. Variable-length: Dynamic padding (standard AOT, ~15ms/batch)
+        
         Args:
             batch: List of sample dicts with 'input_ids', 'attention_mask',
                    'labels', and optionally 'token_count'.
@@ -366,69 +424,84 @@ class FastCollator:
         """
         batch_size = len(batch)
         
-        # Extract pre-tokenized sequences
-        input_ids_list = []
-        attention_mask_list = []
-        lengths = []
+        # Check if batch is pre-padded (all samples have fixed length)
+        is_pre_padded = batch[0].get("_is_pre_padded", False) if batch else False
         
-        for sample in batch:
-            # Get pre-computed tokens (already numpy arrays or lists)
-            ids = sample.get("input_ids")
-            mask = sample.get("attention_mask")
+        if is_pre_padded:
+            # ===== ZERO-COPY PATH: Pre-padded fixed-length arrays =====
+            # Single torch.stack() call - no per-sample iteration needed
             
-            if ids is None or mask is None:
-                raise ValueError(
-                    "FastCollator requires pre-tokenized data. "
-                    "Run preprocess_tokens.py first or use PhaseDCollator."
-                )
+            # Stack all arrays at once (single numpy->torch conversion)
+            input_ids_stacked = np.stack([s["input_ids"] for s in batch])
+            attention_mask_stacked = np.stack([s["attention_mask"] for s in batch])
             
-            # Convert to numpy if needed
-            ids = np.asarray(ids, dtype=np.uint16)
-            mask = np.asarray(mask, dtype=np.uint8)
+            # Convert to torch tensors (single memcpy per tensor)
+            input_ids = torch.from_numpy(input_ids_stacked)
+            attention_mask = torch.from_numpy(attention_mask_stacked)
+            padded_length = input_ids.size(1)
+        else:
+            # ===== STANDARD AOT PATH: Variable-length with dynamic padding =====
+            # Still optimized: pre-allocate numpy, single torch conversion
             
-            input_ids_list.append(ids)
-            attention_mask_list.append(mask)
-            lengths.append(len(ids))
+            # Extract pre-tokenized sequences
+            input_ids_list = []
+            attention_mask_list = []
+            lengths = []
+            
+            for sample in batch:
+                ids = sample.get("input_ids")
+                mask = sample.get("attention_mask")
+                
+                if ids is None or mask is None:
+                    raise ValueError(
+                        "FastCollator requires pre-tokenized data. "
+                        "Run preprocess_tokens.py first or use PhaseDCollator."
+                    )
+                
+                # Convert to numpy if needed (use int64 for torch compatibility)
+                if not isinstance(ids, np.ndarray):
+                    ids = np.array(ids, dtype=np.int64)
+                elif ids.dtype != np.int64:
+                    ids = ids.astype(np.int64)
+                
+                if not isinstance(mask, np.ndarray):
+                    mask = np.array(mask, dtype=np.int64)
+                elif mask.dtype != np.int64:
+                    mask = mask.astype(np.int64)
+                
+                input_ids_list.append(ids)
+                attention_mask_list.append(mask)
+                lengths.append(len(ids))
+            
+            # Compute quantized max length (Snap-to-Grid)
+            max_len_in_batch = max(lengths)
+            padded_length = min(
+                snap_to_grid(max_len_in_batch, self.quantize_step),
+                self.max_length
+            )
+            
+            # Pre-allocate numpy arrays with correct dtype from the start
+            # This enables single numpy->torch conversion (not per-sample)
+            input_ids_np = np.zeros((batch_size, padded_length), dtype=np.int64)
+            attention_mask_np = np.zeros((batch_size, padded_length), dtype=np.int64)
+            
+            # Fill arrays (vectorized where possible)
+            for i, (ids, mask) in enumerate(zip(input_ids_list, attention_mask_list)):
+                seq_len = min(len(ids), padded_length)
+                input_ids_np[i, :seq_len] = ids[:seq_len]
+                attention_mask_np[i, :seq_len] = mask[:seq_len]
+            
+            # Single numpy→torch conversion (not per-sample)
+            input_ids = torch.from_numpy(input_ids_np)
+            attention_mask = torch.from_numpy(attention_mask_np)
         
-        # Compute quantized max length (Snap-to-Grid)
-        max_len_in_batch = max(lengths)
-        padded_length = min(
-            snap_to_grid(max_len_in_batch, self.quantize_step),
-            self.max_length
-        )
-        tokens = int(sum(lengths))
-        
-        # Pre-allocate tensors (pinned memory is handled by DataLoader's pin_memory=True,
-        # NOT here - CUDA ops in worker processes cause initialization errors)
-        input_ids_np = np.full(
-            (batch_size, padded_length),
-            self.pad_token_id,
-            dtype=np.uint16,
-        )
-        attention_mask_np = np.zeros(
-            (batch_size, padded_length),
-            dtype=np.uint8,
-        )
-        
-        # Fill tensors (pad on right with pad_token_id / 0)
-        for i, (ids, mask) in enumerate(zip(input_ids_list, attention_mask_list)):
-            seq_len = min(len(ids), padded_length)
-            input_ids_np[i, :seq_len] = ids[:seq_len]
-            attention_mask_np[i, :seq_len] = mask[:seq_len]
-            # Padding positions already 0 from zeros initialization
-
-        input_ids = torch.from_numpy(input_ids_np).to(dtype=torch.long)
-        attention_mask = torch.from_numpy(attention_mask_np)
-        
-        # Collate labels (pinned memory handled by DataLoader, not here)
+        # Collate labels (same for both paths)
         labels: Dict[str, torch.Tensor] = {}
         if batch and "labels" in batch[0]:
             label_keys = batch[0]["labels"].keys()
             for field in label_keys:
                 label_values = [sample["labels"][field] for sample in batch]
-                labels[field] = torch.from_numpy(
-                    np.asarray(label_values, dtype=np.int64)
-                )
+                labels[field] = torch.tensor(label_values, dtype=torch.long)
         
         return {
             "input_ids": input_ids,
@@ -436,7 +509,6 @@ class FastCollator:
             "labels": labels,
             "post_id": [sample.get("post_id") for sample in batch],
             "padded_length": padded_length,  # For telemetry
-            "tokens": tokens,
         }
 
 

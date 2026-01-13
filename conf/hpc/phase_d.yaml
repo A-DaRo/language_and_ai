@@ -35,6 +35,10 @@ optimization:
   # AOT mode mandatory for 100+ it/s
   use_aot_mode: true
   
+  # Pre-padding enables zero-copy collation (~2ms vs ~15ms/batch)
+  # Use --pre-pad when running preprocess_tokens.py
+  use_pre_padded: true
+  
   # torch.compile with CUDA Graph capture
   use_torch_compile: true
   torch_compile_mode: "default"
@@ -88,8 +92,18 @@ execution:
     enabled: true  # Monitor for profiling
     stride: 50  # Strided sampling to avoid sync overhead
     
+  # DataLoader tuning optimized for RTX 5090 / A100 / H100
+  # GPU is so fast it can starve without aggressive prefetching
   data_loader:
-    num_workers: 8  # High parallelism for data loading
-    pin_memory: true  # Required for async H2D
-    persistent_workers: true  # Avoid worker respawn overhead
-    prefetch_factor: 4  # Aggressive prefetching
+    num_workers: 16  # Increased parallelism - RTX 5090 needs more data throughput
+    pin_memory: true  # Required for async H2D transfers
+    persistent_workers: true  # Avoid worker respawn overhead (critical for throughput)
+    prefetch_factor: 8  # Aggressive prefetching to prevent GPU starvation
+    
+  # OOM recovery configuration
+  oom_recovery:
+    # Epoch-level OOM protection for extreme throughput scenarios
+    # Batch-level protection has minimal overhead, but epoch-level allows
+    # more aggressive optimizations within the hot loop
+    epoch_level_protection: true  # Set true for experimental max throughput
+    max_epoch_retries: 2  # Retry epoch up to N times after OOM
