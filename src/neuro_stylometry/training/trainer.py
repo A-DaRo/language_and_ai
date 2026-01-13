@@ -119,6 +119,7 @@ class PhaseDTrainConfig:
     use_aot_mode: bool = True  # Use pre-tokenized data + FastCollator
     use_torch_compile: bool = True  # Apply torch.compile to model
     torch_compile_mode: str = "reduce-overhead"  # CUDA Graph optimization
+    compile_train_step: bool = False  # Compile full train step (forward+loss+backward)
     use_fused_optimizer: bool = True  # Fused AdamW kernel
     use_device_prefetch: bool = True  # Async H2D transfers
     quantize_step: int = DEFAULT_QUANTIZE_STEP  # Snap-to-Grid step (16)
@@ -175,9 +176,11 @@ class PhaseDTrainer:
         self._use_device_prefetch = bool(config.use_device_prefetch)
         self._use_torch_compile = bool(config.use_torch_compile)
         self._torch_compile_mode = str(config.torch_compile_mode)
+        self._compile_train_step = bool(config.compile_train_step)
         self._use_fused_optimizer = bool(config.use_fused_optimizer)
         self._quantize_step = int(config.quantize_step)
         self._token_budget = int(config.token_budget)
+        self._model_compiled = False
         
         # FP8 support check
         if self._precision == "fp8":
@@ -192,7 +195,8 @@ class PhaseDTrainer:
         
         logger.info(
             f"PhaseDTrainer initialized: device={self.device}, precision={self._precision}, "
-            f"aot_mode={self._aot_mode_requested}, torch_compile={self._use_torch_compile}"
+            f"aot_mode={self._aot_mode_requested}, torch_compile={self._use_torch_compile}, "
+            f"compile_train_step={self._compile_train_step}"
         )
 
     def _build_loader(
@@ -369,7 +373,12 @@ class PhaseDTrainer:
         ).to(self.device)
         
         # Apply torch.compile for kernel optimization (CUDA Graphs)
-        if self._use_torch_compile and self.device.type == "cuda":
+        self._model_compiled = False
+        if (
+            self._use_torch_compile
+            and self.device.type == "cuda"
+            and not self._compile_train_step
+        ):
             logger.info(
                 f"Applying torch.compile to transformer (mode={self._torch_compile_mode})"
             )
@@ -383,9 +392,14 @@ class PhaseDTrainer:
                 )
                 # Keep the classification head eager to avoid multi-graph
                 # CUDA tensor overwrite issues at the graph boundary.
+                self._model_compiled = True
                 logger.info("torch.compile applied to transformer (head excluded)")
             except Exception as e:
                 logger.warning(f"torch.compile failed, continuing without: {e}")
+        elif self._use_torch_compile and self.device.type == "cuda":
+            logger.info(
+                "Skipping torch.compile on transformer because compile_train_step is enabled"
+            )
         
         return model, head
 
@@ -443,7 +457,7 @@ class PhaseDTrainer:
             labels = {k: v.to(self.device) for k, v in batch["labels"].items()}
 
             # Mark CUDA Graph step boundary for compiled models
-            if self._use_torch_compile and self.device.type == "cuda":
+            if self._model_compiled and self.device.type == "cuda":
                 torch.compiler.cudagraph_mark_step_begin()
 
             autocast_ctx = (
@@ -454,7 +468,7 @@ class PhaseDTrainer:
             with autocast_ctx:
                 outputs = model(input_ids=input_ids, attention_mask=attention_mask)
                 cls_embedding = outputs["cls_embedding"]
-                if self._use_torch_compile and self.device.type == "cuda":
+                if self._model_compiled and self.device.type == "cuda":
                     # Break CUDAGraph output aliasing before eager head usage.
                     cls_embedding = cls_embedding.clone()
                 logits = head(cls_embedding)
@@ -511,7 +525,7 @@ class PhaseDTrainer:
             labels = {k: v.to(self.device) for k, v in batch["labels"].items()}
 
             # Mark CUDA Graph step boundary for compiled models
-            if self._use_torch_compile and self.device.type == "cuda":
+            if self._model_compiled and self.device.type == "cuda":
                 torch.compiler.cudagraph_mark_step_begin()
 
             autocast_ctx = (
@@ -522,7 +536,7 @@ class PhaseDTrainer:
             with autocast_ctx:
                 outputs = model(input_ids=input_ids, attention_mask=attention_mask)
                 cls_embedding = outputs["cls_embedding"]
-                if self._use_torch_compile and self.device.type == "cuda":
+                if self._model_compiled and self.device.type == "cuda":
                     # Break CUDAGraph output aliasing before eager head usage.
                     cls_embedding = cls_embedding.clone()
                 logits = head(cls_embedding)
@@ -624,6 +638,40 @@ class PhaseDTrainer:
             f"{total_batches * num_epochs} total batches"
         )
         
+        compiled_step = None
+        if (
+            self._use_torch_compile
+            and self.device.type == "cuda"
+            and self._compile_train_step
+        ):
+            logger.info(
+                f"Compiling full train step (forward+loss+backward) "
+                f"(mode={self._torch_compile_mode})"
+            )
+
+            def _compiled_step(
+                input_ids: torch.Tensor,
+                attention_mask: torch.Tensor,
+                labels: Dict[str, torch.Tensor],
+            ) -> tuple[torch.Tensor, torch.Tensor]:
+                outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+                logits = head(outputs["cls_embedding"])
+                loss = head.compute_loss(logits, labels)
+                if loss is None:
+                    zero = torch.zeros((), device=input_ids.device)
+                    flag = torch.zeros((), device=input_ids.device, dtype=torch.int32)
+                    return zero, flag
+                (loss / accum_steps).backward()
+                flag = torch.ones((), device=input_ids.device, dtype=torch.int32)
+                return loss, flag
+
+            compiled_step = torch.compile(
+                _compiled_step,
+                mode=self._torch_compile_mode,
+                fullgraph=False,
+            )
+            logger.info("torch.compile applied to full train step")
+
         for epoch in range(start_epoch, num_epochs):
             optimizer.zero_grad(set_to_none=True)
             accum_counter = 0
@@ -677,20 +725,33 @@ class PhaseDTrainer:
                         # Use precision-aware autocast context
                         autocast_ctx = self._get_autocast_context()
                         with autocast_ctx:
-                            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-                            cls_embedding = outputs["cls_embedding"]
-                            if self._use_torch_compile and self.device.type == "cuda":
-                                # Break CUDAGraph output aliasing before eager head usage.
-                                cls_embedding = cls_embedding.clone()
-                            logits = head(cls_embedding)
-                            loss = head.compute_loss(logits, labels)
+                            if compiled_step is not None:
+                                loss_tensor, did_backward = compiled_step(
+                                    input_ids,
+                                    attention_mask,
+                                    labels,
+                                )
+                                did_backward = bool(did_backward.item())
+                            else:
+                                outputs = model(
+                                    input_ids=input_ids,
+                                    attention_mask=attention_mask,
+                                )
+                                cls_embedding = outputs["cls_embedding"]
+                                if self._model_compiled and self.device.type == "cuda":
+                                    # Break CUDAGraph output aliasing before eager head usage.
+                                    cls_embedding = cls_embedding.clone()
+                                logits = head(cls_embedding)
+                                loss_tensor = head.compute_loss(logits, labels)
+                                if loss_tensor is None:
+                                    return None, False
+                                (loss_tensor / accum_steps).backward()
+                                did_backward = True
 
-                        if loss is None:
+                        if not did_backward:
                             return None, False
 
-                        loss_value = float(loss.item())
-                        loss = loss / accum_steps
-                        loss.backward()
+                        loss_value = float(loss_tensor.item())
 
                         did_step = False
                         accum_counter += 1

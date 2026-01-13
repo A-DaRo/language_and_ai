@@ -37,7 +37,8 @@ optimization:
   
   # torch.compile with CUDA Graph capture
   use_torch_compile: true
-  torch_compile_mode: "default"
+  torch_compile_mode: "reduce-overhead"
+  compile_train_step: true
   
   # Fused optimizer eliminates Python loop overhead
   use_fused_optimizer: true
