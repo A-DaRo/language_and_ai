@@ -519,13 +519,13 @@ def _find_config_root(config_name: str) -> Path:
         if resolved is not None:
             return resolved
 
-    for parent in Path(__file__).resolve().parents:
+    cwd = Path.cwd()
+    for parent in (cwd, *cwd.parents):
         resolved = _resolve_config_root_from_hint(parent, config_name)
         if resolved is not None:
             return resolved
 
-    cwd = Path.cwd()
-    for parent in (cwd, *cwd.parents):
+    for parent in Path(__file__).resolve().parents:
         resolved = _resolve_config_root_from_hint(parent, config_name)
         if resolved is not None:
             return resolved
