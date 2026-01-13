@@ -81,6 +81,15 @@ output:
 
 # Hardware-aware execution
 execution:
+  bucketing:
+    enabled: false
+    batch_size: 8
+    mega_batch_mult: 100
+    shuffle: true
+    drop_last: false
+    seed: 42
+    length_column: "text_length"
+    length_scale: 1.0
   autotuning:
     enabled: false
     warmup_batches: 10
@@ -105,6 +114,8 @@ execution:
     length_scale: 1.0
   telemetry:
     enabled: false
+    sample_every: 50
+    synchronize: false
   data_loader:
     num_workers: 0
     pin_memory: true
