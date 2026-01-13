@@ -190,6 +190,14 @@ class PhaseDTrainer:
         self._torch_compile_backend = str(config.torch_compile_backend)
         self._compile_train_step = bool(config.compile_train_step)
         self._torch_compile_disable_cudagraphs = bool(config.torch_compile_disable_cudagraphs)
+        self._use_manual_cuda_graphs = bool(config.use_cuda_graph_training)
+        if self._use_manual_cuda_graphs:
+            if self._use_torch_compile:
+                logger.info("Manual CUDA graph training enabled; disabling torch.compile.")
+                self._use_torch_compile = False
+            if self._compile_train_step:
+                logger.info("Manual CUDA graph training enabled; disabling compile_train_step.")
+                self._compile_train_step = False
         self._use_fused_optimizer = bool(config.use_fused_optimizer)
         self._quantize_step = int(config.quantize_step)
         self._token_budget = int(config.token_budget)

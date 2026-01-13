@@ -124,6 +124,9 @@ class GraphCache:
         
         # LRU tracking: list of shape keys in access order (oldest first)
         self._lru_order: List[Tuple[int, ...]] = []
+
+        # Shapes that failed capture (fallback to eager)
+        self._failed_shapes: set[Tuple[int, ...]] = set()
         
         # Thread safety
         self._lock = threading.Lock()
@@ -317,28 +320,38 @@ class GraphCache:
         # Fallback if disabled or not on CUDA
         if not self.is_enabled:
             return forward_fn(**input_tensors)
-        
+
         with self._lock:
+            if shape_key in self._failed_shapes:
+                return forward_fn(**input_tensors)
             if shape_key in self._cache:
                 # Cache hit - replay existing graph
                 self._hits += 1
                 self._update_lru(shape_key)
                 return self.replay(self._cache[shape_key], **input_tensors)
-            else:
-                # Cache miss - capture new graph
-                self._misses += 1
-                
-                # Check cache capacity and evict if needed
-                if len(self._cache) >= self.config.max_cached_graphs:
-                    self._evict_oldest()
-                
-                # Capture new graph
-                captured = self.capture(shape_key, forward_fn, **input_tensors)
-                self._cache[shape_key] = captured
-                self._lru_order.append(shape_key)
-                
-                # Return outputs from capture (already computed)
-                return self._format_outputs(captured.output_buffers)
+            # Cache miss - capture new graph
+            self._misses += 1
+            if len(self._cache) >= self.config.max_cached_graphs:
+                self._evict_oldest()
+
+        try:
+            captured = self.capture(shape_key, forward_fn, **input_tensors)
+        except Exception as exc:
+            with self._lock:
+                self._failed_shapes.add(shape_key)
+            logger.warning(
+                "CUDA graph capture failed for shape_key=%s; falling back to eager: %s",
+                shape_key,
+                exc,
+            )
+            return forward_fn(**input_tensors)
+
+        with self._lock:
+            self._cache[shape_key] = captured
+            self._lru_order.append(shape_key)
+
+        # Return outputs from capture (already computed)
+        return self._format_outputs(captured.output_buffers)
     
     def _update_lru(self, shape_key: Tuple[int, ...]) -> None:
         """Move shape_key to end of LRU list (most recently used)."""
@@ -372,6 +385,7 @@ class GraphCache:
             count = len(self._cache)
             self._cache.clear()
             self._lru_order.clear()
+            self._failed_shapes.clear()
             logger.debug(f"Cleared {count} cached CUDA graphs")
             return count
     
