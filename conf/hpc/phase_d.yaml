@@ -1,0 +1,20 @@
+# Phase D Training Configuration (HPC Overrides)
+
+training:
+  num_epochs: 10
+  batch_size: 32
+  learning_rate: 3e-5
+  layerwise_lr_decay: 0.9
+  gradient_accumulation_steps: 2
+  mixed_precision: true
+  max_steps: null
+  resume_from: null
+  early_stopping:
+    enabled: true
+    patience: 2
+    min_delta: 0.0
+    metric: "f1_macro"
+
+scheduler:
+  name: "cosine"
+  num_warmup_steps: 500

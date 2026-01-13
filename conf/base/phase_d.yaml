@@ -43,6 +43,11 @@ training:
   layerwise_lr_decay: 0.95
   gradient_accumulation_steps: 1
   mixed_precision: true
+  early_stopping:
+    enabled: false
+    patience: 2
+    min_delta: 0.0
+    metric: "f1_macro"
 
   # For testing/debugging
   max_steps: null  # null means run full epochs
