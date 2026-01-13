@@ -9,6 +9,7 @@ from typing import Dict, Optional
 from .attention_analysis import load_svs_result, summarize_head_classification
 from .visualizations import (
     plot_comparison_bars,
+    plot_confusion_matrix,
     plot_loss_curve,
     plot_task_bars,
 )
@@ -46,6 +47,31 @@ def _metric_table_rows(
     return "\n".join(rows) if rows else "<tr><td colspan='6'>No metrics found.</td></tr>"
 
 
+def _per_class_table(task: str, details: Dict[str, Dict[str, float]], *, title: str) -> str:
+    per_class = details.get("per_class", {})
+    if not per_class:
+        return f"<p>No per-class stats for {title} ({task}).</p>"
+    rows = []
+    for cls, stats in per_class.items():
+        rows.append(
+            "<tr>"
+            f"<td>{cls}</td>"
+            f"<td>{stats.get('precision', 0.0):.4f}</td>"
+            f"<td>{stats.get('recall', 0.0):.4f}</td>"
+            f"<td>{stats.get('f1', 0.0):.4f}</td>"
+            f"<td>{stats.get('support', 0)}</td>"
+            "</tr>"
+        )
+    return (
+        f"<h3>{title}: {task}</h3>"
+        "<table>"
+        "<thead><tr><th>Class</th><th>Precision</th><th>Recall</th><th>F1</th><th>Support</th></tr></thead>"
+        "<tbody>"
+        + "\n".join(rows)
+        + "</tbody></table>"
+    )
+
+
 def generate_phase_d_report(
     *,
     phase_d_dir: Path,
@@ -71,6 +97,8 @@ def generate_phase_d_report(
     metrics_for_table = (baseline_test or baseline_metrics, constrained_test or constrained_metrics)
 
     comparative = _safe_read_json(phase_d_dir / "phase_d_comparative_metrics.json") or {}
+    baseline_details = _safe_read_json(baseline_dir / "test_details.json") or {}
+    constrained_details = _safe_read_json(constrained_dir / "test_details.json") or {}
 
     baseline_loss_plot = plot_loss_curve(
         baseline_dir / "training_log.jsonl",
@@ -115,6 +143,37 @@ def generate_phase_d_report(
     constrained_chg = summarize_head_classification(chg_dir / "head_classification_constrained.json")
     baseline_svs = load_svs_result(chg_dir / "svs_baseline.json")
     constrained_svs = load_svs_result(chg_dir / "svs_constrained.json")
+    verification_summary = _safe_read_json(chg_dir / "verification_summary.json") or {}
+    svs_delta = verification_summary.get("svs_delta")
+    if svs_delta is None and baseline_svs and constrained_svs:
+        svs_delta = constrained_svs["svs"] - baseline_svs["svs"]
+
+    confusion_blocks = []
+    per_class_blocks = []
+    for task, details in baseline_details.items():
+        matrix = details.get("confusion_matrix")
+        if matrix is None:
+            continue
+        img_path = plot_confusion_matrix(
+            matrix,
+            assets_dir / f"confusion_baseline_{task}.png",
+            title=f"Baseline Confusion: {task}",
+        )
+        if img_path:
+            confusion_blocks.append(_img_block(img_path, f"Baseline Confusion ({task})"))
+        per_class_blocks.append(_per_class_table(task, details, title="Baseline Per-Class"))
+    for task, details in constrained_details.items():
+        matrix = details.get("confusion_matrix")
+        if matrix is None:
+            continue
+        img_path = plot_confusion_matrix(
+            matrix,
+            assets_dir / f"confusion_constrained_{task}.png",
+            title=f"Constrained Confusion: {task}",
+        )
+        if img_path:
+            confusion_blocks.append(_img_block(img_path, f"Constrained Confusion ({task})"))
+        per_class_blocks.append(_per_class_table(task, details, title="Constrained Per-Class"))
 
     report_path = output_dir / report_name
     dataset_note = str(dataset_path) if dataset_path else "n/a"
@@ -212,6 +271,23 @@ def generate_phase_d_report(
       </tr>
     </tbody>
   </table>
+  <p><strong>SVS Delta (constrained - baseline):</strong> {svs_delta if svs_delta is not None else "n/a"}</p>
+  <p><strong>Gate Count Delta (constrained - baseline):</strong>
+    {verification_summary.get("constrained", {}).get("facilitating_count", 0) - verification_summary.get("baseline", {}).get("facilitating_count", 0)}
+    facilitating,
+    {verification_summary.get("constrained", {}).get("irrelevant_count", 0) - verification_summary.get("baseline", {}).get("irrelevant_count", 0)}
+    irrelevant,
+    {verification_summary.get("constrained", {}).get("neutral_count", 0) - verification_summary.get("baseline", {}).get("neutral_count", 0)}
+    neutral
+  </p>
+
+  <h2>Confusion Matrices</h2>
+  <div class="grid">
+    {"".join(confusion_blocks) if confusion_blocks else "<p>No confusion matrices available.</p>"}
+  </div>
+
+  <h2>Per-Class Metrics</h2>
+  {''.join(per_class_blocks) if per_class_blocks else "<p>No per-class metrics available.</p>"}
 
   <h2>Raw Comparative Metrics</h2>
   <pre>{json.dumps(comparative, indent=2)}</pre>

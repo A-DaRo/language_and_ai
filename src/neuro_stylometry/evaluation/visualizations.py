@@ -130,3 +130,24 @@ def load_phase_d_metrics(phase_d_dir: Path) -> Tuple[Dict, Dict]:
     baseline_metrics = _safe_read_json(phase_d_dir / "baseline" / "phase_d_metrics.json") or {}
     constrained_metrics = _safe_read_json(phase_d_dir / "constrained" / "phase_d_metrics.json") or {}
     return baseline_metrics, constrained_metrics
+
+
+def plot_confusion_matrix(
+    matrix: List[List[int]],
+    output_path: Path,
+    *,
+    title: str,
+) -> Optional[Path]:
+    if not matrix:
+        return None
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.figure(figsize=(4, 4))
+    plt.imshow(matrix, cmap="Blues")
+    plt.title(title)
+    plt.xlabel("Predicted")
+    plt.ylabel("True")
+    plt.colorbar(fraction=0.046, pad=0.04)
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150)
+    plt.close()
+    return output_path

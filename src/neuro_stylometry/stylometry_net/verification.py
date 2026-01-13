@@ -94,6 +94,7 @@ def _compute_svs(
     loader: DataLoader,
     facilitating_heads,
     max_batches: int,
+    query_strategy: str,
 ) -> SVSResult:
     calculator = SVSCalculator(model.tokenizer.tokenizer)
     function_mass = 0.0
@@ -113,6 +114,7 @@ def _compute_svs(
             input_ids=input_ids,
             facilitating_heads=facilitating_heads,
             attention_mask=attention_mask,
+            query_strategy=query_strategy,
         )
         function_mass += result.function_mass
         content_mass += result.content_mass
@@ -140,10 +142,15 @@ def run_verification(
     facilitating_threshold: float,
     irrelevant_threshold: float,
     svs_max_batches: int,
+    svs_query_strategy: str,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     label_maps = load_label_maps(dataset_path, get_demographic_columns()).maps
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    svs_query_strategy = (svs_query_strategy or "mean_tokens").strip().lower()
+    if svs_query_strategy in {"default", "auto"}:
+        svs_query_strategy = "mean_tokens"
 
     def _verify_run(run_name: str, text_field: str, use_affine_guard: bool) -> Dict:
         run_dir = phase_d_dir / run_name
@@ -196,6 +203,7 @@ def run_verification(
             loader=loader,
             facilitating_heads=classifications["facilitating"],
             max_batches=svs_max_batches,
+            query_strategy=svs_query_strategy,
         )
         svs_path = output_dir / f"svs_{run_name}.json"
         with svs_path.open("w", encoding="utf-8") as handle:
@@ -212,7 +220,27 @@ def run_verification(
         return {
             "gates_path": str(gate_path),
             "svs_path": str(svs_path),
+            "facilitating_count": len(classifications["facilitating"]),
+            "irrelevant_count": len(classifications["irrelevant"]),
+            "neutral_count": len(classifications["neutral"]),
         }
 
-    _verify_run("baseline", "post", use_affine_guard=False)
-    _verify_run("constrained", "post_masked", use_affine_guard=True)
+    baseline_outputs = _verify_run("baseline", "post", use_affine_guard=False)
+    constrained_outputs = _verify_run("constrained", "post_masked", use_affine_guard=True)
+
+    summary = {
+        "baseline": baseline_outputs,
+        "constrained": constrained_outputs,
+    }
+    try:
+        with (output_dir / "svs_baseline.json").open("r", encoding="utf-8") as handle:
+            baseline_svs = json.load(handle).get("svs", 0.0)
+        with (output_dir / "svs_constrained.json").open("r", encoding="utf-8") as handle:
+            constrained_svs = json.load(handle).get("svs", 0.0)
+        summary["svs_delta"] = float(constrained_svs) - float(baseline_svs)
+    except Exception:
+        summary["svs_delta"] = None
+
+    summary_path = output_dir / "verification_summary.json"
+    with summary_path.open("w", encoding="utf-8") as handle:
+        json.dump(summary, handle, indent=2)

@@ -61,6 +61,7 @@ class SVSCalculator:
         facilitating_heads: Sequence[Tuple[int, int]],
         attention_mask: Optional[torch.Tensor] = None,
         query_position: int = 0,
+        query_strategy: str = "cls",
     ) -> SVSResult:
         if attention_mask is None:
             attention_mask = torch.ones_like(input_ids, dtype=torch.long)
@@ -76,6 +77,10 @@ class SVSCalculator:
 
         key_masks = attention_mask.bool().cpu()
 
+        strategy = query_strategy.lower().strip()
+        if strategy not in {"cls", "all_tokens", "mean_tokens"}:
+            logger.warning("Unknown SVS query strategy '%s'; defaulting to mean_tokens.", strategy)
+            strategy = "mean_tokens"
         for layer_idx, head_idx in facilitating_heads:
             if layer_idx >= len(attentions):
                 continue
@@ -88,21 +93,33 @@ class SVSCalculator:
                 key_mask = key_masks[batch_idx]
                 function_words = function_sets[batch_idx]
                 attn_row = head_attn[batch_idx]
-                if query_position >= attn_row.shape[0]:
+                if strategy == "all_tokens":
+                    query_indices = list(range(attn_row.shape[0]))
+                elif strategy == "mean_tokens":
+                    query_indices = list(range(attn_row.shape[0]))
+                else:
+                    if query_position >= attn_row.shape[0]:
+                        continue
+                    query_indices = [query_position]
+
+                if not query_indices:
                     continue
 
-                attn_weights = attn_row[query_position].detach().cpu()
-                for pos, token in enumerate(token_row):
-                    if not bool(key_mask[pos]):
-                        continue
-                    norm = self._normalize_token(token)
-                    if not norm:
-                        continue
-                    weight = float(attn_weights[pos].item())
-                    if norm in function_words:
-                        function_mass += weight
-                    else:
-                        content_mass += weight
+                for q_idx in query_indices:
+                    attn_weights = attn_row[q_idx].detach().cpu()
+                    for pos, token in enumerate(token_row):
+                        if not bool(key_mask[pos]):
+                            continue
+                        norm = self._normalize_token(token)
+                        if not norm:
+                            continue
+                        weight = float(attn_weights[pos].item())
+                        if strategy == "mean_tokens":
+                            weight = weight / float(len(query_indices))
+                        if norm in function_words:
+                            function_mass += weight
+                        else:
+                            content_mass += weight
 
         svs = function_mass / content_mass if content_mass > 0 else 0.0
         return SVSResult(svs=svs, function_mass=function_mass, content_mass=content_mass)

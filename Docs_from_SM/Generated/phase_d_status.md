@@ -3,13 +3,13 @@
 **Document Type:** Status + Gap Analysis
 **Scope:** Phase D (Neural Stylometry)
 **Context:** Phase A artifacts available under `artifacts/phase_a/`
-**Last Updated:** 2026-01-12 (Updated with evaluation + CHG/SVS improvements)  
+**Last Updated:** 2026-01-12 (Updated with evaluation + CHG/SVS improvements + HPC config)  
 
 ---
 
 ## 1. Executive Summary
 
-Phase D is now fully implemented for Track A (training pipeline) with configuration-driven architecture. The core model wrapper, Affine Guard injection, tokenizer alignment, dataset loading, baseline vs constrained training loop, checkpointing, metrics reporting, and CHG/SVS verification entry points are in place. The pipeline now uses YAML-based configuration with mode-specific overrides (laptop/HPC), providing a clean separation between configuration and execution. Evaluation/reporting is now implemented (report + plots), and CHG/SVS have been upgraded for rigor (head gating + POS-aware SVS). Remaining work is primarily in training optimization, full evaluation depth, and expanded tests.
+Phase D is now fully implemented for Track A (training pipeline) with configuration-driven architecture. The core model wrapper, Affine Guard injection, tokenizer alignment, dataset loading, baseline vs constrained training loop, checkpointing, metrics reporting, and CHG/SVS verification entry points are in place. The pipeline now uses YAML-based configuration with mode-specific overrides (laptop/HPC), providing a clean separation between configuration and execution. Evaluation/reporting is now implemented (report + plots + per-class tables + confusion matrices), and CHG/SVS have been upgraded for rigor (head gating + POS-aware SVS + query aggregation). Remaining work is primarily in expanded tests and minor evaluation polish.
 
 ---
 
@@ -185,27 +185,19 @@ python -m neuro_stylometry verify \
 | Training loop | ✅ | Baseline + constrained, logs, checkpoints |
 | Metrics | ✅ | Per-task accuracy and macro‑F1 |
 | CHG verifier | ✅ | Head gating via attention masks |
-| SVS | ✅ | POS‑aware (spaCy) + lexical fallback |
+| SVS | ✅ | POS‑aware (spaCy) + lexical fallback + query aggregation |
 | CLI wiring | ✅ **UPDATED** | **Config-driven run-phase-d + verify** |
 | Evaluation/reporting | ✅ **NEW** | **Plots + HTML report + report CLI** |
+| HPC config | ✅ **NEW** | **conf/hpc/phase_d.yaml** |
 
 ### 3.2 Known Limitations / Improvements
 
-1. **HPC configuration not yet finalized**
-   - Laptop config exists and tested, HPC config needs tuning.
-   - Improvement: add `conf/hpc/phase_d.yaml` with appropriate batch sizes and precision settings.
+1. **Test set evaluation could be deeper**
+   - Confusion matrices + per-class tables exist.
+   - Improvement: add per-attribute breakdowns and calibration curves.
 
-2. **SVS still uses a simplified attention query**
-   - Uses CLS attention as the query position.
-   - Improvement: evaluate alternative query positions or aggregate across tokens.
-
-3. **Test set evaluation present but basic**
-   - Pipeline evaluates on test set and reports metrics.
-   - Improvement: add richer analysis (confusion matrices, per-attribute breakdowns).
-
-4. **Training utilities are minimal**
-   - No scheduler/warmup, no AMP, no gradient accumulation.
-   - Improvement: wire precision management + scheduler in training.
+2. **Report coverage could be expanded**
+   - Per-class tables + confusion matrices exist, but no per-attribute breakdowns.
 
 ---
 
@@ -220,6 +212,7 @@ python -m neuro_stylometry verify \
 
 **Delivered artifacts:**
 - Baseline vs constrained plots (learning curves, accuracy bars)
+- Confusion matrices and per-class tables
 - Report HTML under `artifacts/reports/phase_d_report.html`
 - Aggregated `phase_d_metrics.json` at `artifacts/phase_d/`
 
@@ -228,18 +221,17 @@ python -m neuro_stylometry verify \
 ### 4.2 Verification Enhancements (In Progress)
 
 **Needed improvements:**
-- SVS: expand beyond CLS query (aggregate across tokens or tasks).
-- Comparative summary output (delta SVS, delta accuracy).
+- Comparative summary output (delta SVS, delta accuracy) beyond the current JSON summary.
 
 ---
 
 ### 4.3 Training Enhancements
 
 **Recommended upgrades:**
-- Mixed precision + GradScaler
-- Learning‑rate scheduler (linear warmup + cosine decay)
-- Gradient accumulation
-- Checkpoint resumption
+- Mixed precision + GradScaler ✅
+- Learning‑rate scheduler (linear warmup + cosine decay) ✅
+- Gradient accumulation ✅
+- Checkpoint resumption ✅
 
 ---
 
@@ -255,10 +247,8 @@ python -m neuro_stylometry verify \
 
 ## 5. Suggested Next Implementation Order
 
-1. **SVS robustness (query aggregation + reporting deltas)**
-2. **Training quality upgrades (precision, scheduler)**
-3. **Test coverage**
-4. **Config schema finalization (last per instruction)**
+1. **Test coverage**
+2. **Config schema finalization (last per instruction)**
 
 ---
 
@@ -267,18 +257,18 @@ python -m neuro_stylometry verify \
 **Train baseline + constrained (laptop mode):**
 ```bash
 python -m neuro_stylometry run-phase-d \
-  --dataset artifacts/data/output/clean_dataset.arrow \
+  --dataset artifacts/phase_a/clean_dataset.arrow \
   --output-dir artifacts/phase_d \
-  --artifacts-dir artifacts/data/output \
+  --artifacts-dir artifacts/phase_a \
   --mode laptop
 ```
 
 **Train with custom experiment config:**
 ```bash
 python -m neuro_stylometry run-phase-d \
-  --dataset artifacts/data/output/clean_dataset.arrow \
+  --dataset artifacts/phase_a/clean_dataset.arrow \
   --output-dir artifacts/phase_d \
-  --artifacts-dir artifacts/data/output \
+  --artifacts-dir artifacts/phase_a \
   --mode laptop \
   --config experiments/my_config.yaml
 ```
@@ -291,7 +281,7 @@ python -m neuro_stylometry run-phase-d \
 **Verify CHG + SVS:**
 ```bash
 python -m neuro_stylometry verify \
-  --dataset artifacts/data/output/clean_dataset.arrow \
+  --dataset artifacts/phase_a/clean_dataset.arrow \
   --phase-d-dir artifacts/phase_d \
   --output-dir artifacts/phase_d/chg
 ```
@@ -301,7 +291,7 @@ python -m neuro_stylometry verify \
 python -m neuro_stylometry report-phase-d \
   --phase-d-dir artifacts/phase_d \
   --output-dir artifacts/reports \
-  --dataset artifacts/data/output/clean_dataset.arrow
+  --dataset artifacts/phase_a/clean_dataset.arrow
 ```
 
 ---
@@ -319,10 +309,10 @@ python -m neuro_stylometry report-phase-d \
 - Reduced epochs (2 instead of 3)
 - Smaller batch size (4 instead of 8)
 
-**HPC Configuration:** `conf/hpc/phase_d.yaml` (TODO)
-- Will include larger batch sizes
+**HPC Configuration:** `conf/hpc/phase_d.yaml` (DONE)
+- Larger batch sizes + accumulation
 - Mixed precision training
-- Multi-GPU support
+- Cosine scheduler + warmup
 
 **Creating Custom Experiment Configs:**
 ```yaml
@@ -342,3 +332,50 @@ data:
 ---
 
 *End of report.*
+
+---
+
+## 8. Phase D HPC Run Order (Recommended)
+
+**Prerequisites:**
+- `artifacts/phase_a/clean_dataset.arrow`
+- `artifacts/phase_a/projection_matrix.pt`
+- `artifacts/phase_a/pollution_logs.arrow`
+- `conf/base/phase_d.yaml`
+- `conf/hpc/phase_d.yaml`
+
+**Order of execution:**
+1. Run Phase A and validate artifacts:
+   ```bash
+   python -m neuro_stylometry run-phase-a \
+     --dataset artifacts/data/sobr.arrow \
+     --output-dir artifacts/phase_a \
+     --mode hpc
+
+   python -m neuro_stylometry validate-handover \
+     --artifacts-dir artifacts/phase_a
+   ```
+2. Run Phase D using the HPC config:
+   ```bash
+   python -m neuro_stylometry run-phase-d \
+     --dataset artifacts/phase_a/clean_dataset.arrow \
+     --output-dir artifacts/phase_d \
+     --artifacts-dir artifacts/phase_a \
+     --mode hpc
+   ```
+3. Run verification (CHG + SVS):
+   ```bash
+   python -m neuro_stylometry verify \
+     --dataset artifacts/phase_a/clean_dataset.arrow \
+     --phase-d-dir artifacts/phase_d \
+     --artifacts-dir artifacts/phase_a \
+     --output-dir artifacts/phase_d/chg \
+     --svs-query-strategy mean_tokens
+   ```
+4. Generate report:
+   ```bash
+   python -m neuro_stylometry report-phase-d \
+     --phase-d-dir artifacts/phase_d \
+     --output-dir artifacts/reports \
+     --dataset artifacts/phase_a/clean_dataset.arrow
+   ```

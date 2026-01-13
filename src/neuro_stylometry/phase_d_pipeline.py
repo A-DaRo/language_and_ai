@@ -156,6 +156,16 @@ def run_phase_d_training(
         with open(test_metrics_path, 'w') as f:
             json.dump(convert_to_python_types(test_metrics), f, indent=2)
 
+        test_details = baseline_trainer._evaluate_detailed(
+            model=model,
+            head=head,
+            loader=test_loader,
+            num_classes=label_maps.num_classes(),
+        )
+        test_details_path = baseline_dir / "test_details.json"
+        with open(test_details_path, 'w') as f:
+            json.dump(convert_to_python_types(test_details), f, indent=2)
+
     # ========== Train Constrained Model ==========
     logger.info("=" * 80)
     logger.info("Training CONSTRAINED model (masked text + Affine Guard)")
@@ -240,6 +250,16 @@ def run_phase_d_training(
         test_metrics_path_c = constrained_dir / "test_metrics.json"
         with open(test_metrics_path_c, 'w') as f:
             json.dump(convert_to_python_types(test_metrics_c), f, indent=2)
+
+        test_details_c = constrained_trainer._evaluate_detailed(
+            model=model_c,
+            head=head_c,
+            loader=test_loader_c,
+            num_classes=label_maps.num_classes(),
+        )
+        test_details_path_c = constrained_dir / "test_details.json"
+        with open(test_details_path_c, 'w') as f:
+            json.dump(convert_to_python_types(test_details_c), f, indent=2)
 
     # ========== Save Comparative Summary ==========
     _save_comparative_summary(results, output_dir, label_maps.num_classes())

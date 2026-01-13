@@ -485,6 +485,13 @@ def run_phase_d(
     show_default=True,
     help="Max batches for SVS calculation",
 )
+@click.option(
+    "--svs-query-strategy",
+    type=click.Choice(["cls", "all_tokens", "mean_tokens"]),
+    default="mean_tokens",
+    show_default=True,
+    help="Query aggregation strategy for SVS",
+)
 def verify(
     dataset: Path,
     phase_d_dir: Path,
@@ -500,6 +507,7 @@ def verify(
     facilitating_threshold: float,
     irrelevant_threshold: float,
     svs_max_batches: int,
+    svs_query_strategy: str,
 ):
     """Run CHG + SVS verification for baseline vs constrained models."""
     from .stylometry_net.verification import run_verification
@@ -519,6 +527,7 @@ def verify(
         facilitating_threshold=facilitating_threshold,
         irrelevant_threshold=irrelevant_threshold,
         svs_max_batches=svs_max_batches,
+        svs_query_strategy=svs_query_strategy,
     )
     click.echo(f"Verification complete. Outputs in: {output_dir}")
 
