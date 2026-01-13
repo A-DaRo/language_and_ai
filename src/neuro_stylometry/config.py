@@ -10,6 +10,7 @@ This module provides:
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Literal, Optional, Union
@@ -461,6 +462,18 @@ def load_pipeline_config(
 
     mode_path = repo_root / "conf" / mode / base_filename
 
+    if not base_path.exists():
+        raise FileNotFoundError(
+            f"Base config not found: {base_path}. "
+            "Set NEURO_STYLOMETRY_CONFIG_ROOT or run from the repo root."
+        )
+
+    if not mode_path.exists():
+        raise FileNotFoundError(
+            f"Mode config not found: {mode_path}. "
+            "Set NEURO_STYLOMETRY_CONFIG_ROOT or run from the repo root."
+        )
+
     base_cfg = OmegaConf.load(base_path)
     mode_cfg = OmegaConf.load(mode_path)
 
@@ -482,23 +495,42 @@ def load_pipeline_config(
     return merged
 
 
-def _find_config_root(config_name: str) -> Path:
-    repo_root = Path(__file__).resolve().parents[2]
-    candidate = repo_root / "conf" / "base" / config_name
+def _resolve_config_root_from_hint(hint: Path, config_name: str) -> Optional[Path]:
+    candidate = hint / "conf" / "base" / config_name
     if candidate.exists():
-        return repo_root
+        return hint
+
+    candidate = hint / "base" / config_name
+    if candidate.exists():
+        return hint.parent if hint.name == "conf" else hint
+
+    if hint.name == "base":
+        candidate = hint / config_name
+        if candidate.exists():
+            return hint.parent.parent
+
+    return None
+
+
+def _find_config_root(config_name: str) -> Path:
+    env_hint = os.getenv("NEURO_STYLOMETRY_CONFIG_ROOT") or os.getenv("NEURO_STYLOMETRY_ROOT")
+    if env_hint:
+        resolved = _resolve_config_root_from_hint(Path(env_hint).expanduser().resolve(), config_name)
+        if resolved is not None:
+            return resolved
+
+    for parent in Path(__file__).resolve().parents:
+        resolved = _resolve_config_root_from_hint(parent, config_name)
+        if resolved is not None:
+            return resolved
 
     cwd = Path.cwd()
-    candidate = cwd / "conf" / "base" / config_name
-    if candidate.exists():
-        return cwd
+    for parent in (cwd, *cwd.parents):
+        resolved = _resolve_config_root_from_hint(parent, config_name)
+        if resolved is not None:
+            return resolved
 
-    for parent in cwd.parents:
-        candidate = parent / "conf" / "base" / config_name
-        if candidate.exists():
-            return parent
-
-    return repo_root
+    return cwd
 
 
 def find_config_root(config_name: str) -> Path:
