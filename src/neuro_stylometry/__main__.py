@@ -355,12 +355,20 @@ def validate_handover(artifacts_dir: Path):
     default=None,
     help="Optional experiment config to override defaults",
 )
+@click.option(
+    "--data-change",
+    type=click.Choice(["yes", "no"]),
+    default="no",
+    show_default=True,
+    help="Rewrite dataset split column for small test runs",
+)
 def run_phase_d(
     dataset: Path,
     output_dir: Path,
     artifacts_dir: Path,
     mode: str,
     config_path: Path | None,
+    data_change: str,
 ):
     """Train Phase D baseline and constrained models."""
     from .phase_d_pipeline import run_phase_d_training
@@ -372,6 +380,7 @@ def run_phase_d(
             artifacts_dir=artifacts_dir,
             mode=mode,
             config_path=config_path,
+            data_change=(data_change == "yes"),
         )
 
         click.echo("\n" + "=" * 80)

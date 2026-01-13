@@ -36,6 +36,7 @@ def run_phase_d_training(
     artifacts_dir: Path,
     mode: str = "laptop",
     config_path: Path | None = None,
+    data_change: bool = False,
 ) -> Dict[str, Any]:
     """
     Run Phase D training: baseline + constrained models.
@@ -50,6 +51,10 @@ def run_phase_d_training(
     Returns:
         Dict with results for baseline and constrained models
     """
+    # Optionally enforce split column for small dataset runs
+    if data_change:
+        _ensure_split_column(Path(dataset_path))
+
     # Load configuration
     config = load_phase_d_config(mode=mode, experiment_config_path=config_path)
 
@@ -79,6 +84,12 @@ def run_phase_d_training(
         num_epochs=config['training']['num_epochs'],
         max_steps=config['training'].get('max_steps'),
         learning_rate=config['training']['learning_rate'],
+        layerwise_lr_decay=config['training'].get('layerwise_lr_decay', 1.0),
+        gradient_accumulation_steps=config['training'].get('gradient_accumulation_steps', 1),
+        mixed_precision=config['training'].get('mixed_precision', False),
+        resume_from=Path(config['training']['resume_from']) if config['training'].get('resume_from') else None,
+        scheduler_name=config.get('scheduler', {}).get('name', 'linear'),
+        num_warmup_steps=config.get('scheduler', {}).get('num_warmup_steps', 0),
         save_every_steps=config['training'].get('save_every_steps'),
         save_every_epochs=config['training'].get('save_every_epochs'),
         split_ratios=config['data'].get('split_ratios'),
@@ -158,6 +169,12 @@ def run_phase_d_training(
         num_epochs=config['training']['num_epochs'],
         max_steps=config['training'].get('max_steps'),
         learning_rate=config['training']['learning_rate'],
+        layerwise_lr_decay=config['training'].get('layerwise_lr_decay', 1.0),
+        gradient_accumulation_steps=config['training'].get('gradient_accumulation_steps', 1),
+        mixed_precision=config['training'].get('mixed_precision', False),
+        resume_from=Path(config['training']['resume_from']) if config['training'].get('resume_from') else None,
+        scheduler_name=config.get('scheduler', {}).get('name', 'linear'),
+        num_warmup_steps=config.get('scheduler', {}).get('num_warmup_steps', 0),
         save_every_steps=config['training'].get('save_every_steps'),
         save_every_epochs=config['training'].get('save_every_epochs'),
         split_ratios=config['data'].get('split_ratios'),
@@ -242,6 +259,25 @@ def run_phase_d_training(
     logger.info("=" * 80)
 
     return results
+
+
+def _ensure_split_column(dataset_path: Path) -> None:
+    import pyarrow as pa
+    import pyarrow.feather as feather
+
+    table = feather.read_table(dataset_path, memory_map=True)
+    num_rows = table.num_rows
+    if num_rows < 3:
+        raise ValueError(
+            f"Dataset must have at least 3 rows to create train/val/test splits; got {num_rows}"
+        )
+    splits = ["train", "val", "test"]
+    split_col = pa.array([splits[i % 3] for i in range(num_rows)])
+    if "split" in table.column_names:
+        table = table.drop(["split"])
+    table = table.append_column("split", split_col)
+    feather.write_feather(table, dataset_path)
+    logger.info("Wrote round-robin split column to %s", dataset_path)
 
 
 def _save_comparative_summary(

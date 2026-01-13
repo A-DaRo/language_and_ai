@@ -40,6 +40,9 @@ training:
   num_epochs: 3
   batch_size: 8
   learning_rate: 2e-5
+  layerwise_lr_decay: 0.95
+  gradient_accumulation_steps: 1
+  mixed_precision: true
 
   # For testing/debugging
   max_steps: null  # null means run full epochs
@@ -47,9 +50,15 @@ training:
   # Checkpointing
   save_every_steps: null
   save_every_epochs: 1  # Save after each epoch
+  resume_from: null
 
   # Device
   device: "auto"  # auto, cuda, cpu
+
+# Scheduler
+scheduler:
+  name: "linear" # linear or cosine
+  num_warmup_steps: 0
 
 # Evaluation
 evaluation:

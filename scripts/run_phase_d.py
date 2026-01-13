@@ -44,6 +44,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional experiment config to override defaults",
     )
+    parser.add_argument(
+        "--data-change",
+        choices=("yes", "no"),
+        default="no",
+        help="Rewrite dataset split column for small test runs",
+    )
     return parser.parse_args()
 
 
@@ -55,6 +61,7 @@ def main() -> None:
         artifacts_dir=args.artifacts_dir,
         mode=args.mode,
         config_path=args.config,
+        data_change=(args.data_change == "yes"),
     )
 
 

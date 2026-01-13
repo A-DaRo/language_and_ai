@@ -16,6 +16,8 @@ def save_checkpoint(
     model_state: Dict[str, Any],
     head_state: Dict[str, Any],
     optimizer_state: Dict[str, Any],
+    scheduler_state: Dict[str, Any] | None = None,
+    scaler_state: Dict[str, Any] | None = None,
     metadata: Dict[str, Any],
 ) -> None:
     path = Path(path)
@@ -26,11 +28,18 @@ def save_checkpoint(
             "head_state": head_state,
             "optimizer_state": optimizer_state,
             "metadata": metadata,
+            "scheduler_state": scheduler_state,
+            "scaler_state": scaler_state,
             "torch_rng": torch.get_rng_state(),
             "cuda_rng": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
         },
         path,
     )
+
+
+def load_checkpoint(path: Path) -> Dict[str, Any]:
+    path = Path(path)
+    return torch.load(path, map_location="cpu")
 
 
 def save_metadata(path: Path, metadata: Dict[str, Any]) -> None:
