@@ -8,10 +8,17 @@ import numpy as np
 from pathlib import Path
 from typing import Any, Dict
 
-from .config import load_phase_d_config
+from .config import find_config_root, load_phase_d_config
 from .training.trainer import PhaseDTrainer, PhaseDTrainConfig
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_phase_d_path(path: Path | str, *, config_root: Path) -> Path:
+    candidate = Path(path)
+    if candidate.is_absolute():
+        return candidate
+    return config_root / candidate
 
 
 def convert_to_python_types(obj):
@@ -51,6 +58,13 @@ def run_phase_d_training(
     Returns:
         Dict with results for baseline and constrained models
     """
+    config_root = find_config_root("phase_d.yaml")
+    dataset_path = _resolve_phase_d_path(dataset_path, config_root=config_root)
+    output_dir = _resolve_phase_d_path(output_dir, config_root=config_root)
+    artifacts_dir = _resolve_phase_d_path(artifacts_dir, config_root=config_root)
+    if config_path is not None:
+        config_path = _resolve_phase_d_path(config_path, config_root=config_root)
+
     # Optionally enforce split column for small dataset runs
     if data_change:
         _ensure_split_column(Path(dataset_path))
@@ -65,6 +79,17 @@ def run_phase_d_training(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    taxonomy_path = _resolve_phase_d_path(
+        config['model']['taxonomy_path'],
+        config_root=config_root,
+    )
+    resume_from = config['training'].get('resume_from')
+    resume_from = (
+        _resolve_phase_d_path(resume_from, config_root=config_root)
+        if resume_from
+        else None
+    )
+
     results = {}
 
     # ========== Train Baseline Model ==========
@@ -78,7 +103,7 @@ def run_phase_d_training(
         artifacts_dir=Path(config['data']['artifacts_dir']),
         output_dir=baseline_dir,
         model_name=config['model']['name'],
-        taxonomy_path=Path(config['model']['taxonomy_path']),
+        taxonomy_path=taxonomy_path,
         max_length=config['model']['max_length'],
         batch_size=config['training']['batch_size'],
         num_epochs=config['training']['num_epochs'],
@@ -87,7 +112,7 @@ def run_phase_d_training(
         layerwise_lr_decay=config['training'].get('layerwise_lr_decay', 1.0),
         gradient_accumulation_steps=config['training'].get('gradient_accumulation_steps', 1),
         mixed_precision=config['training'].get('mixed_precision', False),
-        resume_from=Path(config['training']['resume_from']) if config['training'].get('resume_from') else None,
+        resume_from=resume_from,
         scheduler_name=config.get('scheduler', {}).get('name', 'linear'),
         num_warmup_steps=config.get('scheduler', {}).get('num_warmup_steps', 0),
         early_stopping_enabled=config['training'].get('early_stopping', {}).get('enabled', False),
@@ -177,7 +202,7 @@ def run_phase_d_training(
         artifacts_dir=Path(config['data']['artifacts_dir']),
         output_dir=constrained_dir,
         model_name=config['model']['name'],
-        taxonomy_path=Path(config['model']['taxonomy_path']),
+        taxonomy_path=taxonomy_path,
         max_length=config['model']['max_length'],
         batch_size=config['training']['batch_size'],
         num_epochs=config['training']['num_epochs'],
@@ -186,7 +211,7 @@ def run_phase_d_training(
         layerwise_lr_decay=config['training'].get('layerwise_lr_decay', 1.0),
         gradient_accumulation_steps=config['training'].get('gradient_accumulation_steps', 1),
         mixed_precision=config['training'].get('mixed_precision', False),
-        resume_from=Path(config['training']['resume_from']) if config['training'].get('resume_from') else None,
+        resume_from=resume_from,
         scheduler_name=config.get('scheduler', {}).get('name', 'linear'),
         num_warmup_steps=config.get('scheduler', {}).get('num_warmup_steps', 0),
         early_stopping_enabled=config['training'].get('early_stopping', {}).get('enabled', False),
@@ -267,7 +292,11 @@ def run_phase_d_training(
     # ========== Optional Report Generation ==========
     if config.get("evaluation", {}).get("write_report", True):
         reports_dir = config.get("output", {}).get("reports_dir")
-        reports_dir = Path(reports_dir) if reports_dir else output_dir / "reports"
+        reports_dir = (
+            _resolve_phase_d_path(reports_dir, config_root=config_root)
+            if reports_dir
+            else output_dir / "reports"
+        )
         try:
             from .evaluation.comparative_report import generate_phase_d_report
 
