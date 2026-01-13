@@ -1,11 +1,18 @@
-"""Optimizer and scheduler utilities for Phase D training."""
+"""Optimizer and scheduler utilities for Phase D training.
+
+Includes support for fused AdamW optimizer which collapses the parameter
+update loop into a single CUDA kernel, eliminating Python iteration overhead.
+"""
 
 from __future__ import annotations
 
+import logging
 from typing import Iterable, List, Tuple
 
 import torch
 from transformers import get_cosine_schedule_with_warmup, get_linear_schedule_with_warmup
+
+logger = logging.getLogger(__name__)
 
 
 def build_param_groups(
@@ -52,13 +59,57 @@ def build_param_groups(
     return param_groups
 
 
+def _supports_fused_adamw() -> bool:
+    """Check if fused AdamW is available (PyTorch 2.0+ with CUDA)."""
+    if not torch.cuda.is_available():
+        return False
+    # fused=True requires CUDA and PyTorch 2.0+
+    try:
+        # Check PyTorch version supports fused
+        import inspect
+        sig = inspect.signature(torch.optim.AdamW.__init__)
+        return "fused" in sig.parameters
+    except Exception:
+        return False
+
+
 def build_optimizer(
     *,
     param_groups: Iterable[dict],
     base_lr: float,
     weight_decay: float = 0.01,
+    use_fused: bool = True,
 ) -> torch.optim.Optimizer:
-    return torch.optim.AdamW(param_groups, lr=base_lr, weight_decay=weight_decay)
+    """
+    Build AdamW optimizer with optional fused kernel.
+    
+    Fused AdamW collapses the parameter update loop into a single CUDA
+    kernel launch, eliminating Python iteration overhead over model
+    parameters. This can provide significant speedups on large models.
+    
+    Args:
+        param_groups: Parameter groups with learning rates.
+        base_lr: Base learning rate.
+        weight_decay: L2 regularization weight.
+        use_fused: Whether to use fused kernel (requires CUDA + PyTorch 2.0+).
+        
+    Returns:
+        Configured AdamW optimizer.
+    """
+    fused = use_fused and _supports_fused_adamw()
+    
+    if fused:
+        logger.info("Using fused AdamW optimizer (single CUDA kernel)")
+    else:
+        if use_fused:
+            logger.debug("Fused AdamW not available, using standard optimizer")
+    
+    return torch.optim.AdamW(
+        param_groups,
+        lr=base_lr,
+        weight_decay=weight_decay,
+        fused=fused,
+    )
 
 
 def build_scheduler(

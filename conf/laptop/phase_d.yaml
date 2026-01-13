@@ -1,27 +1,58 @@
 # Phase D Training Configuration (Laptop Overrides)
+# ==============================================================================
+# Conservative settings for development/testing on consumer hardware
+# Prioritizes stability over throughput
+# ==============================================================================
 
-# Laptop-specific overrides for smaller-scale training
-
+# Laptop-specific training overrides
 training:
   num_epochs: 2  # Shorter for testing
-  batch_size: 4  # Smaller batch for laptop
+  batch_size: 4  # Smaller batch for limited VRAM
   max_steps: null  # Run full epochs even on laptop
-  precision: "fp32"
+  precision: "fp32"  # FP32 for stability on consumer GPUs
+  gradient_accumulation_steps: 2  # Effective batch = 8
 
+# Laptop-specific optimization overrides
+optimization:
+  # AOT mode still enabled (benefits all hardware)
+  use_aot_mode: true
+  
+  # Disable torch.compile on laptop (compilation overhead > benefit for small runs)
+  use_torch_compile: false
+  
+  # Fused optimizer still beneficial
+  use_fused_optimizer: true
+  
+  # Device prefetch still beneficial
+  use_device_prefetch: true
+  
+  # Same quantization step
+  quantize_step: 16
+  
+  # Lower token budget for smaller batches
+  token_budget: 8192  # ~16 samples @ 512 tokens
+
+# Laptop-specific execution overrides
 execution:
+  autotuning:
+    enabled: false  # Manual tuning for predictability
+    
   dynamic_batching:
-    enabled: false
-    max_batch_size: 8
+    enabled: true
+    max_batch_size: 32  # Reasonable cap for laptop VRAM
     min_batch_size: 1
     drop_last: false
     shuffle: true
     seed: 42
-    length_column: "text_length"
+    length_column: "token_count"
     length_scale: 1.0
+    
   telemetry:
-    enabled: false
+    enabled: false  # Disable for speed
+    stride: 10  # More frequent sampling for debugging
+    
   data_loader:
-    num_workers: 0
+    num_workers: 0  # Single-threaded for stability
     pin_memory: true
-    persistent_workers: false
+    persistent_workers: false  # N/A with 0 workers
     prefetch_factor: 2
