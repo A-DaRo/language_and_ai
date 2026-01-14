@@ -290,8 +290,12 @@ class GraphCache:
             if name in captured.input_buffers:
                 captured.input_buffers[name].copy_(tensor)
         
-        # Replay the graph
-        captured.graph.replay()
+        # Replay the graph on the capture stream to keep RNG ops consistent.
+        if captured.capture_stream is not None:
+            with torch.cuda.stream(captured.capture_stream):
+                captured.graph.replay()
+        else:
+            captured.graph.replay()
         
         return self._format_outputs(captured.output_buffers)
     
