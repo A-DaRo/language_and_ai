@@ -1,4 +1,15 @@
 # Phase D Verification Configuration (HPC Overrides)
 
-verify: {}
+verify:
+  svs:
+    use_pos: true
+    spacy_model: "en_core_web_trf"
+    spacy_use_gpu: true
+    spacy_gpu_id: 0
+    spacy_batch_size: 16
+    spacy_n_process: 1
+    spacy_disable:
+      - "ner"
+      - "parser"
+
 model: {}

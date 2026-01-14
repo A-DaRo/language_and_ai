@@ -16,3 +16,12 @@ verify:
   svs:
     max_batches: 20
     query_strategy: "mean_tokens"
+    use_pos: true
+    spacy_model: "en_core_web_sm"
+    spacy_use_gpu: false
+    spacy_gpu_id: 0
+    spacy_batch_size: 32
+    spacy_n_process: 2
+    spacy_disable:
+      - "ner"
+      - "parser"

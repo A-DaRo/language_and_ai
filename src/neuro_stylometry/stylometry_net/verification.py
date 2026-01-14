@@ -169,13 +169,42 @@ def _compute_svs(
     facilitating_heads,
     max_batches: int,
     query_strategy: str,
+    svs_use_pos: bool,
+    svs_spacy_model: str,
+    svs_spacy_use_gpu: bool,
+    svs_spacy_gpu_id: int | None,
+    svs_spacy_batch_size: int,
+    svs_spacy_n_process: int,
+    svs_spacy_disable: list[str],
 ) -> SVSResult:
-    calculator = SVSCalculator(tokenizer)
+    calculator = SVSCalculator(
+        tokenizer,
+        use_pos=svs_use_pos,
+        spacy_model=svs_spacy_model,
+        spacy_use_gpu=svs_spacy_use_gpu,
+        spacy_gpu_id=svs_spacy_gpu_id,
+        spacy_batch_size=svs_spacy_batch_size,
+        spacy_n_process=svs_spacy_n_process,
+        spacy_disable=svs_spacy_disable,
+    )
     function_mass = 0.0
     content_mass = 0.0
     batches_seen = 0
 
-    for batch in tqdm(loader, desc="SVS batches", unit="batch"):
+    total = None
+    if max_batches:
+        total = max_batches
+        try:
+            total = min(int(total), len(loader))
+        except TypeError:
+            pass
+    else:
+        try:
+            total = len(loader)
+        except TypeError:
+            total = None
+
+    for batch in tqdm(loader, desc="SVS batches", unit="batch", total=total):
         input_ids = batch["input_ids"].to(next(model.parameters()).device)
         attention_mask = batch["attention_mask"].to(next(model.parameters()).device)
         outputs = model(
@@ -289,6 +318,13 @@ def run_verification(
     irrelevant_threshold: float,
     svs_max_batches: int,
     svs_query_strategy: str,
+    svs_use_pos: bool,
+    svs_spacy_model: str,
+    svs_spacy_use_gpu: bool,
+    svs_spacy_gpu_id: int | None,
+    svs_spacy_batch_size: int,
+    svs_spacy_n_process: int,
+    svs_spacy_disable: list[str],
     use_only_labels: Optional[tuple[str, ...]] = None,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -396,6 +432,13 @@ def run_verification(
             facilitating_heads=classifications["facilitating"],
             max_batches=svs_max_batches,
             query_strategy=svs_query_strategy,
+            svs_use_pos=svs_use_pos,
+            svs_spacy_model=svs_spacy_model,
+            svs_spacy_use_gpu=svs_spacy_use_gpu,
+            svs_spacy_gpu_id=svs_spacy_gpu_id,
+            svs_spacy_batch_size=svs_spacy_batch_size,
+            svs_spacy_n_process=svs_spacy_n_process,
+            svs_spacy_disable=svs_spacy_disable,
         )
         svs_path = output_dir / f"svs_{run_name}.json"
         with svs_path.open("w", encoding="utf-8") as handle:

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import logging
-from typing import Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import torch
 from transformers import PreTrainedTokenizer
@@ -31,6 +31,8 @@ class SVSResult:
 class SVSCalculator:
     """Compute function-word vs content-word attention ratios."""
 
+    _NLP_CACHE: Dict[tuple, object] = {}
+
     def __init__(
         self,
         tokenizer: PreTrainedTokenizer,
@@ -39,6 +41,11 @@ class SVSCalculator:
         exclude_tokens: Optional[Iterable[str]] = None,
         use_pos: bool = True,
         spacy_model: str = "en_core_web_sm",
+        spacy_use_gpu: bool = False,
+        spacy_gpu_id: Optional[int] = 0,
+        spacy_batch_size: int = 32,
+        spacy_n_process: int = 1,
+        spacy_disable: Optional[Iterable[str]] = None,
     ) -> None:
         self.tokenizer = tokenizer
         self.function_words = set(function_words or DEFAULT_FUNCTION_WORDS)
@@ -46,10 +53,20 @@ class SVSCalculator:
             self.function_words -= set(exclude_tokens)
         self.use_pos = bool(use_pos)
         self.spacy_model = spacy_model
+        self.spacy_use_gpu = bool(spacy_use_gpu)
+        self.spacy_gpu_id = spacy_gpu_id
+        self.spacy_batch_size = int(spacy_batch_size)
+        self.spacy_n_process = int(spacy_n_process)
+        self.spacy_disable = list(spacy_disable) if spacy_disable else []
         self._nlp = None
 
         if self.use_pos:
-            self._nlp = self._load_spacy_model(spacy_model)
+            self._nlp = self._load_spacy_model(
+                spacy_model,
+                use_gpu=self.spacy_use_gpu,
+                gpu_id=self.spacy_gpu_id,
+                disable=self.spacy_disable,
+            )
             if self._nlp is None:
                 self.use_pos = False
 
@@ -66,9 +83,10 @@ class SVSCalculator:
         if attention_mask is None:
             attention_mask = torch.ones_like(input_ids, dtype=torch.long)
 
+        input_ids_cpu = input_ids.cpu()
         tokens = [
             self.tokenizer.convert_ids_to_tokens(row.tolist())
-            for row in input_ids.cpu()
+            for row in input_ids_cpu
         ]
         function_sets = self._build_function_sets(input_ids)
 
@@ -76,6 +94,11 @@ class SVSCalculator:
         content_mass = 0.0
 
         key_masks = attention_mask.bool().cpu()
+        function_mask, content_mask = self._build_token_masks(
+            tokens=tokens,
+            function_sets=function_sets,
+            key_masks=key_masks,
+        )
 
         strategy = query_strategy.lower().strip()
         if strategy not in {"cls", "all_tokens", "mean_tokens"}:
@@ -87,39 +110,18 @@ class SVSCalculator:
             layer_attn = attentions[layer_idx]  # [B, H, S, S]
             if head_idx >= layer_attn.shape[1]:
                 continue
-            head_attn = layer_attn[:, head_idx, :, :]  # [B, S, S]
-
-            for batch_idx, token_row in enumerate(tokens):
-                key_mask = key_masks[batch_idx]
-                function_words = function_sets[batch_idx]
-                attn_row = head_attn[batch_idx]
-                if strategy == "all_tokens":
-                    query_indices = list(range(attn_row.shape[0]))
-                elif strategy == "mean_tokens":
-                    query_indices = list(range(attn_row.shape[0]))
-                else:
-                    if query_position >= attn_row.shape[0]:
-                        continue
-                    query_indices = [query_position]
-
-                if not query_indices:
+            head_attn = layer_attn[:, head_idx, :, :].detach().cpu()  # [B, S, S]
+            if strategy == "all_tokens":
+                attn_weights = head_attn.sum(dim=1)
+            elif strategy == "mean_tokens":
+                attn_weights = head_attn.mean(dim=1)
+            else:
+                if query_position >= head_attn.shape[1]:
                     continue
+                attn_weights = head_attn[:, query_position, :]
 
-                for q_idx in query_indices:
-                    attn_weights = attn_row[q_idx].detach().cpu()
-                    for pos, token in enumerate(token_row):
-                        if not bool(key_mask[pos]):
-                            continue
-                        norm = self._normalize_token(token)
-                        if not norm:
-                            continue
-                        weight = float(attn_weights[pos].item())
-                        if strategy == "mean_tokens":
-                            weight = weight / float(len(query_indices))
-                        if norm in function_words:
-                            function_mass += weight
-                        else:
-                            content_mass += weight
+            function_mass += float((attn_weights * function_mask).sum().item())
+            content_mass += float((attn_weights * content_mask).sum().item())
 
         svs = function_mass / content_mass if content_mass > 0 else 0.0
         return SVSResult(svs=svs, function_mass=function_mass, content_mass=content_mass)
@@ -141,10 +143,19 @@ class SVSCalculator:
             return [set(self.function_words) for _ in decoded]
 
         function_sets: List[set[str]] = []
-        for text in decoded:
-            words = set(self.function_words)
-            try:
-                doc = self._nlp(text)
+        n_process = self.spacy_n_process
+        if self.spacy_use_gpu and n_process != 1:
+            logger.warning("spaCy GPU mode requires n_process=1; overriding.")
+            n_process = 1
+
+        try:
+            docs = self._nlp.pipe(
+                decoded,
+                batch_size=max(1, self.spacy_batch_size),
+                n_process=max(1, n_process),
+            )
+            for doc in docs:
+                words = set(self.function_words)
                 for token in doc:
                     if token.pos_ in {
                         "ADP",
@@ -156,20 +167,71 @@ class SVSCalculator:
                         "SCONJ",
                     }:
                         words.add(token.text.lower())
-            except Exception:
-                logger.warning("SVS POS tagging failed; falling back to lexical list.")
-            function_sets.append(words)
+                function_sets.append(words)
+        except Exception:
+            logger.warning("SVS POS tagging failed; falling back to lexical list.")
+            return [set(self.function_words) for _ in decoded]
+
         return function_sets
 
+    def _build_token_masks(
+        self,
+        *,
+        tokens: Sequence[Sequence[str]],
+        function_sets: Sequence[set[str]],
+        key_masks: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        batch_size, seq_len = key_masks.shape
+        function_mask = torch.zeros((batch_size, seq_len), dtype=torch.bool)
+        content_mask = torch.zeros((batch_size, seq_len), dtype=torch.bool)
+
+        for batch_idx, token_row in enumerate(tokens):
+            function_words = function_sets[batch_idx]
+            key_mask = key_masks[batch_idx]
+            for pos, token in enumerate(token_row):
+                if pos >= seq_len:
+                    break
+                if not bool(key_mask[pos]):
+                    continue
+                norm = self._normalize_token(token)
+                if not norm:
+                    continue
+                if norm in function_words:
+                    function_mask[batch_idx, pos] = True
+                else:
+                    content_mask[batch_idx, pos] = True
+
+        return function_mask, content_mask
+
     @staticmethod
-    def _load_spacy_model(model_name: str):
+    def _load_spacy_model(
+        model_name: str,
+        *,
+        use_gpu: bool = False,
+        gpu_id: Optional[int] = None,
+        disable: Optional[Iterable[str]] = None,
+    ):
+        cache_key = (model_name, bool(use_gpu), gpu_id, tuple(disable or []))
+        cached = SVSCalculator._NLP_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
         try:
             import spacy
         except Exception:
             logger.warning("spaCy not available; SVS POS tagging disabled.")
             return None
         try:
-            return spacy.load(model_name)
+            if use_gpu:
+                try:
+                    if gpu_id is None:
+                        spacy.require_gpu()
+                    else:
+                        spacy.require_gpu(gpu_id)
+                except Exception as exc:
+                    logger.warning("spaCy GPU requested but unavailable: %s. Falling back to CPU.", exc)
+            nlp = spacy.load(model_name, disable=list(disable or []))
+            SVSCalculator._NLP_CACHE[cache_key] = nlp
+            return nlp
         except Exception:
             logger.warning("spaCy model '%s' not found; SVS POS tagging disabled.", model_name)
             return None
