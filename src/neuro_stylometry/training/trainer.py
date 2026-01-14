@@ -17,7 +17,7 @@ import logging
 import math
 import json
 from pathlib import Path
-from typing import Dict, Optional, Any, Union
+from typing import Dict, Optional, Any, Union, List
 
 import numpy as np
 import torch
@@ -39,7 +39,7 @@ from ..hardware_ops.cuda_graphs import (
     GraphCache,
     GraphCacheConfig,
 )
-from ..stylometry_net.classification_head import MultiTaskHead
+from ..stylometry_net.classification_head import MultiTaskHead, SingleTaskHead
 from ..stylometry_net.phase_d_dataset import (
     DevicePrefetcher,
     FastCollator,
@@ -132,6 +132,9 @@ class PhaseDTrainConfig:
     use_device_prefetch: bool = True  # Async H2D transfers
     quantize_step: int = DEFAULT_QUANTIZE_STEP  # Snap-to-Grid step (16)
     token_budget: int = 65536  # Default token budget for quantized sampler
+    
+    # Label filtering for single-label or subset training
+    use_only_labels: Optional[tuple[str, ...]] = None  # Filter to specific demographic labels
 
 
 class PhaseDTrainer:
@@ -215,15 +218,26 @@ class PhaseDTrainer:
         shuffle: bool = False,
         enable_dynamic_batching: bool = False,
     ) -> tuple[DataLoader, PhaseDLabelMaps]:
+        # Determine label_fields based on use_only_labels filter
+        use_only = self.config.use_only_labels
+        if use_only:
+            label_fields = list(use_only)
+        else:
+            label_fields = get_demographic_columns()
+        
         dataset = PhaseDDataset(
             self.config.dataset_path,
             text_field=text_field,
-            label_fields=get_demographic_columns(),
+            label_fields=label_fields,
             label_maps=label_maps,
             split=split,
             split_ratios=self.config.split_ratios,
             use_aot_tokens=self._aot_mode_requested,
+            use_only_labels=list(use_only) if use_only else None,
         )
+        
+        # Store filter metadata for later checkpoint saving
+        self._dataset_filter_metadata = dataset.get_filter_metadata()
         
         # Determine collator based on dataset mode
         aot_mode_active = dataset.is_aot_mode
@@ -369,7 +383,9 @@ class PhaseDTrainer:
             )
         return loader, dataset.label_maps
 
-    def _build_model(self, *, use_affine_guard: bool) -> tuple[AffineGuardTransformer, MultiTaskHead]:
+    def _build_model(
+        self, *, use_affine_guard: bool
+    ) -> tuple[AffineGuardTransformer, Union[MultiTaskHead, SingleTaskHead]]:
         if use_affine_guard:
             model = AffineGuardTransformer.from_phase_a(
                 self.config.artifacts_dir,
@@ -386,10 +402,43 @@ class PhaseDTrainer:
             )
 
         model = model.to(self.device)
-        head = MultiTaskHead(
-            hidden_dim=model.config.hidden_size,
-            num_labels_per_task=self.label_maps.num_classes(),
-        ).to(self.device)
+        
+        # Determine head type based on use_only_labels
+        use_only = self.config.use_only_labels
+        num_classes_per_task = self.label_maps.num_classes()
+        
+        if use_only and len(use_only) == 1:
+            # Single-label mode: use SingleTaskHead
+            task_name = use_only[0]
+            num_classes = num_classes_per_task[task_name]
+            head = SingleTaskHead(
+                hidden_dim=model.config.hidden_size,
+                num_classes=num_classes,
+                task_name=task_name,
+            ).to(self.device)
+            self._single_task_mode = True
+            self._single_task_name = task_name
+            logger.info(
+                f"Single-task mode: training on '{task_name}' with {num_classes} classes "
+                f"(is_binary={head.is_binary})"
+            )
+        else:
+            # Multi-task mode: use MultiTaskHead
+            head = MultiTaskHead(
+                hidden_dim=model.config.hidden_size,
+                num_labels_per_task=num_classes_per_task,
+            ).to(self.device)
+            self._single_task_mode = False
+            self._single_task_name = None
+            if use_only:
+                logger.info(
+                    f"Multi-task mode with filtered labels: {list(use_only)} "
+                    f"({len(use_only)} tasks)"
+                )
+            else:
+                logger.info(
+                    f"Multi-task mode: training on all {len(num_classes_per_task)} demographic tasks"
+                )
         
         # Apply torch.compile for kernel optimization
         if self._use_torch_compile and self.device.type == "cuda":
@@ -451,7 +500,7 @@ class PhaseDTrainer:
         self,
         *,
         model: AffineGuardTransformer,
-        head: MultiTaskHead,
+        head: Union[MultiTaskHead, SingleTaskHead],
         loader: DataLoader,
         num_classes: Dict[str, int],
     ) -> Dict[str, Dict[str, float]]:
@@ -489,9 +538,17 @@ class PhaseDTrainer:
                 outputs = model(input_ids=input_ids, attention_mask=attention_mask)
                 logits = head(outputs["cls_embedding"])
 
-            for task, task_logits_batch in logits.items():
-                task_logits[task].append(task_logits_batch.detach().cpu())
-                task_labels[task].append(labels[task].detach().cpu())
+            # Handle single-task vs multi-task evaluation
+            if self._single_task_mode:
+                # SingleTaskHead returns tensor, convert to dict format
+                task_name = self._single_task_name
+                task_logits[task_name].append(logits.detach().cpu())
+                task_labels[task_name].append(labels[task_name].detach().cpu())
+            else:
+                # MultiTaskHead returns dict
+                for task, task_logits_batch in logits.items():
+                    task_logits[task].append(task_logits_batch.detach().cpu())
+                    task_labels[task].append(labels[task].detach().cpu())
         
         eval_pbar.close()
 
@@ -515,7 +572,7 @@ class PhaseDTrainer:
         self,
         *,
         model: AffineGuardTransformer,
-        head: MultiTaskHead,
+        head: Union[MultiTaskHead, SingleTaskHead],
         loader: DataLoader,
         num_classes: Dict[str, int],
     ) -> Dict[str, Dict[str, Any]]:
@@ -553,9 +610,17 @@ class PhaseDTrainer:
                 outputs = model(input_ids=input_ids, attention_mask=attention_mask)
                 logits = head(outputs["cls_embedding"])
 
-            for task, task_logits_batch in logits.items():
-                task_logits[task].append(task_logits_batch.detach().cpu())
-                task_labels[task].append(labels[task].detach().cpu())
+            # Handle single-task vs multi-task evaluation
+            if self._single_task_mode:
+                # SingleTaskHead returns tensor, convert to dict format
+                task_name = self._single_task_name
+                task_logits[task_name].append(logits.detach().cpu())
+                task_labels[task_name].append(labels[task_name].detach().cpu())
+            else:
+                # MultiTaskHead returns dict
+                for task, task_logits_batch in logits.items():
+                    task_logits[task].append(task_logits_batch.detach().cpu())
+                    task_labels[task].append(labels[task].detach().cpu())
         
         eval_pbar.close()
 
@@ -578,7 +643,7 @@ class PhaseDTrainer:
         self,
         *,
         model: AffineGuardTransformer,
-        head: MultiTaskHead,
+        head: Union[MultiTaskHead, SingleTaskHead],
         loader: DataLoader,
         eval_loader: Optional[DataLoader],
         run_dir: Path,
@@ -876,7 +941,15 @@ class PhaseDTrainer:
                             # been overwritten by a subsequent CUDA Graph execution.
                             cls_embedding = outputs["cls_embedding"].clone()
                             logits = head(cls_embedding)
-                            loss = head.compute_loss(logits, labels)
+                            
+                            # Handle single-task vs multi-task loss computation
+                            if self._single_task_mode:
+                                # SingleTaskHead: labels is dict, need to extract single task
+                                task_labels = labels[self._single_task_name]
+                                loss = head.compute_loss(logits, task_labels)
+                            else:
+                                # MultiTaskHead: standard dict-based loss
+                                loss = head.compute_loss(logits, labels)
 
                         if loss is None:
                             return None, False, True  # loss_value, did_step, skip_batch
@@ -1064,6 +1137,34 @@ class PhaseDTrainer:
                 num_classes=self.label_maps.num_classes(),
             )
             save_metadata(run_dir / "phase_d_evaluation_details.json", details)
+        
+        # Build label filter metadata for training_metadata.json
+        filter_metadata = getattr(self, "_dataset_filter_metadata", None) or {
+            "use_only": None,
+            "semantics": None,
+            "original_rows": None,
+            "filtered_rows": None,
+        }
+        model_variant = "single_task" if self._single_task_mode else "multi_task"
+        
+        # Build training metadata with label filter info
+        training_metadata = {
+            "label_filter": filter_metadata,
+            "label_maps": self.label_maps.maps,
+            "model_variant": model_variant,
+            "task_name": self._single_task_name if self._single_task_mode else None,
+            "num_tasks": 1 if self._single_task_mode else len(self.label_maps.maps),
+            "training_complete": True,
+            "final_step": step,
+            "final_optimizer_step": optimizer_step,
+            "num_epochs": self.config.num_epochs,
+        }
+        
+        # Save training_metadata.json for verify command auto-detection
+        training_metadata_path = run_dir / "training_metadata.json"
+        save_metadata(training_metadata_path, training_metadata)
+        logger.info(f"Saved training metadata: {training_metadata_path}")
+        
         save_checkpoint(
             checkpoint_path,
             model_state=model.state_dict(),
@@ -1073,6 +1174,8 @@ class PhaseDTrainer:
             metadata={
                 "config": config_to_metadata(self.config),
                 "label_maps": self.label_maps.maps,
+                "label_filter": filter_metadata,
+                "model_variant": model_variant,
                 "metrics": metrics,
                 "checkpoint": {
                     "epoch": self.config.num_epochs,

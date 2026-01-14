@@ -3,19 +3,22 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 from torch.utils.data import DataLoader
 
 from ..data_engine.schemas import get_demographic_columns
 from .chg_verifier import CHGVerifier
-from .classification_head import MultiTaskHead
+from .classification_head import MultiTaskHead, SingleTaskHead
 from .phase_d_dataset import PhaseDCollator, PhaseDDataset, load_label_maps
 from .svs_calculator import SVSCalculator, SVSResult
 from .tokenizer import PhaseDTokenizer
 from .transformer import AffineGuardTransformer
+
+logger = logging.getLogger(__name__)
 
 
 def _load_model_and_head(
@@ -28,7 +31,8 @@ def _load_model_and_head(
     use_affine_guard: bool,
     label_maps: Dict[str, Dict],
     device: torch.device,
-) -> Tuple[AffineGuardTransformer, MultiTaskHead]:
+    use_only_labels: Optional[List[str]] = None,
+) -> Tuple[AffineGuardTransformer, Union[MultiTaskHead, SingleTaskHead]]:
     if use_affine_guard:
         model = AffineGuardTransformer.from_phase_a(
             artifacts_dir,
@@ -46,19 +50,52 @@ def _load_model_and_head(
 
     # Load head state first to infer num_labels from checkpoint
     head_state = torch.load(run_dir / "head.pt", map_location=device)
+    
+    # Check if this is a SingleTaskHead or MultiTaskHead based on checkpoint keys
+    # SingleTaskHead has "classifier.weight", MultiTaskHead has "heads.{task}.weight"
+    is_single_task = "classifier.weight" in head_state
+    
+    if is_single_task:
+        # SingleTaskHead: extract num_classes and task_name
+        num_classes = head_state["classifier.weight"].shape[0]
+        
+        # Try to get task name from training_metadata.json
+        task_name = None
+        training_meta_path = run_dir / "training_metadata.json"
+        if training_meta_path.exists():
+            try:
+                with open(training_meta_path) as f:
+                    meta = json.load(f)
+                    task_name = meta.get("task_name")
+            except Exception:
+                pass
+        
+        # Fallback: use first use_only_label or a generic name
+        if task_name is None:
+            if use_only_labels and len(use_only_labels) == 1:
+                task_name = use_only_labels[0]
+            else:
+                task_name = "single_task"
+        
+        head = SingleTaskHead(
+            hidden_dim=model.config.hidden_size,
+            num_classes=num_classes,
+            task_name=task_name,
+        )
+        logger.info(f"Loaded SingleTaskHead for task '{task_name}' ({num_classes} classes)")
+    else:
+        # MultiTaskHead: infer num_labels_per_task from checkpoint
+        num_labels_per_task = {}
+        for key in head_state.keys():
+            if key.endswith(".weight"):
+                task_name = key.split(".")[1]  # Extract task name from "heads.{task}.weight"
+                num_labels = head_state[key].shape[0]
+                num_labels_per_task[task_name] = num_labels
 
-    # Infer num_labels_per_task from the saved checkpoint
-    num_labels_per_task = {}
-    for key in head_state.keys():
-        if key.endswith(".weight"):
-            task_name = key.split(".")[1]  # Extract task name from "heads.{task}.weight"
-            num_labels = head_state[key].shape[0]
-            num_labels_per_task[task_name] = num_labels
-
-    head = MultiTaskHead(
-        hidden_dim=model.config.hidden_size,
-        num_labels_per_task=num_labels_per_task,
-    )
+        head = MultiTaskHead(
+            hidden_dim=model.config.hidden_size,
+            num_labels_per_task=num_labels_per_task,
+        )
 
     model_state = torch.load(run_dir / "model.pt", map_location=device)
     model.load_state_dict(model_state)
@@ -80,13 +117,21 @@ def _build_loader(
     label_maps,
     batch_size: int,
     split: str,
+    use_only_labels: Optional[List[str]] = None,
 ) -> DataLoader:
+    # Determine label_fields based on filter
+    if use_only_labels:
+        label_fields = list(use_only_labels)
+    else:
+        label_fields = get_demographic_columns()
+    
     dataset = PhaseDDataset(
         dataset_path,
         text_field=text_field,
-        label_fields=get_demographic_columns(),
+        label_fields=label_fields,
         label_maps=label_maps,
         split=split,
+        use_only_labels=use_only_labels,
     )
     tokenizer = PhaseDTokenizer(
         model_name="roberta-base",
@@ -153,9 +198,18 @@ def run_verification(
     irrelevant_threshold: float,
     svs_max_batches: int,
     svs_query_strategy: str,
+    use_only_labels: Optional[tuple[str, ...]] = None,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
-    label_maps = load_label_maps(dataset_path, get_demographic_columns()).maps
+    
+    # Determine which label fields to use for label maps
+    if use_only_labels:
+        label_fields_for_maps = list(use_only_labels)
+        logger.info(f"Verification using filtered labels: {label_fields_for_maps}")
+    else:
+        label_fields_for_maps = get_demographic_columns()
+    
+    label_maps = load_label_maps(dataset_path, label_fields_for_maps).maps
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     svs_query_strategy = (svs_query_strategy or "mean_tokens").strip().lower()
@@ -173,6 +227,7 @@ def run_verification(
             use_affine_guard=use_affine_guard,
             label_maps=label_maps,
             device=device,
+            use_only_labels=list(use_only_labels) if use_only_labels else None,
         )
 
         loader = _build_loader(
@@ -180,9 +235,10 @@ def run_verification(
             text_field=text_field,
             taxonomy_path=taxonomy_path,
             max_length=max_length,
-            label_maps=load_label_maps(dataset_path, get_demographic_columns()),
+            label_maps=load_label_maps(dataset_path, label_fields_for_maps),
             batch_size=batch_size,
             split="val",
+            use_only_labels=list(use_only_labels) if use_only_labels else None,
         )
 
         chg = CHGVerifier(

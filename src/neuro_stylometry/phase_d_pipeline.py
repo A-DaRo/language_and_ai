@@ -47,6 +47,7 @@ def run_phase_d_training(
     config_path: Path | None = None,
     data_change: bool = False,
     graph_train: bool | None = None,
+    use_only_labels: tuple[str, ...] | None = None,
 ) -> Dict[str, Any]:
     """
     Run Phase D training: baseline + constrained models.
@@ -59,6 +60,10 @@ def run_phase_d_training(
         dataset_path_masked: Optional tokenized dataset for masked posts
         mode: Hardware mode (laptop/hpc)
         config_path: Optional experiment config override
+        data_change: Whether to rewrite dataset split column for small test runs
+        graph_train: Whether to enable manual CUDA graph training
+        use_only_labels: Filter to specific demographic labels (AND semantics).
+                         If single label, uses SingleTaskHead for simplified training.
 
     Returns:
         Dict with results for baseline and constrained models
@@ -115,6 +120,10 @@ def run_phase_d_training(
         if resume_from
         else None
     )
+    
+    # Log label filter if specified
+    if use_only_labels:
+        logger.info(f"Label filter active: use_only={list(use_only_labels)} (AND semantics)")
 
     results = {}
 
@@ -163,6 +172,8 @@ def run_phase_d_training(
         use_device_prefetch=opt_cfg.get('use_device_prefetch', False),
         quantize_step=opt_cfg.get('quantize_step', 16),
         token_budget=opt_cfg.get('token_budget', 65536),
+        # Label filtering
+        use_only_labels=use_only_labels,
     )
 
     baseline_trainer = PhaseDTrainer(baseline_config)
@@ -283,6 +294,8 @@ def run_phase_d_training(
         use_device_prefetch=opt_cfg.get('use_device_prefetch', False),
         quantize_step=opt_cfg.get('quantize_step', 16),
         token_budget=opt_cfg.get('token_budget', 65536),
+        # Label filtering
+        use_only_labels=use_only_labels,
     )
 
     constrained_trainer = PhaseDTrainer(constrained_config)

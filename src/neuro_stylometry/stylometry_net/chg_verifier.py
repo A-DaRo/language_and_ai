@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Union
 
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
+
+from .classification_head import SingleTaskHead, MultiTaskHead
 
 
 @dataclass
@@ -97,7 +99,7 @@ class CHGVerifier:
             for batch in dataloader:
                 input_ids = batch["input_ids"].to(device)
                 attention_mask = batch["attention_mask"].to(device)
-                labels = {k: v.to(device) for k, v in batch["labels"].items()}
+                labels_dict = {k: v.to(device) for k, v in batch["labels"].items()}
 
                 gate_values = torch.sigmoid(gate_logits)
                 outputs = model(
@@ -107,7 +109,18 @@ class CHGVerifier:
                     output_attentions=True,
                 )
                 logits = head(outputs["cls_embedding"])
-                base_loss = head.compute_loss(logits, labels)
+                
+                # Handle SingleTaskHead vs MultiTaskHead
+                if isinstance(head, SingleTaskHead):
+                    # SingleTaskHead expects tensor labels for its specific task
+                    task_labels = labels_dict.get(head.task_name)
+                    if task_labels is None:
+                        continue
+                    base_loss = head.compute_loss(logits, task_labels)
+                else:
+                    # MultiTaskHead expects dict labels
+                    base_loss = head.compute_loss(logits, labels_dict)
+                
                 if base_loss is None:
                     continue
 

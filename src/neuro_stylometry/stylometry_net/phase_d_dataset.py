@@ -65,6 +65,11 @@ class PhaseDDataset(Dataset):
     2. AOT mode: Returns pre-tokenized tensors for FastCollator (optimized)
     
     AOT mode is auto-detected when 'input_ids' column exists in the Arrow file.
+    
+    Label filtering (--use-only):
+    When use_only_labels is provided, the dataset filters rows to only include
+    those with valid (non-null) values for ALL specified labels (AND semantics).
+    This enables single-label or multi-label subset training.
     """
 
     def __init__(
@@ -78,12 +83,64 @@ class PhaseDDataset(Dataset):
         split_seed: int = 42,
         split_ratios: Optional[Dict[str, float]] = None,
         use_aot_tokens: Optional[bool] = None,  # Auto-detect if None
+        use_only_labels: Optional[List[str]] = None,  # Filter to rows with valid labels
     ) -> None:
         self.arrow_path = Path(arrow_path)
         self.text_field = text_field
-        self.label_fields = list(label_fields or get_demographic_columns())
+        all_demographics = get_demographic_columns()
+        self.label_fields = list(label_fields or all_demographics)
+        
+        # Validate use_only_labels against known demographics
+        self._use_only_labels = None
+        if use_only_labels:
+            invalid_labels = [lbl for lbl in use_only_labels if lbl not in all_demographics]
+            if invalid_labels:
+                raise ValueError(
+                    f"Invalid label(s) in use_only_labels: {invalid_labels}. "
+                    f"Valid options: {all_demographics}"
+                )
+            self._use_only_labels = list(use_only_labels)
+            # Restrict label_fields to only the selected labels for training
+            self.label_fields = self._use_only_labels
 
         table = feather.read_table(self.arrow_path, memory_map=True)
+        
+        # Track original row count before any filtering
+        self._original_row_count = table.num_rows
+        
+        # Apply use_only_labels filter BEFORE split filtering (AND semantics)
+        if self._use_only_labels:
+            valid_mask = None
+            for label_col in self._use_only_labels:
+                if label_col not in table.column_names:
+                    raise ValueError(
+                        f"Label column '{label_col}' not found in dataset. "
+                        f"Available columns: {table.column_names}"
+                    )
+                col_valid = pc.is_valid(table[label_col])
+                if valid_mask is None:
+                    valid_mask = col_valid
+                else:
+                    valid_mask = pc.and_(valid_mask, col_valid)
+            
+            table = table.filter(valid_mask)
+            self._filtered_row_count = table.num_rows
+            
+            if self._filtered_row_count == 0:
+                raise ValueError(
+                    f"No rows remain after filtering for labels {self._use_only_labels}. "
+                    f"Original row count: {self._original_row_count}. "
+                    "Ensure dataset has valid values for all specified labels."
+                )
+            
+            logger.info(
+                f"Label filter applied (use_only={self._use_only_labels}): "
+                f"{self._original_row_count} -> {self._filtered_row_count} rows "
+                f"({self._filtered_row_count / self._original_row_count * 100:.1f}% retained)"
+            )
+        else:
+            self._filtered_row_count = self._original_row_count
+        
         if split is not None:
             # Check if split column exists and has valid values
             has_valid_split = False
@@ -131,25 +188,34 @@ class PhaseDDataset(Dataset):
         aot_field_matches = False
         tokenized_field = None
         
-        if has_aot_columns and "tokenized_text_field" in self.table.column_names:
-            # Check if at least one row has matching tokenized field
-            tokenized_field = self.table["tokenized_text_field"][0].as_py()
-            aot_field_matches = (tokenized_field == text_field)
-        elif has_aot_columns:
-            # Legacy: no tokenized_text_field column, assume match for backward compat
-            aot_field_matches = True
-        
-        if use_aot_tokens is None:
-            # Auto-detect: enable AOT only if columns exist AND field matches
-            self._aot_mode = has_aot_columns and aot_field_matches
-            if has_aot_columns and not aot_field_matches:
-                logger.debug(
-                    f"AOT columns found but tokenized field mismatch: "
-                    f"requested '{text_field}', dataset has '{tokenized_field}'. "
-                    f"Falling back to JIT tokenization."
-                )
+        # Check if table has any rows before accessing column data
+        if len(self.table) == 0:
+            logger.warning(
+                f"Dataset has 0 rows after filtering (use_only={use_only_labels}, split='{split}'). "
+                f"Training/validation may fail."
+            )
+            # Set AOT mode to False since we can't check field matches on empty table
+            self._aot_mode = False
         else:
-            self._aot_mode = use_aot_tokens
+            if has_aot_columns and "tokenized_text_field" in self.table.column_names:
+                # Check if at least one row has matching tokenized field
+                tokenized_field = self.table["tokenized_text_field"][0].as_py()
+                aot_field_matches = (tokenized_field == text_field)
+            elif has_aot_columns:
+                # Legacy: no tokenized_text_field column, assume match for backward compat
+                aot_field_matches = True
+            
+            if use_aot_tokens is None:
+                # Auto-detect: enable AOT only if columns exist AND field matches
+                self._aot_mode = has_aot_columns and aot_field_matches
+                if has_aot_columns and not aot_field_matches:
+                    logger.debug(
+                        f"AOT columns found but tokenized field mismatch: "
+                        f"requested '{text_field}', dataset has '{tokenized_field}'. "
+                        f"Falling back to JIT tokenization."
+                    )
+            else:
+                self._aot_mode = use_aot_tokens
         
         if self._aot_mode:
             if "input_ids" not in self.table.column_names:
@@ -208,6 +274,34 @@ class PhaseDDataset(Dataset):
     def pre_padded_length(self) -> Optional[int]:
         """Fixed sequence length if pre-padded, None otherwise."""
         return self._pre_padded_length
+    
+    @property
+    def use_only_labels(self) -> Optional[List[str]]:
+        """Labels being filtered on, or None if using all labels."""
+        return self._use_only_labels
+    
+    @property
+    def original_row_count(self) -> int:
+        """Number of rows before any label filtering."""
+        return self._original_row_count
+    
+    @property
+    def filtered_row_count(self) -> int:
+        """Number of rows after label filtering (same as original if no filter)."""
+        return self._filtered_row_count
+    
+    def get_filter_metadata(self) -> Dict:
+        """Get metadata about the label filtering applied to this dataset.
+        
+        Returns:
+            Dict with filter info for saving to training_metadata.json
+        """
+        return {
+            "use_only": self._use_only_labels,
+            "semantics": "AND" if self._use_only_labels else None,
+            "original_rows": self._original_row_count,
+            "filtered_rows": self._filtered_row_count,
+        }
 
     def __len__(self) -> int:
         return self.table.num_rows
