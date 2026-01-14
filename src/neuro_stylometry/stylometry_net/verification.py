@@ -14,6 +14,7 @@ from ..data_engine.schemas import get_demographic_columns
 from .chg_verifier import CHGVerifier
 from .classification_head import MultiTaskHead, SingleTaskHead
 from .phase_d_dataset import (
+    FastCollator,
     PhaseDCollator,
     PhaseDDataset,
     PhaseDLabelMaps,
@@ -120,6 +121,7 @@ def _build_loader(
     dataset_path: Path,
     text_field: str,
     taxonomy_path: Path,
+    model_name: str,
     max_length: int,
     label_maps,
     batch_size: int,
@@ -141,11 +143,17 @@ def _build_loader(
         use_only_labels=use_only_labels,
     )
     tokenizer = PhaseDTokenizer(
-        model_name="roberta-base",
+        model_name=model_name,
         max_length=max_length,
         taxonomy_path=taxonomy_path,
     )
-    collator = PhaseDCollator(tokenizer)
+    if dataset.is_aot_mode:
+        collator = FastCollator(
+            max_length=max_length,
+            pad_token_id=1,
+        )
+    else:
+        collator = PhaseDCollator(tokenizer)
     return DataLoader(dataset, batch_size=batch_size, shuffle=False, collate_fn=collator), tokenizer
 
 
@@ -281,6 +289,7 @@ def run_verification(
             dataset_path=dataset_for_run,
             text_field=text_field,
             taxonomy_path=taxonomy_path,
+            model_name=model_name,
             max_length=max_length,
             label_maps=label_maps_obj,
             batch_size=batch_size,
