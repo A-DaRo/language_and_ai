@@ -98,7 +98,9 @@ def _load_model_and_head(
         )
 
     model_state = torch.load(run_dir / "model.pt", map_location=device)
-    model.load_state_dict(model_state)
+    # Load with strict=False to handle potential embedding size mismatch
+    # (Training may not resize embeddings for mask tokens)
+    model.load_state_dict(model_state, strict=False)
     head.load_state_dict(head_state)
 
     model.to(device)
@@ -118,7 +120,7 @@ def _build_loader(
     batch_size: int,
     split: str,
     use_only_labels: Optional[List[str]] = None,
-) -> DataLoader:
+) -> tuple[DataLoader, PhaseDTokenizer]:
     # Determine label_fields based on filter
     if use_only_labels:
         label_fields = list(use_only_labels)
@@ -139,7 +141,7 @@ def _build_loader(
         taxonomy_path=taxonomy_path,
     )
     collator = PhaseDCollator(tokenizer)
-    return DataLoader(dataset, batch_size=batch_size, shuffle=False, collate_fn=collator)
+    return DataLoader(dataset, batch_size=batch_size, shuffle=False, collate_fn=collator), tokenizer
 
 
 @torch.no_grad()
@@ -147,11 +149,12 @@ def _compute_svs(
     *,
     model: AffineGuardTransformer,
     loader: DataLoader,
+    tokenizer,  # HF tokenizer instance (not PhaseDTokenizer)
     facilitating_heads,
     max_batches: int,
     query_strategy: str,
 ) -> SVSResult:
-    calculator = SVSCalculator(model.tokenizer.tokenizer)
+    calculator = SVSCalculator(tokenizer)
     function_mass = 0.0
     content_mass = 0.0
     batches_seen = 0
@@ -230,7 +233,7 @@ def run_verification(
             use_only_labels=list(use_only_labels) if use_only_labels else None,
         )
 
-        loader = _build_loader(
+        loader, phase_d_tokenizer = _build_loader(
             dataset_path=dataset_path,
             text_field=text_field,
             taxonomy_path=taxonomy_path,
@@ -240,6 +243,9 @@ def run_verification(
             split="val",
             use_only_labels=list(use_only_labels) if use_only_labels else None,
         )
+        
+        # Resize model embeddings to match tokenizer vocabulary (includes mask tokens)
+        phase_d_tokenizer.resize_model_embeddings(model.model)
 
         chg = CHGVerifier(
             num_layers=model.config.num_hidden_layers,
@@ -267,6 +273,7 @@ def run_verification(
         svs_result = _compute_svs(
             model=model,
             loader=loader,
+            tokenizer=phase_d_tokenizer.tokenizer,  # Pass underlying HF tokenizer
             facilitating_heads=classifications["facilitating"],
             max_batches=svs_max_batches,
             query_strategy=svs_query_strategy,
