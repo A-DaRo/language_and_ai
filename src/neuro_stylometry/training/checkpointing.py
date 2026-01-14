@@ -4,13 +4,10 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict
-import logging
 from pathlib import Path
 from typing import Any, Dict
 
 import torch
-
-logger = logging.getLogger(__name__)
 
 
 def save_checkpoint(
@@ -25,29 +22,19 @@ def save_checkpoint(
 ) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "model_state": model_state,
-        "head_state": head_state,
-        "optimizer_state": optimizer_state,
-        "metadata": metadata,
-        "scheduler_state": scheduler_state,
-        "scaler_state": scaler_state,
-        "torch_rng": torch.get_rng_state(),
-        "cuda_rng": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
-    }
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    try:
-        torch.save(payload, tmp_path)
-        tmp_path.replace(path)
-    except Exception as exc:
-        logger.warning("Checkpoint save failed at %s: %s", path, exc)
-        try:
-            if tmp_path.exists():
-                tmp_path.unlink()
-        except Exception as cleanup_exc:
-            logger.warning(
-                "Checkpoint cleanup failed at %s: %s", tmp_path, cleanup_exc
-            )
+    torch.save(
+        {
+            "model_state": model_state,
+            "head_state": head_state,
+            "optimizer_state": optimizer_state,
+            "metadata": metadata,
+            "scheduler_state": scheduler_state,
+            "scaler_state": scaler_state,
+            "torch_rng": torch.get_rng_state(),
+            "cuda_rng": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+        },
+        path,
+    )
 
 
 def load_checkpoint(path: Path) -> Dict[str, Any]:
