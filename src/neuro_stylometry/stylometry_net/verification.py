@@ -7,6 +7,8 @@ import logging
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
+import pyarrow.compute as pc
+import pyarrow.feather as feather
 import torch
 from torch.utils.data import DataLoader
 
@@ -213,6 +215,60 @@ def _load_label_maps_from_checkpoint(run_dir: Path) -> Optional[PhaseDLabelMaps]
     return None
 
 
+def _prescan_label_validity(dataset_path: Path, label_maps: PhaseDLabelMaps) -> None:
+    try:
+        table = feather.read_table(dataset_path, memory_map=True)
+    except Exception as exc:
+        logger.warning("Failed to read dataset for prescan (%s): %s", dataset_path, exc)
+        return
+
+    total_rows = int(table.num_rows)
+    if total_rows == 0:
+        logger.warning("Prescan skipped (0 rows) for %s", dataset_path)
+        return
+
+    logger.info("Prescanning label validity: %s (%d rows)", dataset_path, total_rows)
+    for field, mapping in label_maps.maps.items():
+        if field not in table.column_names:
+            logger.warning("Prescan: label column missing: %s", field)
+            continue
+
+        col = table[field]
+        valid_mask = pc.is_valid(col)
+        valid_count = int(pc.sum(valid_mask).as_py())
+        missing_count = total_rows - valid_count
+
+        invalid_count = 0
+        if mapping:
+            try:
+                allowed_values = list(mapping.keys())
+                in_map = pc.is_in(col, value_set=allowed_values)
+                invalid_mask = pc.and_(valid_mask, pc.invert(in_map))
+                invalid_count = int(pc.sum(invalid_mask).as_py())
+            except Exception as exc:
+                logger.warning(
+                    "Prescan skipped invalid-value check for %s (type mismatch): %s",
+                    field,
+                    exc,
+                )
+                invalid_count = 0
+        else:
+            invalid_count = valid_count
+
+        ignored = missing_count + invalid_count
+        if ignored:
+            logger.warning(
+                "Prescan: %s ignored=%d (missing=%d, invalid=%d) out of %d",
+                field,
+                ignored,
+                missing_count,
+                invalid_count,
+                total_rows,
+            )
+        else:
+            logger.info("Prescan: %s ignored=0 out of %d", field, total_rows)
+
+
 def run_verification(
     *,
     dataset_path: Path,
@@ -251,6 +307,15 @@ def run_verification(
     else:
         logger.info("Loaded label maps from training checkpoint metadata")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    prescan_paths: List[Path] = []
+    for candidate in (dataset_path_post, dataset_path_masked, dataset_path):
+        if candidate is None:
+            continue
+        if candidate.exists() and candidate not in prescan_paths:
+            prescan_paths.append(candidate)
+    for path in prescan_paths:
+        _prescan_label_validity(path, label_maps_obj)
 
     svs_query_strategy = (svs_query_strategy or "mean_tokens").strip().lower()
     if svs_query_strategy in {"default", "auto"}:

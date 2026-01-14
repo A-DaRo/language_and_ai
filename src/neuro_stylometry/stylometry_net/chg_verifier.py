@@ -79,6 +79,15 @@ class CHGVerifier:
         dataloader: DataLoader,
         device: torch.device,
     ) -> HeadGates:
+        def _sanitize_labels(
+            labels: torch.Tensor,
+            *,
+            num_classes: int,
+            ignore_index: int = -1,
+        ) -> torch.Tensor:
+            invalid_mask = (labels < 0) | (labels >= num_classes)
+            return labels.masked_fill(invalid_mask, ignore_index)
+
         gate_init = float(self.gate_init)
         gate_init = min(max(gate_init, 1e-3), 1 - 1e-3)
         gate_logits = nn.Parameter(
@@ -116,10 +125,21 @@ class CHGVerifier:
                     task_labels = labels_dict.get(head.task_name)
                     if task_labels is None:
                         continue
+                    task_labels = _sanitize_labels(
+                        task_labels,
+                        num_classes=head.num_classes,
+                    )
                     base_loss = head.compute_loss(logits, task_labels)
                 else:
                     # MultiTaskHead expects dict labels
-                    base_loss = head.compute_loss(logits, labels_dict)
+                    sanitized_labels: Dict[str, torch.Tensor] = {}
+                    for task_name, task_labels in labels_dict.items():
+                        num_classes = head.heads[task_name].out_features
+                        sanitized_labels[task_name] = _sanitize_labels(
+                            task_labels,
+                            num_classes=num_classes,
+                        )
+                    base_loss = head.compute_loss(logits, sanitized_labels)
                 
                 if base_loss is None:
                     continue
