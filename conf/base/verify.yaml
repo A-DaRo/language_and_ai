@@ -8,7 +8,7 @@ model:
 verify:
   batch_size: 8
   chg:
-    epochs: 2
+    epochs: 10
     learning_rate: 0.001
     regularization: 0.01
     facilitating_threshold: 0.7
