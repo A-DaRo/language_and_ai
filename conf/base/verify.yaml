@@ -1,0 +1,18 @@
+# Phase D Verification Configuration (Base)
+
+model:
+  name: "roberta-base"
+  max_length: 512
+  taxonomy_path: "conf/base/gliner_taxonomy.yaml"
+
+verify:
+  batch_size: 8
+  chg:
+    epochs: 10
+    learning_rate: 0.001
+    regularization: 0.01
+    facilitating_threshold: 0.7
+    irrelevant_threshold: 0.3
+  svs:
+    max_batches: 20
+    query_strategy: "mean_tokens"

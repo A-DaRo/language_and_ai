@@ -565,6 +565,19 @@ def run_phase_d(
     help="Tokenized dataset for masked posts (post_masked)",
 )
 @click.option(
+    "--mode",
+    type=click.Choice(["laptop", "hpc"]),
+    default="laptop",
+    help="Hardware mode for verify.yaml (laptop or hpc)",
+)
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=False,
+    help="Optional verify YAML config to merge on top of base+mode configs",
+)
+@click.option(
     "--phase-d-dir",
     type=click.Path(exists=True, path_type=Path),
     default=Path("artifacts/phase_d"),
@@ -587,71 +600,68 @@ def run_phase_d(
 )
 @click.option(
     "--model-name",
-    default="roberta-base",
-    show_default=True,
-    help="Base Hugging Face model name",
+    default=None,
+    help="Base Hugging Face model name (defaults to verify.yaml)",
 )
 @click.option(
     "--taxonomy-path",
     type=click.Path(exists=True, dir_okay=False, path_type=Path),
-    default=Path("conf/base/gliner_taxonomy.yaml"),
-    show_default=True,
-    help="GLiNER taxonomy path for mask-token alignment",
+    default=None,
+    help="GLiNER taxonomy path for mask-token alignment (defaults to verify.yaml)",
 )
 @click.option(
     "--max-length",
-    default=512,
-    show_default=True,
-    help="Tokenizer max length for Phase D",
+    default=None,
+    type=int,
+    help="Tokenizer max length for Phase D (defaults to verify.yaml)",
 )
 @click.option(
     "--batch-size",
-    default=8,
-    show_default=True,
-    help="Batch size for verification",
+    default=None,
+    type=int,
+    help="Batch size for verification (defaults to verify.yaml)",
 )
 @click.option(
     "--chg-epochs",
-    default=5,
-    show_default=True,
-    help="CHG gate training epochs",
+    default=None,
+    type=int,
+    help="CHG gate training epochs (defaults to verify.yaml)",
 )
 @click.option(
     "--chg-lr",
-    default=1e-3,
-    show_default=True,
-    help="CHG gate learning rate",
+    default=None,
+    type=float,
+    help="CHG gate learning rate (defaults to verify.yaml)",
 )
 @click.option(
     "--chg-regularization",
-    default=0.01,
-    show_default=True,
-    help="CHG gate L1 regularization",
+    default=None,
+    type=float,
+    help="CHG gate L1 regularization (defaults to verify.yaml)",
 )
 @click.option(
     "--facilitating-threshold",
-    default=0.7,
-    show_default=True,
-    help="Gate threshold for facilitating heads",
+    default=None,
+    type=float,
+    help="Gate threshold for facilitating heads (defaults to verify.yaml)",
 )
 @click.option(
     "--irrelevant-threshold",
-    default=0.3,
-    show_default=True,
-    help="Gate threshold for irrelevant heads",
+    default=None,
+    type=float,
+    help="Gate threshold for irrelevant heads (defaults to verify.yaml)",
 )
 @click.option(
     "--svs-max-batches",
-    default=5,
-    show_default=True,
-    help="Max batches for SVS calculation",
+    default=None,
+    type=int,
+    help="Max batches for SVS calculation (defaults to verify.yaml)",
 )
 @click.option(
     "--svs-query-strategy",
     type=click.Choice(["cls", "all_tokens", "mean_tokens"]),
-    default="mean_tokens",
-    show_default=True,
-    help="Query aggregation strategy for SVS",
+    default=None,
+    help="Query aggregation strategy for SVS (defaults to verify.yaml)",
 )
 @click.option(
     "--use-only",
@@ -668,25 +678,28 @@ def verify(
     dataset: Path,
     dataset_post: Path | None,
     dataset_masked: Path | None,
+    mode: str,
+    config_path: Path | None,
     phase_d_dir: Path,
     artifacts_dir: Path,
     output_dir: Path,
-    model_name: str,
-    taxonomy_path: Path,
-    max_length: int,
-    batch_size: int,
-    chg_epochs: int,
-    chg_lr: float,
-    chg_regularization: float,
-    facilitating_threshold: float,
-    irrelevant_threshold: float,
-    svs_max_batches: int,
-    svs_query_strategy: str,
+    model_name: str | None,
+    taxonomy_path: Path | None,
+    max_length: int | None,
+    batch_size: int | None,
+    chg_epochs: int | None,
+    chg_lr: float | None,
+    chg_regularization: float | None,
+    facilitating_threshold: float | None,
+    irrelevant_threshold: float | None,
+    svs_max_batches: int | None,
+    svs_query_strategy: str | None,
     use_only_labels: tuple[str, ...],
 ):
     """Run CHG + SVS verification for baseline vs constrained models."""
     import json as json_module
     from .stylometry_net.verification import run_verification
+    from .config import find_config_root, load_verify_config
     
     def _derive_tokenized_paths(base_path: Path) -> tuple[Path, Path]:
         if base_path.suffix:
@@ -698,6 +711,47 @@ def verify(
             base_path / "tokenized_post.arrow",
             base_path / "tokenized_post_masked.arrow",
         )
+
+    config = load_verify_config(mode=mode, experiment_config_path=config_path)
+    config_root = find_config_root("verify.yaml")
+
+    if model_name is None:
+        model_name = config.get("model", {}).get("name", "roberta-base")
+    if taxonomy_path is None:
+        taxonomy_value = config.get("model", {}).get("taxonomy_path")
+        if taxonomy_value:
+            taxonomy_candidate = Path(taxonomy_value)
+            taxonomy_path = (
+                taxonomy_candidate
+                if taxonomy_candidate.is_absolute()
+                else config_root / taxonomy_candidate
+            )
+    if taxonomy_path is None:
+        taxonomy_path = config_root / "conf/base/gliner_taxonomy.yaml"
+    if not taxonomy_path.exists():
+        raise click.ClickException(f"Taxonomy path not found: {taxonomy_path}")
+    if max_length is None:
+        max_length = int(config.get("model", {}).get("max_length", 512))
+
+    verify_cfg = config.get("verify", {})
+    chg_cfg = verify_cfg.get("chg", {})
+    svs_cfg = verify_cfg.get("svs", {})
+    if batch_size is None:
+        batch_size = int(verify_cfg.get("batch_size", 8))
+    if chg_epochs is None:
+        chg_epochs = int(chg_cfg.get("epochs", 5))
+    if chg_lr is None:
+        chg_lr = float(chg_cfg.get("learning_rate", 1e-3))
+    if chg_regularization is None:
+        chg_regularization = float(chg_cfg.get("regularization", 0.01))
+    if facilitating_threshold is None:
+        facilitating_threshold = float(chg_cfg.get("facilitating_threshold", 0.7))
+    if irrelevant_threshold is None:
+        irrelevant_threshold = float(chg_cfg.get("irrelevant_threshold", 0.3))
+    if svs_max_batches is None:
+        svs_max_batches = int(svs_cfg.get("max_batches", 5))
+    if svs_query_strategy is None:
+        svs_query_strategy = svs_cfg.get("query_strategy", "mean_tokens")
 
     if dataset_post is None:
         derived_post, _ = _derive_tokenized_paths(dataset)

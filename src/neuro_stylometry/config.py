@@ -564,3 +564,31 @@ def load_phase_d_config(
         validate=False,
         base_filename="phase_d.yaml",
     )
+
+
+def load_verify_config(
+    *,
+    mode: Literal["auto", "laptop", "hpc"] = "laptop",
+    experiment_config_path: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """
+    Load Phase D verification configuration from YAML.
+
+    Merge order: base/verify.yaml -> {mode}/verify.yaml -> experiment config
+
+    Args:
+        mode: Hardware mode ("auto", "laptop", or "hpc").
+        experiment_config_path: Optional experiment YAML to merge.
+
+    Returns:
+        Resolved configuration dictionary.
+
+    Raises:
+        FileNotFoundError: If base verify config not found.
+    """
+    return load_pipeline_config(
+        mode=mode,
+        experiment_config_path=experiment_config_path,
+        validate=False,
+        base_filename="verify.yaml",
+    )
