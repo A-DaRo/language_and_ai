@@ -31,7 +31,7 @@ class MultiTaskHead(nn.Module):
         return {task: head(cls_embedding) for task, head in self.heads.items()}
 
     def forward_compiled(self, cls_embedding: torch.Tensor) -> tuple[torch.Tensor, ...]:
-        # cls_embedding = self.dropout(cls_embedding) # DEBUG: Disable dropout
+        cls_embedding = self.dropout(cls_embedding)
         logits = []
         for task in self.task_order:
             logits.append(self.heads[task](cls_embedding))

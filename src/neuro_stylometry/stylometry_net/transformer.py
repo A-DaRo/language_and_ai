@@ -59,14 +59,14 @@ class AffineGuardTransformer(nn.Module):
                 f"Base model {model_name} does not expose embeddings/encoder attributes"
             )
 
-        # self.tokenizer = PhaseDTokenizer(
-        #     model_name=model_name,
-        #     max_length=max_length,
-        #     mask_tokens=mask_tokens,
-        #     taxonomy_path=taxonomy_path,
-        #     enforce_single_token=enforce_single_token_masks,
-        # )
-        # self.tokenizer.resize_model_embeddings(self.model)
+        self.tokenizer = PhaseDTokenizer(
+            model_name=model_name,
+            max_length=max_length,
+            mask_tokens=mask_tokens,
+            taxonomy_path=taxonomy_path,
+            enforce_single_token=enforce_single_token_masks,
+        )
+        self.tokenizer.resize_model_embeddings(self.model)
 
         self.affine_guard: Optional[AffineGuard]
         if projection_matrix_path is not None:
@@ -184,14 +184,15 @@ class AffineGuardTransformer(nn.Module):
         extended_attention_mask = extended_attention_mask.to(dtype=embedding_output.dtype)
         extended_attention_mask = (1.0 - extended_attention_mask) * torch.finfo(embedding_output.dtype).min
         
-        # encoder_outputs = self.model.encoder(
-        #     embedding_output,
-        #     attention_mask=extended_attention_mask,
-        #     head_mask=None,
-        #     output_attentions=False,
-        #     output_hidden_states=False,
-        #     return_dict=True,
-        # )
+        encoder_outputs = self.model.encoder(
+            embedding_output,
+            attention_mask=extended_attention_mask,
+            head_mask=None,
+            output_attentions=False,
+            output_hidden_states=False,
+            return_dict=True,
+        )
 
-        # return encoder_outputs.last_hidden_state[:, 0, :]  # CLS only
-        return embedding_output[:, 0, :] # Fake CLS from embeddings for debugging
+        return encoder_outputs.last_hidden_state[:, 0, :]  # CLS only
+        #DEBUGGING PLACEHOLDER
+        #return embedding_output[:, 0, :] # Fake CLS from embeddings for debugging
