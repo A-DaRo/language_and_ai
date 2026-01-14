@@ -11,6 +11,7 @@ import pyarrow.compute as pc
 import pyarrow.feather as feather
 import torch
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 from ..data_engine.schemas import get_demographic_columns
 from .chg_verifier import CHGVerifier
@@ -174,7 +175,7 @@ def _compute_svs(
     content_mass = 0.0
     batches_seen = 0
 
-    for batch in loader:
+    for batch in tqdm(loader, desc="SVS batches", unit="batch"):
         input_ids = batch["input_ids"].to(next(model.parameters()).device)
         attention_mask = batch["attention_mask"].to(next(model.parameters()).device)
         outputs = model(

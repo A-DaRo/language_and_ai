@@ -8,6 +8,7 @@ from typing import Dict, List, Tuple, Union
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 from .classification_head import SingleTaskHead, MultiTaskHead
 
@@ -104,8 +105,9 @@ class CHGVerifier:
 
         optimizer = torch.optim.Adam([gate_logits], lr=self.learning_rate)
 
-        for _ in range(self.num_epochs):
-            for batch in dataloader:
+        for epoch in range(self.num_epochs):
+            epoch_label = f"CHG epoch {epoch + 1}/{self.num_epochs}"
+            for batch in tqdm(dataloader, desc=epoch_label, unit="batch"):
                 input_ids = batch["input_ids"].to(device)
                 attention_mask = batch["attention_mask"].to(device)
                 labels_dict = {k: v.to(device) for k, v in batch["labels"].items()}
