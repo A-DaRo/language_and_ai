@@ -833,6 +833,24 @@ class PhaseDTrainer:
                 if hasattr(train_iterator, "pause_prefetch")
                 else None
             )
+            rolling_checkpoint_path = checkpoint_dir / "checkpoint_epoch_latest.pt"
+
+            def _save_checkpoint_with_prefetch_pause(path: Path, metadata: Dict[str, Any]) -> None:
+                if prefetcher is not None:
+                    prefetcher.pause_prefetch()
+                    prefetcher.synchronize()
+                try:
+                    save_checkpoint(
+                        path,
+                        model_state=model.state_dict(),
+                        head_state=head.state_dict(),
+                        optimizer_state=optimizer.state_dict(),
+                        scheduler_state=scheduler.state_dict() if scheduler else None,
+                        metadata=metadata,
+                    )
+                finally:
+                    if prefetcher is not None:
+                        prefetcher.resume_prefetch()
             
             # Determine batch count for progress bar - disable total for dynamic batching
             if is_dynamic_batching:
@@ -1083,13 +1101,9 @@ class PhaseDTrainer:
                 step += 1
                 if self.config.save_every_steps and optimizer_step > 0:
                     if optimizer_step % self.config.save_every_steps == 0:
-                        save_checkpoint(
+                        _save_checkpoint_with_prefetch_pause(
                             checkpoint_dir / f"checkpoint_step_{optimizer_step}.pt",
-                            model_state=model.state_dict(),
-                            head_state=head.state_dict(),
-                            optimizer_state=optimizer.state_dict(),
-                            scheduler_state=scheduler.state_dict() if scheduler else None,
-                            metadata={
+                            {
                                 "config": config_to_metadata(self.config),
                                 "label_maps": self.label_maps.maps,
                                 "checkpoint": {
@@ -1122,13 +1136,9 @@ class PhaseDTrainer:
             )
             
             if self.config.save_every_epochs and (epoch + 1) % self.config.save_every_epochs == 0:
-                save_checkpoint(
-                    checkpoint_dir / f"checkpoint_epoch_{epoch + 1}.pt",
-                    model_state=model.state_dict(),
-                    head_state=head.state_dict(),
-                    optimizer_state=optimizer.state_dict(),
-                    scheduler_state=scheduler.state_dict() if scheduler else None,
-                    metadata={
+                _save_checkpoint_with_prefetch_pause(
+                    rolling_checkpoint_path,
+                    {
                         "config": config_to_metadata(self.config),
                         "label_maps": self.label_maps.maps,
                         "checkpoint": {
@@ -1187,13 +1197,9 @@ class PhaseDTrainer:
                 num_classes=self.label_maps.num_classes(),
             )
             save_metadata(run_dir / "phase_d_evaluation_details.json", details)
-        save_checkpoint(
+        _save_checkpoint_with_prefetch_pause(
             checkpoint_path,
-            model_state=model.state_dict(),
-            head_state=head.state_dict(),
-            optimizer_state=optimizer.state_dict(),
-            scheduler_state=scheduler.state_dict() if scheduler else None,
-            metadata={
+            {
                 "config": config_to_metadata(self.config),
                 "label_maps": self.label_maps.maps,
                 "metrics": metrics,

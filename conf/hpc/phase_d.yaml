@@ -11,6 +11,7 @@ training:
   learning_rate: 3e-5
   layerwise_lr_decay: 0.9
   gradient_accumulation_steps: 2
+  save_every_epochs: 10
   
   # FP8 for maximum tensor core throughput (requires TransformerEngine)
   # Falls back to BF16 if TransformerEngine not installed
