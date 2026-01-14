@@ -752,6 +752,7 @@ def verify(
         svs_max_batches = int(svs_cfg.get("max_batches", 5))
     if svs_query_strategy is None:
         svs_query_strategy = svs_cfg.get("query_strategy", "mean_tokens")
+    svs_pos_backend = svs_cfg.get("pos_backend", "lexical")
     svs_use_pos = bool(svs_cfg.get("use_pos", True))
     svs_spacy_model = svs_cfg.get("spacy_model", "en_core_web_sm")
     svs_spacy_use_gpu = bool(svs_cfg.get("spacy_use_gpu", False))
@@ -759,6 +760,9 @@ def verify(
     svs_spacy_batch_size = int(svs_cfg.get("spacy_batch_size", 32))
     svs_spacy_n_process = int(svs_cfg.get("spacy_n_process", 1))
     svs_spacy_disable = list(svs_cfg.get("spacy_disable", []))
+    svs_hf_model = svs_cfg.get("hf_model", "vblagoje/bert-english-uncased-finetuned-pos")
+    svs_hf_device = int(svs_cfg.get("hf_device", 0))
+    svs_hf_batch_size = int(svs_cfg.get("hf_batch_size", 16))
 
     if dataset_post is None:
         derived_post, _ = _derive_tokenized_paths(dataset)
@@ -834,6 +838,7 @@ def verify(
         irrelevant_threshold=irrelevant_threshold,
         svs_max_batches=svs_max_batches,
         svs_query_strategy=svs_query_strategy,
+        svs_pos_backend=svs_pos_backend,
         svs_use_pos=svs_use_pos,
         svs_spacy_model=svs_spacy_model,
         svs_spacy_use_gpu=svs_spacy_use_gpu,
@@ -841,6 +846,9 @@ def verify(
         svs_spacy_batch_size=svs_spacy_batch_size,
         svs_spacy_n_process=svs_spacy_n_process,
         svs_spacy_disable=svs_spacy_disable,
+        svs_hf_model=svs_hf_model,
+        svs_hf_device=svs_hf_device,
+        svs_hf_batch_size=svs_hf_batch_size,
         use_only_labels=use_only,
     )
     click.echo(f"Verification complete. Outputs in: {output_dir}")

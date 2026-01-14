@@ -16,6 +16,7 @@ verify:
   svs:
     max_batches: 20
     query_strategy: "mean_tokens"
+    pos_backend: "hf"
     use_pos: true
     spacy_model: "en_core_web_sm"
     spacy_use_gpu: false
@@ -25,3 +26,6 @@ verify:
     spacy_disable:
       - "ner"
       - "parser"
+    hf_model: "vblagoje/bert-english-uncased-finetuned-pos"
+    hf_device: -1
+    hf_batch_size: 16

@@ -169,6 +169,7 @@ def _compute_svs(
     facilitating_heads,
     max_batches: int,
     query_strategy: str,
+    svs_pos_backend: str,
     svs_use_pos: bool,
     svs_spacy_model: str,
     svs_spacy_use_gpu: bool,
@@ -176,16 +177,23 @@ def _compute_svs(
     svs_spacy_batch_size: int,
     svs_spacy_n_process: int,
     svs_spacy_disable: list[str],
+    svs_hf_model: str,
+    svs_hf_device: int,
+    svs_hf_batch_size: int,
 ) -> SVSResult:
     calculator = SVSCalculator(
         tokenizer,
         use_pos=svs_use_pos,
+        pos_backend=svs_pos_backend,
         spacy_model=svs_spacy_model,
         spacy_use_gpu=svs_spacy_use_gpu,
         spacy_gpu_id=svs_spacy_gpu_id,
         spacy_batch_size=svs_spacy_batch_size,
         spacy_n_process=svs_spacy_n_process,
         spacy_disable=svs_spacy_disable,
+        hf_model=svs_hf_model,
+        hf_device=svs_hf_device,
+        hf_batch_size=svs_hf_batch_size,
     )
     function_mass = 0.0
     content_mass = 0.0
@@ -318,6 +326,7 @@ def run_verification(
     irrelevant_threshold: float,
     svs_max_batches: int,
     svs_query_strategy: str,
+    svs_pos_backend: str,
     svs_use_pos: bool,
     svs_spacy_model: str,
     svs_spacy_use_gpu: bool,
@@ -325,6 +334,9 @@ def run_verification(
     svs_spacy_batch_size: int,
     svs_spacy_n_process: int,
     svs_spacy_disable: list[str],
+    svs_hf_model: str,
+    svs_hf_device: int,
+    svs_hf_batch_size: int,
     use_only_labels: Optional[tuple[str, ...]] = None,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -432,6 +444,7 @@ def run_verification(
             facilitating_heads=classifications["facilitating"],
             max_batches=svs_max_batches,
             query_strategy=svs_query_strategy,
+            svs_pos_backend=svs_pos_backend,
             svs_use_pos=svs_use_pos,
             svs_spacy_model=svs_spacy_model,
             svs_spacy_use_gpu=svs_spacy_use_gpu,
@@ -439,6 +452,9 @@ def run_verification(
             svs_spacy_batch_size=svs_spacy_batch_size,
             svs_spacy_n_process=svs_spacy_n_process,
             svs_spacy_disable=svs_spacy_disable,
+            svs_hf_model=svs_hf_model,
+            svs_hf_device=svs_hf_device,
+            svs_hf_batch_size=svs_hf_batch_size,
         )
         svs_path = output_dir / f"svs_{run_name}.json"
         with svs_path.open("w", encoding="utf-8") as handle:

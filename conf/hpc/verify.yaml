@@ -2,14 +2,10 @@
 
 verify:
   svs:
+    pos_backend: "hf"
     use_pos: true
-    spacy_model: "en_core_web_trf"
-    spacy_use_gpu: true
-    spacy_gpu_id: 0
-    spacy_batch_size: 16
-    spacy_n_process: 1
-    spacy_disable:
-      - "ner"
-      - "parser"
+    hf_model: "vblagoje/bert-english-uncased-finetuned-pos"
+    hf_device: 0
+    hf_batch_size: 16
 
 model: {}
