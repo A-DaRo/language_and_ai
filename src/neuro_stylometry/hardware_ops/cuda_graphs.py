@@ -247,8 +247,9 @@ class GraphCache:
         # Ensure optimizer logic hasn't touched gradients in a way that confuses capture?
         # Since we can't control optimizer here, rely on user doing zero_grad() before run()
         
-        with torch.cuda.graph(graph, **capture_kwargs):
-            output_dict = forward_fn(**input_buffers)
+        with torch.cuda.stream(self._capture_stream):
+            with torch.cuda.graph(graph, **capture_kwargs):
+                output_dict = forward_fn(**input_buffers)
         
         # Keep captured output tensors so replay writes into the same buffers.
         output_buffers = {name: tensor.detach() for name, tensor in output_dict.items()}
