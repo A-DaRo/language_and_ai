@@ -1,12 +1,72 @@
-"""Multi-task classification heads for Phase D."""
+"""Multi-task and single-task classification heads for Phase D."""
 
 from __future__ import annotations
 
-from typing import Dict, Optional
+from typing import Dict, Optional, Union
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+class SingleTaskHead(nn.Module):
+    """Single-task classification head for filtered label training.
+    
+    Use this head when training on a single demographic label via --use-only.
+    Returns a single logits tensor instead of a dict, simplifying the training loop.
+    """
+
+    def __init__(
+        self,
+        *,
+        hidden_dim: int,
+        num_classes: int,
+        task_name: str,
+        dropout: float = 0.1,
+    ) -> None:
+        super().__init__()
+        self.dropout = nn.Dropout(dropout)
+        self.classifier = nn.Linear(hidden_dim, num_classes)
+        self.num_classes = num_classes
+        self.task_name = task_name
+
+    @property
+    def is_binary(self) -> bool:
+        """Whether this is a binary classification task."""
+        return self.num_classes == 2
+
+    def forward(self, cls_embedding: torch.Tensor) -> torch.Tensor:
+        """Forward pass returning single logits tensor.
+        
+        Args:
+            cls_embedding: [batch_size, hidden_dim] CLS token embeddings
+            
+        Returns:
+            Logits tensor of shape [batch_size, num_classes]
+        """
+        cls_embedding = self.dropout(cls_embedding)
+        return self.classifier(cls_embedding)
+
+    def compute_loss(
+        self,
+        logits: torch.Tensor,
+        labels: torch.Tensor,
+        ignore_index: int = -1,
+    ) -> Optional[torch.Tensor]:
+        """Compute cross-entropy loss for single task.
+        
+        Args:
+            logits: [batch_size, num_classes] model predictions
+            labels: [batch_size] ground truth labels
+            ignore_index: Label value to ignore in loss computation
+            
+        Returns:
+            Scalar loss tensor, or None if all labels are ignored
+        """
+        loss = F.cross_entropy(logits, labels, ignore_index=ignore_index)
+        # Handle all-ignored case (returns nan)
+        loss = torch.nan_to_num(loss, nan=0.0)
+        return loss if loss.item() != 0.0 else None
 
 
 class MultiTaskHead(nn.Module):

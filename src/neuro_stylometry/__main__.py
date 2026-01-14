@@ -398,6 +398,17 @@ def validate_handover(artifacts_dir: Path):
     default=False,
     help="Enable manual CUDA graph training path (static bucket capture).",
 )
+@click.option(
+    "--use-only",
+    "use_only_labels",
+    multiple=True,
+    type=click.Choice([
+        "birth_year", "female", "nationality", "political_leaning",
+        "extrovert", "sensing", "feeling", "judging"
+    ]),
+    help="Filter to rows with valid values for specified labels (AND semantics). "
+         "Can be specified multiple times. Single label uses simplified SingleTaskHead.",
+)
 def run_phase_d(
     dataset: Path,
     dataset_post: Path | None,
@@ -411,6 +422,7 @@ def run_phase_d(
     config_path: Path | None,
     data_change: str,
     graph_train: bool,
+    use_only_labels: tuple[str, ...],
 ):
     """Train Phase D baseline and constrained models."""
     from .config import find_config_root, load_phase_d_config
@@ -498,6 +510,13 @@ def run_phase_d(
             click.echo(f"{'=' * 80}\n")
 
         dataset_base = dataset if dataset.exists() else (dataset_post or dataset_masked or dataset)
+        
+        # Convert use_only_labels tuple to None if empty
+        use_only = use_only_labels if use_only_labels else None
+        if use_only:
+            click.echo(f"Label filter: --use-only {' --use-only '.join(use_only)}")
+            if len(use_only) == 1:
+                click.echo(f"  -> Single-task mode enabled for '{use_only[0]}'")
 
         logger.info("Phase D config root: %s", find_config_root("phase_d.yaml"))
         results = run_phase_d_training(
@@ -510,6 +529,7 @@ def run_phase_d(
             config_path=config_path,
             data_change=(data_change == "yes"),
             graph_train=graph_train,
+            use_only_labels=use_only,
         )
 
         click.echo("\n" + "=" * 80)
@@ -621,6 +641,17 @@ def run_phase_d(
     show_default=True,
     help="Query aggregation strategy for SVS",
 )
+@click.option(
+    "--use-only",
+    "use_only_labels",
+    multiple=True,
+    type=click.Choice([
+        "birth_year", "female", "nationality", "political_leaning",
+        "extrovert", "sensing", "feeling", "judging"
+    ]),
+    help="Filter to specific labels (auto-detected from training_metadata.json if not provided). "
+         "Can be specified multiple times.",
+)
 def verify(
     dataset: Path,
     phase_d_dir: Path,
@@ -637,9 +668,57 @@ def verify(
     irrelevant_threshold: float,
     svs_max_batches: int,
     svs_query_strategy: str,
+    use_only_labels: tuple[str, ...],
 ):
     """Run CHG + SVS verification for baseline vs constrained models."""
+    import json as json_module
     from .stylometry_net.verification import run_verification
+    
+    # Auto-detect use_only_labels from training_metadata.json if not provided
+    use_only = use_only_labels if use_only_labels else None
+    
+    if not use_only:
+        # Try to auto-detect from baseline training_metadata.json
+        baseline_meta_path = phase_d_dir / "baseline" / "training_metadata.json"
+        constrained_meta_path = phase_d_dir / "constrained" / "training_metadata.json"
+        
+        baseline_labels = None
+        constrained_labels = None
+        
+        if baseline_meta_path.exists():
+            try:
+                with open(baseline_meta_path) as f:
+                    baseline_meta = json_module.load(f)
+                    label_filter = baseline_meta.get("label_filter", {})
+                    baseline_labels = label_filter.get("use_only")
+            except Exception as e:
+                logger.warning(f"Failed to load baseline metadata: {e}")
+        
+        if constrained_meta_path.exists():
+            try:
+                with open(constrained_meta_path) as f:
+                    constrained_meta = json_module.load(f)
+                    label_filter = constrained_meta.get("label_filter", {})
+                    constrained_labels = label_filter.get("use_only")
+            except Exception as e:
+                logger.warning(f"Failed to load constrained metadata: {e}")
+        
+        # Check for consistency between baseline and constrained
+        if baseline_labels and constrained_labels and baseline_labels != constrained_labels:
+            logger.warning(
+                f"⚠️ Baseline and constrained models were trained with different label filters:\n"
+                f"  Baseline: {baseline_labels}\n"
+                f"  Constrained: {constrained_labels}\n"
+                "Using baseline filter for verification."
+            )
+        
+        # Use detected labels (prefer baseline)
+        use_only = tuple(baseline_labels) if baseline_labels else None
+        
+        if use_only:
+            click.echo(f"Auto-detected label filter from training metadata: {list(use_only)}")
+        else:
+            click.echo("No label filter detected - using all demographic labels")
 
     run_verification(
         dataset_path=dataset,
@@ -657,6 +736,7 @@ def verify(
         irrelevant_threshold=irrelevant_threshold,
         svs_max_batches=svs_max_batches,
         svs_query_strategy=svs_query_strategy,
+        use_only_labels=use_only,
     )
     click.echo(f"Verification complete. Outputs in: {output_dir}")
 

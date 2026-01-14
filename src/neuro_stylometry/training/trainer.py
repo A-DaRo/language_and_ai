@@ -17,7 +17,7 @@ import logging
 import math
 import json
 from pathlib import Path
-from typing import Dict, Optional, Any, Union
+from typing import Dict, Optional, Any, Union, List
 
 import numpy as np
 import torch
@@ -39,7 +39,7 @@ from ..hardware_ops.cuda_graphs import (
     GraphCache,
     GraphCacheConfig,
 )
-from ..stylometry_net.classification_head import MultiTaskHead
+from ..stylometry_net.classification_head import MultiTaskHead, SingleTaskHead
 from ..stylometry_net.phase_d_dataset import (
     DevicePrefetcher,
     FastCollator,
@@ -124,8 +124,6 @@ class PhaseDTrainConfig:
     use_aot_mode: bool = True  # Use pre-tokenized data + FastCollator
     use_torch_compile: bool = True  # Apply torch.compile to model
     torch_compile_mode: str = "reduce-overhead"  # CUDA Graph optimization
-    torch_compile_dynamic: bool = False
-    torch_compile_backend: str = "inductor"
     compile_train_step: bool = False  # Compile full train step (forward+loss+backward)
     torch_compile_disable_cudagraphs: bool = False
     use_cuda_graph_training: bool = False  # Manual CUDA-graph training path
@@ -134,6 +132,9 @@ class PhaseDTrainConfig:
     use_device_prefetch: bool = True  # Async H2D transfers
     quantize_step: int = DEFAULT_QUANTIZE_STEP  # Snap-to-Grid step (16)
     token_budget: int = 65536  # Default token budget for quantized sampler
+    
+    # Label filtering for single-label or subset training
+    use_only_labels: Optional[tuple[str, ...]] = None  # Filter to specific demographic labels
 
 
 class PhaseDTrainer:
@@ -186,18 +187,7 @@ class PhaseDTrainer:
         self._use_device_prefetch = bool(config.use_device_prefetch)
         self._use_torch_compile = bool(config.use_torch_compile)
         self._torch_compile_mode = str(config.torch_compile_mode)
-        self._torch_compile_dynamic = bool(config.torch_compile_dynamic)
-        self._torch_compile_backend = str(config.torch_compile_backend)
-        self._compile_train_step = bool(config.compile_train_step)
         self._torch_compile_disable_cudagraphs = bool(config.torch_compile_disable_cudagraphs)
-        self._use_manual_cuda_graphs = bool(config.use_cuda_graph_training)
-        if self._use_manual_cuda_graphs:
-            if self._use_torch_compile:
-                logger.info("Manual CUDA graph training enabled; disabling torch.compile.")
-                self._use_torch_compile = False
-            if self._compile_train_step:
-                logger.info("Manual CUDA graph training enabled; disabling compile_train_step.")
-                self._compile_train_step = False
         self._use_fused_optimizer = bool(config.use_fused_optimizer)
         self._quantize_step = int(config.quantize_step)
         self._token_budget = int(config.token_budget)
@@ -228,15 +218,26 @@ class PhaseDTrainer:
         shuffle: bool = False,
         enable_dynamic_batching: bool = False,
     ) -> tuple[DataLoader, PhaseDLabelMaps]:
+        # Determine label_fields based on use_only_labels filter
+        use_only = self.config.use_only_labels
+        if use_only:
+            label_fields = list(use_only)
+        else:
+            label_fields = get_demographic_columns()
+        
         dataset = PhaseDDataset(
             self.config.dataset_path,
             text_field=text_field,
-            label_fields=get_demographic_columns(),
+            label_fields=label_fields,
             label_maps=label_maps,
             split=split,
             split_ratios=self.config.split_ratios,
             use_aot_tokens=self._aot_mode_requested,
+            use_only_labels=list(use_only) if use_only else None,
         )
+        
+        # Store filter metadata for later checkpoint saving
+        self._dataset_filter_metadata = dataset.get_filter_metadata()
         
         # Determine collator based on dataset mode
         aot_mode_active = dataset.is_aot_mode
@@ -382,7 +383,9 @@ class PhaseDTrainer:
             )
         return loader, dataset.label_maps
 
-    def _build_model(self, *, use_affine_guard: bool) -> tuple[AffineGuardTransformer, MultiTaskHead]:
+    def _build_model(
+        self, *, use_affine_guard: bool
+    ) -> tuple[AffineGuardTransformer, Union[MultiTaskHead, SingleTaskHead]]:
         if use_affine_guard:
             model = AffineGuardTransformer.from_phase_a(
                 self.config.artifacts_dir,
@@ -399,47 +402,73 @@ class PhaseDTrainer:
             )
 
         model = model.to(self.device)
-        head = MultiTaskHead(
-            hidden_dim=model.config.hidden_size,
-            num_labels_per_task=self.label_maps.num_classes(),
-        ).to(self.device)
+        
+        # Determine head type based on use_only_labels
+        use_only = self.config.use_only_labels
+        num_classes_per_task = self.label_maps.num_classes()
+        
+        if use_only and len(use_only) == 1:
+            # Single-label mode: use SingleTaskHead
+            task_name = use_only[0]
+            num_classes = num_classes_per_task[task_name]
+            head = SingleTaskHead(
+                hidden_dim=model.config.hidden_size,
+                num_classes=num_classes,
+                task_name=task_name,
+            ).to(self.device)
+            self._single_task_mode = True
+            self._single_task_name = task_name
+            logger.info(
+                f"Single-task mode: training on '{task_name}' with {num_classes} classes "
+                f"(is_binary={head.is_binary})"
+            )
+        else:
+            # Multi-task mode: use MultiTaskHead
+            head = MultiTaskHead(
+                hidden_dim=model.config.hidden_size,
+                num_labels_per_task=num_classes_per_task,
+            ).to(self.device)
+            self._single_task_mode = False
+            self._single_task_name = None
+            if use_only:
+                logger.info(
+                    f"Multi-task mode with filtered labels: {list(use_only)} "
+                    f"({len(use_only)} tasks)"
+                )
+            else:
+                logger.info(
+                    f"Multi-task mode: training on all {len(num_classes_per_task)} demographic tasks"
+                )
         
         # Apply torch.compile for kernel optimization
         if self._use_torch_compile and self.device.type == "cuda":
-            if self._compile_train_step:
-                logger.info("compile_train_step enabled; skipping model-only torch.compile")
-            else:
-                # Override to "default" mode if CUDA Graphs are disabled
-                # "reduce-overhead" uses CUDA Graphs which can cause tensor overwrite errors
-                # "default" still provides kernel fusion benefits without graph capture
-                effective_mode = (
-                    "default" if self._torch_compile_disable_cudagraphs
-                    else self._torch_compile_mode
+            # Override to "default" mode if CUDA Graphs are disabled
+            # "reduce-overhead" uses CUDA Graphs which can cause tensor overwrite errors
+            # "default" still provides kernel fusion benefits without graph capture
+            effective_mode = (
+                "default" if self._torch_compile_disable_cudagraphs 
+                else self._torch_compile_mode
+            )
+            logger.info(
+                f"Applying torch.compile to transformer (mode={effective_mode}, "
+                f"cudagraphs={'disabled' if self._torch_compile_disable_cudagraphs else 'enabled'})"
+            )
+            try:
+                # Compile the transformer backbone
+                # mode="default": kernel fusion only (stable)
+                # mode="reduce-overhead": CUDA Graph capture (faster but can cause tensor aliasing)
+                model = torch.compile(
+                    model,
+                    mode=effective_mode,
+                    fullgraph=False,  # Allow graph breaks for flexibility
                 )
-                logger.info(
-                    "Applying torch.compile to transformer "
-                    f"(mode={effective_mode}, backend={self._torch_compile_backend}, "
-                    f"dynamic={self._torch_compile_dynamic}, "
-                    f"cudagraphs={'disabled' if self._torch_compile_disable_cudagraphs else 'enabled'})"
-                )
-                try:
-                    # Compile the transformer backbone
-                    # mode="default": kernel fusion only (stable)
-                    # mode="reduce-overhead": CUDA Graph capture (faster but can cause tensor aliasing)
-                    model = torch.compile(
-                        model,
-                        mode=effective_mode,
-                        fullgraph=False,  # Allow graph breaks for flexibility
-                        dynamic=self._torch_compile_dynamic,
-                        backend=self._torch_compile_backend,
-                    )
-                    # DO NOT compile head:
-                    # - Head is <5% of compute (single linear per task)
-                    # - Dict return can cause CUDA Graph tensor aliasing
-                    # - Stability > marginal speedup
-                    logger.info("torch.compile applied to transformer only (head excluded)")
-                except Exception as e:
-                    logger.warning(f"torch.compile failed, continuing without: {e}")
+                # DO NOT compile head:
+                # - Head is <5% of compute (single linear per task)
+                # - Dict return can cause CUDA Graph tensor aliasing
+                # - Stability > marginal speedup
+                logger.info("torch.compile applied to transformer only (head excluded)")
+            except Exception as e:
+                logger.warning(f"torch.compile failed, continuing without: {e}")
         
         return model, head
 
@@ -471,7 +500,7 @@ class PhaseDTrainer:
         self,
         *,
         model: AffineGuardTransformer,
-        head: MultiTaskHead,
+        head: Union[MultiTaskHead, SingleTaskHead],
         loader: DataLoader,
         num_classes: Dict[str, int],
     ) -> Dict[str, Dict[str, float]]:
@@ -509,9 +538,17 @@ class PhaseDTrainer:
                 outputs = model(input_ids=input_ids, attention_mask=attention_mask)
                 logits = head(outputs["cls_embedding"])
 
-            for task, task_logits_batch in logits.items():
-                task_logits[task].append(task_logits_batch.detach().cpu())
-                task_labels[task].append(labels[task].detach().cpu())
+            # Handle single-task vs multi-task evaluation
+            if self._single_task_mode:
+                # SingleTaskHead returns tensor, convert to dict format
+                task_name = self._single_task_name
+                task_logits[task_name].append(logits.detach().cpu())
+                task_labels[task_name].append(labels[task_name].detach().cpu())
+            else:
+                # MultiTaskHead returns dict
+                for task, task_logits_batch in logits.items():
+                    task_logits[task].append(task_logits_batch.detach().cpu())
+                    task_labels[task].append(labels[task].detach().cpu())
         
         eval_pbar.close()
 
@@ -535,7 +572,7 @@ class PhaseDTrainer:
         self,
         *,
         model: AffineGuardTransformer,
-        head: MultiTaskHead,
+        head: Union[MultiTaskHead, SingleTaskHead],
         loader: DataLoader,
         num_classes: Dict[str, int],
     ) -> Dict[str, Dict[str, Any]]:
@@ -573,9 +610,17 @@ class PhaseDTrainer:
                 outputs = model(input_ids=input_ids, attention_mask=attention_mask)
                 logits = head(outputs["cls_embedding"])
 
-            for task, task_logits_batch in logits.items():
-                task_logits[task].append(task_logits_batch.detach().cpu())
-                task_labels[task].append(labels[task].detach().cpu())
+            # Handle single-task vs multi-task evaluation
+            if self._single_task_mode:
+                # SingleTaskHead returns tensor, convert to dict format
+                task_name = self._single_task_name
+                task_logits[task_name].append(logits.detach().cpu())
+                task_labels[task_name].append(labels[task_name].detach().cpu())
+            else:
+                # MultiTaskHead returns dict
+                for task, task_logits_batch in logits.items():
+                    task_logits[task].append(task_logits_batch.detach().cpu())
+                    task_labels[task].append(labels[task].detach().cpu())
         
         eval_pbar.close()
 
@@ -598,7 +643,7 @@ class PhaseDTrainer:
         self,
         *,
         model: AffineGuardTransformer,
-        head: MultiTaskHead,
+        head: Union[MultiTaskHead, SingleTaskHead],
         loader: DataLoader,
         eval_loader: Optional[DataLoader],
         run_dir: Path,
@@ -628,7 +673,6 @@ class PhaseDTrainer:
                 max_cached_graphs=int(cg_conf.get("max_cached_graphs", 16)),
                 capture_pool_size_mb=int(cg_conf.get("capture_pool_size_mb", 256)),
                 use_cuda_graph_memory_pool=bool(cg_conf.get("use_cuda_graph_memory_pool", True)),
-                clone_outputs=bool(cg_conf.get("clone_outputs", True)),
             )
             graph_cache = GraphCache(config=cache_config)
             graph_trainer = GraphAwareTraining(
@@ -645,11 +689,6 @@ class PhaseDTrainer:
                     "Switching effective mode to 'default' to prevent double-graphing."
                 )
                 self._torch_compile_mode = "default"
-            if self._compile_train_step:
-                logger.warning(
-                    "compile_train_step ignored because use_cuda_graph_training is enabled."
-                )
-                self._compile_train_step = False
 
         run_dir.mkdir(parents=True, exist_ok=True)
         checkpoint_dir = run_dir / "checkpoints"
@@ -714,72 +753,6 @@ class PhaseDTrainer:
             if scheduler_state:
                 scheduler.load_state_dict(scheduler_state)
 
-        if self._compile_train_step and not self._use_torch_compile:
-            logger.warning(
-                "compile_train_step enabled but use_torch_compile is false; disabling."
-            )
-            self._compile_train_step = False
-
-        effective_compile_mode = (
-            "default" if self._torch_compile_disable_cudagraphs else self._torch_compile_mode
-        )
-
-        compiled_step_fn = None
-        label_keys: list[str] = []
-        if self._compile_train_step:
-            if hasattr(head, "task_order"):
-                label_keys = list(head.task_order)
-            if not label_keys:
-                logger.warning(
-                    "compile_train_step enabled but task order is unavailable; disabling."
-                )
-                self._compile_train_step = False
-
-        if self._compile_train_step:
-            if self.device.type != "cuda":
-                logger.warning(
-                    "compile_train_step enabled but CUDA is unavailable; disabling."
-                )
-                self._compile_train_step = False
-            else:
-                def _compiled_step(
-                    input_ids: torch.Tensor,
-                    attention_mask: torch.Tensor,
-                    *label_tensors: torch.Tensor,
-                ) -> torch.Tensor:
-                    outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-                    cls_embedding = outputs["cls_embedding"].clone()
-                    logits = head(cls_embedding)
-                    label_dict = {
-                        key: label for key, label in zip(label_keys, label_tensors)
-                    }
-                    loss = head.compute_loss(logits, label_dict)
-                    if loss is None:
-                        return torch.zeros((), device=input_ids.device)
-                    scaled_loss = loss / accum_steps
-                    scaled_loss.backward()
-                    return scaled_loss
-
-                try:
-                    compiled_step_fn = torch.compile(
-                        _compiled_step,
-                        mode=effective_compile_mode,
-                        fullgraph=False,
-                        dynamic=self._torch_compile_dynamic,
-                        backend=self._torch_compile_backend,
-                    )
-                    logger.info(
-                        "torch.compile applied to full train step "
-                        f"(mode={effective_compile_mode}, "
-                        f"backend={self._torch_compile_backend}, "
-                        f"dynamic={self._torch_compile_dynamic})"
-                    )
-                except Exception as e:
-                    logger.warning(
-                        f"torch.compile full train step failed, falling back: {e}"
-                    )
-                    compiled_step_fn = None
-
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
         best_score = None
         bad_epochs = 0
@@ -828,38 +801,12 @@ class PhaseDTrainer:
                 if use_device_prefetch
                 else loader
             )
-            prefetcher = (
-                train_iterator
-                if hasattr(train_iterator, "pause_prefetch")
-                else None
-            )
-            rolling_checkpoint_path = checkpoint_dir / "checkpoint_epoch_latest.pt"
-
-            def _save_checkpoint_with_prefetch_pause(path: Path, metadata: Dict[str, Any]) -> None:
-                if prefetcher is not None:
-                    prefetcher.pause_prefetch()
-                    prefetcher.synchronize()
-                try:
-                    save_checkpoint(
-                        path,
-                        model_state=model.state_dict(),
-                        head_state=head.state_dict(),
-                        optimizer_state=optimizer.state_dict(),
-                        scheduler_state=scheduler.state_dict() if scheduler else None,
-                        metadata=metadata,
-                    )
-                finally:
-                    if prefetcher is not None:
-                        prefetcher.resume_prefetch()
             
-            # Determine batch count for progress bar - disable total for dynamic batching
-            if is_dynamic_batching:
-                epoch_total = None
-            else:
-                try:
-                    epoch_total = len(loader)  # Re-check each epoch (samplers may update)
-                except TypeError:
-                    epoch_total = steps_per_epoch  # Use cached estimate or None
+            # Determine batch count for progress bar - prefer loader length, handle dynamic cases
+            try:
+                epoch_total = len(loader)  # Re-check each epoch (samplers may update)
+            except TypeError:
+                epoch_total = steps_per_epoch  # Use cached estimate or None
             
             # Progress bar for batches within epoch - single persistent bar
             # Explicitly pass total to avoid tqdm guessing wrong on wrapped iterators
@@ -911,16 +858,11 @@ class PhaseDTrainer:
                     if graph_trainer is not None and graph_trainer.is_enabled:
                          # 1. Prepare labels ordered by head.task_order inside graph trainer
                          labels_dict = labels
-                         capture_guard = {"active": False}
                          
                          def _pre_capture_hook() -> bool:
                              if accum_counter != 0:
                                  return False
-                             if prefetcher is not None:
-                                 prefetcher.pause_prefetch()
-                                 prefetcher.synchronize()
                              optimizer.zero_grad(set_to_none=True)
-                             capture_guard["active"] = True
                              return True
                          
                          # 2. Timer (strided)
@@ -930,21 +872,16 @@ class PhaseDTrainer:
                              # Enclose in autocast so capture records correct precision
                              autocast_ctx = self._get_autocast_context()
                              with autocast_ctx:
-                                 try:
-                                     loss_tensor, valid_flag, did_run = graph_trainer.run(
-                                         model=model,
-                                         head=head,
-                                         input_ids=input_ids,
-                                         attention_mask=attention_mask,
-                                         labels=labels_dict,
-                                         accum_steps=accum_steps,
-                                         pad_token_id=1,
-                                         pre_capture_hook=_pre_capture_hook,
-                                     )
-                                 finally:
-                                     if capture_guard["active"] and prefetcher is not None:
-                                         prefetcher.resume_prefetch()
-                                         capture_guard["active"] = False
+                                 loss_tensor, valid_flag, did_run = graph_trainer.run(
+                                     model=model,
+                                     head=head,
+                                     input_ids=input_ids,
+                                     attention_mask=attention_mask,
+                                     labels=labels_dict,
+                                     accum_steps=accum_steps,
+                                     pad_token_id=1,
+                                     pre_capture_hook=_pre_capture_hook,
+                                 )
 
                              # 4. Check validity (if valid_flag is 0, loss was NaN/skipped)
                              if valid_flag.item() == 0:
@@ -998,34 +935,29 @@ class PhaseDTrainer:
                         # Use precision-aware autocast context
                         autocast_ctx = self._get_autocast_context()
                         with autocast_ctx:
-                            if compiled_step_fn is not None:
-                                try:
-                                    label_tensors = tuple(labels[key] for key in label_keys)
-                                except KeyError as exc:
-                                    raise RuntimeError(
-                                        f"Missing label key for compile_train_step: {exc}"
-                                    ) from exc
-                                loss = compiled_step_fn(
-                                    input_ids,
-                                    attention_mask,
-                                    *label_tensors,
-                                )
+                            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+                            # Clone cls_embedding to break CUDA Graph memory reuse dependency.
+                            # Without this, the backward pass may try to read tensors that have
+                            # been overwritten by a subsequent CUDA Graph execution.
+                            cls_embedding = outputs["cls_embedding"].clone()
+                            logits = head(cls_embedding)
+                            
+                            # Handle single-task vs multi-task loss computation
+                            if self._single_task_mode:
+                                # SingleTaskHead: labels is dict, need to extract single task
+                                task_labels = labels[self._single_task_name]
+                                loss = head.compute_loss(logits, task_labels)
                             else:
-                                outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-                                # Clone cls_embedding to break CUDA Graph memory reuse dependency.
-                                # Without this, the backward pass may try to read tensors that have
-                                # been overwritten by a subsequent CUDA Graph execution.
-                                cls_embedding = outputs["cls_embedding"].clone()
-                                logits = head(cls_embedding)
+                                # MultiTaskHead: standard dict-based loss
                                 loss = head.compute_loss(logits, labels)
 
-                                if loss is None:
-                                    return None, False, True  # loss_value, did_step, skip_batch
+                        if loss is None:
+                            return None, False, True  # loss_value, did_step, skip_batch
 
-                                # Async loss logging: only extract scalar when needed for telemetry/logging
-                                # This avoids GPU→CPU sync on every batch, significantly improving throughput
-                                loss = loss / accum_steps
-                                loss.backward()
+                        # Async loss logging: only extract scalar when needed for telemetry/logging
+                        # This avoids GPU→CPU sync on every batch, significantly improving throughput
+                        loss = loss / accum_steps
+                        loss.backward()
                         
                         # Extract loss value only when we need it (strided telemetry or progress bar)
                         loss_value = float(loss.detach().item()) if should_measure else None
@@ -1101,9 +1033,13 @@ class PhaseDTrainer:
                 step += 1
                 if self.config.save_every_steps and optimizer_step > 0:
                     if optimizer_step % self.config.save_every_steps == 0:
-                        _save_checkpoint_with_prefetch_pause(
+                        save_checkpoint(
                             checkpoint_dir / f"checkpoint_step_{optimizer_step}.pt",
-                            {
+                            model_state=model.state_dict(),
+                            head_state=head.state_dict(),
+                            optimizer_state=optimizer.state_dict(),
+                            scheduler_state=scheduler.state_dict() if scheduler else None,
+                            metadata={
                                 "config": config_to_metadata(self.config),
                                 "label_maps": self.label_maps.maps,
                                 "checkpoint": {
@@ -1136,9 +1072,13 @@ class PhaseDTrainer:
             )
             
             if self.config.save_every_epochs and (epoch + 1) % self.config.save_every_epochs == 0:
-                _save_checkpoint_with_prefetch_pause(
-                    rolling_checkpoint_path,
-                    {
+                save_checkpoint(
+                    checkpoint_dir / f"checkpoint_epoch_{epoch + 1}.pt",
+                    model_state=model.state_dict(),
+                    head_state=head.state_dict(),
+                    optimizer_state=optimizer.state_dict(),
+                    scheduler_state=scheduler.state_dict() if scheduler else None,
+                    metadata={
                         "config": config_to_metadata(self.config),
                         "label_maps": self.label_maps.maps,
                         "checkpoint": {
@@ -1197,11 +1137,45 @@ class PhaseDTrainer:
                 num_classes=self.label_maps.num_classes(),
             )
             save_metadata(run_dir / "phase_d_evaluation_details.json", details)
-        _save_checkpoint_with_prefetch_pause(
+        
+        # Build label filter metadata for training_metadata.json
+        filter_metadata = getattr(self, "_dataset_filter_metadata", None) or {
+            "use_only": None,
+            "semantics": None,
+            "original_rows": None,
+            "filtered_rows": None,
+        }
+        model_variant = "single_task" if self._single_task_mode else "multi_task"
+        
+        # Build training metadata with label filter info
+        training_metadata = {
+            "label_filter": filter_metadata,
+            "label_maps": self.label_maps.maps,
+            "model_variant": model_variant,
+            "task_name": self._single_task_name if self._single_task_mode else None,
+            "num_tasks": 1 if self._single_task_mode else len(self.label_maps.maps),
+            "training_complete": True,
+            "final_step": step,
+            "final_optimizer_step": optimizer_step,
+            "num_epochs": self.config.num_epochs,
+        }
+        
+        # Save training_metadata.json for verify command auto-detection
+        training_metadata_path = run_dir / "training_metadata.json"
+        save_metadata(training_metadata_path, training_metadata)
+        logger.info(f"Saved training metadata: {training_metadata_path}")
+        
+        save_checkpoint(
             checkpoint_path,
-            {
+            model_state=model.state_dict(),
+            head_state=head.state_dict(),
+            optimizer_state=optimizer.state_dict(),
+            scheduler_state=scheduler.state_dict() if scheduler else None,
+            metadata={
                 "config": config_to_metadata(self.config),
                 "label_maps": self.label_maps.maps,
+                "label_filter": filter_metadata,
+                "model_variant": model_variant,
                 "metrics": metrics,
                 "checkpoint": {
                     "epoch": self.config.num_epochs,
