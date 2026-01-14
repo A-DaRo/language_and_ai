@@ -328,19 +328,7 @@ def validate_handover(artifacts_dir: Path):
     "--dataset",
     type=click.Path(path_type=Path),
     required=True,
-    help="Tokenized dataset path or base path for auto-preprocess outputs",
-)
-@click.option(
-    "--dataset-post",
-    type=click.Path(path_type=Path),
-    default=None,
-    help="Tokenized dataset for raw posts (post)",
-)
-@click.option(
-    "--dataset-masked",
-    type=click.Path(path_type=Path),
-    default=None,
-    help="Tokenized dataset for masked posts (post_masked)",
+    help="Path to tokenized_dataset.arrow (created via --preprocess or preprocess-tokens)",
 )
 @click.option(
     "--output-dir",
@@ -364,13 +352,13 @@ def validate_handover(artifacts_dir: Path):
     "--preprocess/--no-preprocess",
     default=True,
     show_default=True,
-    help="Auto-preprocess tokenized datasets when missing",
+    help="Auto-preprocess dataset if --dataset doesn't exist",
 )
 @click.option(
     "--pre-pad/--no-pre-pad",
-    default=False,
+    default=True,
     show_default=True,
-    help="Pre-pad sequences during auto-preprocess for zero-copy collation",
+    help="Use pre-padding for tokenization (recommended for HPC mode)",
 )
 @click.option(
     "--mode",
@@ -392,124 +380,79 @@ def validate_handover(artifacts_dir: Path):
     show_default=True,
     help="Rewrite dataset split column for small test runs",
 )
-@click.option(
-    "--graph-train",
-    is_flag=True,
-    default=False,
-    help="Enable manual CUDA graph training path (static bucket capture).",
-)
 def run_phase_d(
     dataset: Path,
-    dataset_post: Path | None,
-    dataset_masked: Path | None,
     output_dir: Path,
     artifacts_dir: Path,
     source_dataset: Path | None,
     preprocess: bool,
-    pre_pad: bool,
     mode: str,
     config_path: Path | None,
     data_change: str,
-    graph_train: bool,
+    pre_pad: bool,
 ):
     """Train Phase D baseline and constrained models."""
     from .config import find_config_root, load_phase_d_config
-    from .data_engine.tokenization import preprocess_dataset
     from .phase_d_pipeline import run_phase_d_training
 
     try:
-        def _derive_tokenized_paths(base_path: Path) -> tuple[Path, Path]:
-            if base_path.suffix:
-                return (
-                    base_path.with_name(f"{base_path.stem}_post{base_path.suffix}"),
-                    base_path.with_name(f"{base_path.stem}_post_masked{base_path.suffix}"),
-                )
-            return (
-                base_path / "tokenized_post.arrow",
-                base_path / "tokenized_post_masked.arrow",
-            )
-
-        if preprocess:
-            if dataset_post is None and dataset_masked is None:
-                dataset_post, dataset_masked = _derive_tokenized_paths(dataset)
-            else:
-                dataset_post = dataset_post or dataset
-                dataset_masked = dataset_masked or dataset
-        else:
-            dataset_post = dataset_post or dataset
-            dataset_masked = dataset_masked or dataset
-
-        if not dataset_post.exists() or not dataset_masked.exists():
+        # Check if dataset exists; if not and preprocess enabled, create it
+        if not dataset.exists():
             if not preprocess:
-                missing = []
-                if not dataset_post.exists():
-                    missing.append(str(dataset_post))
-                if not dataset_masked.exists():
-                    missing.append(str(dataset_masked))
                 raise click.ClickException(
-                    "Tokenized dataset(s) not found:\n"
-                    + "\n".join(f"  - {path}" for path in missing)
-                    + "\nEnable --preprocess or provide existing datasets."
+                    f"Dataset not found: {dataset}\n"
+                    f"Either provide an existing tokenized dataset or enable --preprocess"
                 )
-
+            
+            # Determine source dataset path
             if source_dataset is None:
                 source_dataset = artifacts_dir / "clean_dataset.arrow"
+            
             if not source_dataset.exists():
                 raise click.ClickException(
                     f"Source dataset not found: {source_dataset}\n"
                     f"Provide --source-dataset or ensure clean_dataset.arrow exists in artifacts-dir"
                 )
-
+            
+            # Load config to get model settings
             config = load_phase_d_config(mode=mode, experiment_config_path=config_path)
-            model_name = config.get("model", {}).get("name", "roberta-base")
-            max_length = config.get("model", {}).get("max_length", 512)
-
+            model_name = config.get('model', {}).get('name', 'roberta-base')
+            max_length = config.get('model', {}).get('max_length', 512)
+            
             click.echo(f"\n{'=' * 80}")
-            click.echo("AUTO-PREPROCESSING: Creating tokenized datasets")
+            click.echo("AUTO-PREPROCESSING: Creating tokenized dataset")
             click.echo(f"{'=' * 80}")
             click.echo(f"Source: {source_dataset}")
+            click.echo(f"Output: {dataset}")
             click.echo(f"Model: {model_name}")
             click.echo(f"Max length: {max_length}")
-            click.echo(f"Pre-pad: {pre_pad}")
-
-            for text_field, output_path in (
-                ("post", dataset_post),
-                ("post_masked", dataset_masked),
-            ):
-                if output_path.exists():
-                    click.echo(f"Skipping {text_field}: exists at {output_path}")
-                    continue
-                click.echo(f"\nTokenizing '{text_field}' -> {output_path}")
-                stats = preprocess_dataset(
-                    input_path=source_dataset,
-                    output_path=output_path,
-                    model_name=model_name,
-                    max_length=max_length,
-                    text_field=text_field,
-                    num_workers=None,
-                    pre_pad=pre_pad,
-                )
-                click.echo(
-                    "Tokenization complete: "
-                    f"{stats['num_rows']} rows in {stats['elapsed_seconds']:.1f}s "
-                    f"(pre_pad={stats['pre_pad']})"
-                )
-
+            
+            # Import and run preprocessing
+            import sys
+            sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent / "scripts"))
+            from scripts.preprocess_tokens import preprocess_dataset
+            
+            stats = preprocess_dataset(
+                input_path=source_dataset,
+                output_path=dataset,
+                model_name=model_name,
+                max_length=max_length,
+                text_field="post_masked",  # Tokenize masked text for constrained model
+                num_workers=None,  # Auto-detect
+                pre_pad=pre_pad,
+            )
+            
+            click.echo(f"\nTokenization complete: {stats['num_rows']} rows in {stats['elapsed_seconds']:.1f}s")
             click.echo(f"{'=' * 80}\n")
-
-        dataset_base = dataset if dataset.exists() else (dataset_post or dataset_masked or dataset)
 
         logger.info("Phase D config root: %s", find_config_root("phase_d.yaml"))
         results = run_phase_d_training(
-            dataset_path=dataset_base,
-            dataset_path_post=dataset_post,
-            dataset_path_masked=dataset_masked,
+            dataset_path=dataset,
             output_dir=output_dir,
             artifacts_dir=artifacts_dir,
             mode=mode,
             config_path=config_path,
             data_change=(data_change == "yes"),
-            graph_train=graph_train,
         )
 
         click.echo("\n" + "=" * 80)
