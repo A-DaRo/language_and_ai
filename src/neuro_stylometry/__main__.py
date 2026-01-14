@@ -553,6 +553,18 @@ def run_phase_d(
     help="Phase D dataset path (clean_dataset.arrow)",
 )
 @click.option(
+    "--dataset-post",
+    type=click.Path(exists=True, path_type=Path),
+    default=None,
+    help="Tokenized dataset for raw posts (post)",
+)
+@click.option(
+    "--dataset-masked",
+    type=click.Path(exists=True, path_type=Path),
+    default=None,
+    help="Tokenized dataset for masked posts (post_masked)",
+)
+@click.option(
     "--phase-d-dir",
     type=click.Path(exists=True, path_type=Path),
     default=Path("artifacts/phase_d"),
@@ -654,6 +666,8 @@ def run_phase_d(
 )
 def verify(
     dataset: Path,
+    dataset_post: Path | None,
+    dataset_masked: Path | None,
     phase_d_dir: Path,
     artifacts_dir: Path,
     output_dir: Path,
@@ -674,6 +688,27 @@ def verify(
     import json as json_module
     from .stylometry_net.verification import run_verification
     
+    def _derive_tokenized_paths(base_path: Path) -> tuple[Path, Path]:
+        if base_path.suffix:
+            return (
+                base_path.with_name(f"{base_path.stem}_post{base_path.suffix}"),
+                base_path.with_name(f"{base_path.stem}_post_masked{base_path.suffix}"),
+            )
+        return (
+            base_path / "tokenized_post.arrow",
+            base_path / "tokenized_post_masked.arrow",
+        )
+
+    if dataset_post is None:
+        derived_post, _ = _derive_tokenized_paths(dataset)
+        if derived_post.exists():
+            dataset_post = derived_post
+
+    if dataset_masked is None:
+        _, derived_masked = _derive_tokenized_paths(dataset)
+        if derived_masked.exists():
+            dataset_masked = derived_masked
+
     # Auto-detect use_only_labels from training_metadata.json if not provided
     use_only = use_only_labels if use_only_labels else None
     
@@ -722,6 +757,8 @@ def verify(
 
     run_verification(
         dataset_path=dataset,
+        dataset_path_post=dataset_post,
+        dataset_path_masked=dataset_masked,
         artifacts_dir=artifacts_dir,
         phase_d_dir=phase_d_dir,
         output_dir=output_dir,

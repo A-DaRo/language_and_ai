@@ -13,7 +13,12 @@ from torch.utils.data import DataLoader
 from ..data_engine.schemas import get_demographic_columns
 from .chg_verifier import CHGVerifier
 from .classification_head import MultiTaskHead, SingleTaskHead
-from .phase_d_dataset import PhaseDCollator, PhaseDDataset, load_label_maps
+from .phase_d_dataset import (
+    PhaseDCollator,
+    PhaseDDataset,
+    PhaseDLabelMaps,
+    load_label_maps,
+)
 from .svs_calculator import SVSCalculator, SVSResult
 from .tokenizer import PhaseDTokenizer
 from .transformer import AffineGuardTransformer
@@ -184,9 +189,27 @@ def _compute_svs(
     return SVSResult(svs=svs, function_mass=function_mass, content_mass=content_mass)
 
 
+def _load_label_maps_from_checkpoint(run_dir: Path) -> Optional[PhaseDLabelMaps]:
+    checkpoint_path = run_dir / "checkpoint.pt"
+    if not checkpoint_path.exists():
+        return None
+    try:
+        payload = torch.load(checkpoint_path, map_location="cpu")
+        metadata = payload.get("metadata", {})
+        label_maps = metadata.get("label_maps")
+    except Exception as exc:
+        logger.warning("Failed to load label maps from %s: %s", checkpoint_path, exc)
+        return None
+    if isinstance(label_maps, dict) and label_maps:
+        return PhaseDLabelMaps(maps=label_maps)
+    return None
+
+
 def run_verification(
     *,
     dataset_path: Path,
+    dataset_path_post: Path | None = None,
+    dataset_path_masked: Path | None = None,
     artifacts_dir: Path,
     phase_d_dir: Path,
     output_dir: Path,
@@ -205,21 +228,42 @@ def run_verification(
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     
-    # Determine which label fields to use for label maps
-    if use_only_labels:
-        label_fields_for_maps = list(use_only_labels)
-        logger.info(f"Verification using filtered labels: {label_fields_for_maps}")
+    label_maps_obj = _load_label_maps_from_checkpoint(phase_d_dir / "baseline")
+    if label_maps_obj is None:
+        label_maps_obj = _load_label_maps_from_checkpoint(phase_d_dir / "constrained")
+    if label_maps_obj is None:
+        # Determine which label fields to use for label maps
+        if use_only_labels:
+            label_fields_for_maps = list(use_only_labels)
+            logger.info(f"Verification using filtered labels: {label_fields_for_maps}")
+        else:
+            label_fields_for_maps = get_demographic_columns()
+        dataset_for_maps = dataset_path_post or dataset_path_masked or dataset_path
+        label_maps_obj = load_label_maps(dataset_for_maps, label_fields_for_maps)
     else:
-        label_fields_for_maps = get_demographic_columns()
-    
-    label_maps = load_label_maps(dataset_path, label_fields_for_maps).maps
+        logger.info("Loaded label maps from training checkpoint metadata")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     svs_query_strategy = (svs_query_strategy or "mean_tokens").strip().lower()
     if svs_query_strategy in {"default", "auto"}:
         svs_query_strategy = "mean_tokens"
 
-    def _verify_run(run_name: str, text_field: str, use_affine_guard: bool) -> Dict:
+    def _resolve_dataset(candidate: Optional[Path]) -> Path:
+        if candidate is None:
+            return dataset_path
+        if candidate.exists():
+            return candidate
+        logger.warning("Dataset not found at %s; falling back to %s", candidate, dataset_path)
+        return dataset_path
+
+    def _verify_run(
+        run_name: str,
+        text_field: str,
+        use_affine_guard: bool,
+        *,
+        dataset_for_run: Optional[Path],
+    ) -> Dict:
+        dataset_for_run = _resolve_dataset(dataset_for_run)
         run_dir = phase_d_dir / run_name
         model, head = _load_model_and_head(
             run_dir=run_dir,
@@ -228,17 +272,17 @@ def run_verification(
             taxonomy_path=taxonomy_path,
             max_length=max_length,
             use_affine_guard=use_affine_guard,
-            label_maps=label_maps,
+            label_maps=label_maps_obj.maps,
             device=device,
             use_only_labels=list(use_only_labels) if use_only_labels else None,
         )
 
         loader, phase_d_tokenizer = _build_loader(
-            dataset_path=dataset_path,
+            dataset_path=dataset_for_run,
             text_field=text_field,
             taxonomy_path=taxonomy_path,
             max_length=max_length,
-            label_maps=load_label_maps(dataset_path, label_fields_for_maps),
+            label_maps=label_maps_obj,
             batch_size=batch_size,
             split="val",
             use_only_labels=list(use_only_labels) if use_only_labels else None,
@@ -298,8 +342,18 @@ def run_verification(
             "neutral_count": len(classifications["neutral"]),
         }
 
-    baseline_outputs = _verify_run("baseline", "post", use_affine_guard=False)
-    constrained_outputs = _verify_run("constrained", "post_masked", use_affine_guard=True)
+    baseline_outputs = _verify_run(
+        "baseline",
+        "post",
+        use_affine_guard=False,
+        dataset_for_run=dataset_path_post,
+    )
+    constrained_outputs = _verify_run(
+        "constrained",
+        "post_masked",
+        use_affine_guard=True,
+        dataset_for_run=dataset_path_masked,
+    )
 
     summary = {
         "baseline": baseline_outputs,
