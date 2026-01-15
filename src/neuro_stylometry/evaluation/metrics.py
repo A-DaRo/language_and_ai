@@ -28,6 +28,7 @@ def compute_phase_a_metrics(
     projection_matrix: Optional["torch.Tensor"] = None,
     strategy_metadata: Optional[Dict[str, Any]] = None,
     config: Optional[Dict[str, Any]] = None,
+    use_only_labels: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """
     Compute unified Phase A metrics for JSON export.
@@ -38,6 +39,8 @@ def compute_phase_a_metrics(
         projection_matrix: LEACE projection matrix (768x768).
         strategy_metadata: Metadata returned by strategy.execute().
         config: Pipeline configuration dict (for config_hash).
+        use_only_labels: Optional list of demographic labels being filtered.
+            If provided, records the label_filter for single-label mode tracking.
         
     Returns:
         Dict suitable for JSON serialization to phase_a_metrics.json.
@@ -98,12 +101,14 @@ def compute_phase_a_metrics(
             "mode": strategy_metadata.get("mode", "unknown"),
             "staged_execution": strategy_metadata.get("staged_execution", False),
             "num_samples": strategy_metadata.get("num_samples", len(clean_table)),
+            "label_filter": use_only_labels or strategy_metadata.get("label_filter"),
         }
     else:
         metrics["execution"] = {
             "mode": "unknown",
             "staged_execution": False,
             "num_samples": len(clean_table),
+            "label_filter": use_only_labels,
         }
     
     return metrics

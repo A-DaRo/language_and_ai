@@ -1,7 +1,7 @@
 # Phase D Verification Configuration (Base)
 
 model:
-  name: "roberta-base"
+  name: "facebook/xlm-roberta-xl"
   max_length: 512
   taxonomy_path: "conf/base/gliner_taxonomy.yaml"
 

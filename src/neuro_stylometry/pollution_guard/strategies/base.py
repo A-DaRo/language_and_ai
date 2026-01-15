@@ -90,6 +90,12 @@ class ProbingContext:
     benchmark_results: Dict[str, Any] = field(default_factory=dict)
     reports_dir: Optional[Path] = None
     stage_skipped: bool = False
+    # Visualization data for pipeline orchestration (returned to pipeline for centralized plotting)
+    visualization_data: Optional[Dict[str, Any]] = None
+    # Demographic columns used for probing (for single-label mode detection)
+    demo_cols: Optional[List[str]] = None
+    # Probe configuration for visualization
+    probe_config: Optional[Any] = None
 
 
 @dataclass
@@ -158,6 +164,7 @@ class PollutionFilterStrategy(ABC):
         projection_matrix_path: Path,
         pollution_logs_path: Path,
         config: Dict[str, Any],
+        use_only_labels: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """
         Execute Phase A pollution filtering pipeline.
@@ -168,6 +175,9 @@ class PollutionFilterStrategy(ABC):
             projection_matrix_path: Path to save projection matrix.
             pollution_logs_path: Path to save pollution logs.
             config: Configuration dictionary.
+            use_only_labels: Optional list of demographic labels to filter to.
+                If provided, only rows with valid values for ALL specified labels
+                will be processed, and only those labels will be used for LEACE.
             
         Returns:
             Execution metadata (timing, stats, etc.).

@@ -397,6 +397,25 @@ class SOBRTaxonomy:
         # Reverse lookup: find which column contains this prompt
         return self._prompt_to_column(label)
 
+    def filter_columns(self, columns: List[str]) -> "SOBRTaxonomy":
+        """
+        Create a filtered taxonomy containing only the specified columns.
+        
+        Used for --use-only demographic filtering in Phase A.
+        
+        Args:
+            columns: List of SOBR column names to keep.
+            
+        Returns:
+            New SOBRTaxonomy instance with only the specified columns.
+        """
+        filtered_prompts = {
+            col: self.column_prompts[col]
+            for col in columns
+            if col in self.column_prompts
+        }
+        return SOBRTaxonomy(column_prompts=filtered_prompts)
+
     def _prompt_to_column(self, prompt_label: str) -> str:
         """Reverse lookup: prompt string -> column name."""
         for column, cfg in self.column_prompts.items():

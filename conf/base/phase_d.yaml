@@ -10,7 +10,7 @@ phase_d:
 
 # Model configuration
 model:
-  name: "roberta-base"
+  name: "facebook/xlm-roberta-xl"
   max_length: 512
   taxonomy_path: "conf/base/gliner_taxonomy.yaml"
 

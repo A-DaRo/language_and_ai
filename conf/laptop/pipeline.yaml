@@ -92,7 +92,7 @@ gliner:
   # Laptop mode: bi-encoder NOT required by default (allows uni-encoder models).
   # Word limit same as base (512 words is GLiNER's default processor limit).
   # ---------------------------------------------------------------------------
-  require_bi_encoder: true   # Enforce bi-encoder usage on laptop
+  require_bi_encoder: false   # Allow uni-encoder models on laptop
   # gliner_max_words: inherited from base (512)
   # tokens_per_word_ratio: inherited from base (1.3)
   
@@ -128,8 +128,13 @@ leace:
   batch_size: 50
   compute_dtype: "float64"   # CPU uses higher precision for numerical stability
 
-# Encoder output device configuration
+# Encoder configuration for laptop - use smaller model to fit in 4GB VRAM
 encoder:
+  model: "xlm-roberta-base"  # ~1.1GB instead of xlm-roberta-xl (~14GB)
+  hidden_dim: 768
+  max_length: 512
+  batch_size: 16             # Smaller batch for limited VRAM
+  device: "auto"
   output_device: "cpu"       # Move embeddings to CPU after extraction (for LEACE)
 
 logging:

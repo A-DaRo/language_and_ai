@@ -36,9 +36,61 @@ from typing import Any, Dict, List, Optional, Set
 import numpy as np
 import pandas as pd
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.feather as feather
 import torch
 from tqdm import tqdm
+
+
+def _convert_numpy_types(obj: Any) -> Any:
+    """Recursively convert numpy types to Python native types for JSON serialization."""
+    if isinstance(obj, dict):
+        return {k: _convert_numpy_types(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [_convert_numpy_types(v) for v in obj]
+    elif isinstance(obj, (np.bool_, np.bool8)):
+        return bool(obj)
+    elif isinstance(obj, (np.integer, np.int64, np.int32)):
+        return int(obj)
+    elif isinstance(obj, (np.floating, np.float64, np.float32)):
+        return float(obj)
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    return obj
+
+
+def _cast_strings_to_large(table: pa.Table) -> pa.Table:
+    """Cast string columns to large_string to avoid offset overflow on take/filter ops."""
+    new_fields = []
+    for field in table.schema:
+        if pa.types.is_string(field.type):
+            new_fields.append(pa.field(field.name, pa.large_string(), nullable=field.nullable))
+        elif pa.types.is_large_string(field.type):
+            new_fields.append(field)
+        else:
+            new_fields.append(field)
+    
+    # Only cast if there are actual string columns to convert
+    has_regular_strings = any(pa.types.is_string(f.type) for f in table.schema)
+    if not has_regular_strings:
+        return table
+    
+    new_schema = pa.schema(new_fields)
+    return table.cast(new_schema)
+
+
+def _safe_take_subset(table: pa.Table, indices: np.ndarray) -> pa.Table:
+    """Take a subset of rows using pandas to avoid Arrow offset overflow issues.
+    
+    When taking random indices from a very large table, PyArrow's take() can fail
+    with offset overflow even with large_string types. This function converts
+    to pandas for the subsetting operation which handles large strings better.
+    """
+    # Use pandas iloc for safe row subsetting
+    df = table.to_pandas()
+    df_subset = df.iloc[indices].reset_index(drop=True)
+    # Convert back to Arrow with string inference disabled to preserve types
+    return pa.Table.from_pandas(df_subset, preserve_index=False)
 
 from .base import (
     PollutionFilterStrategy,
@@ -592,6 +644,7 @@ class LaptopFilterStrategy(PollutionFilterStrategy):
         pollution_logs_path: Path,
         gliner: GLiNERDetector,
         config: Dict[str, Any],
+        demographic_columns: Optional[List[str]] = None,
     ) -> LEACEContext:
         """
         Execute Stage 3: Masking + embedding + LEACE projection computation.
@@ -604,6 +657,8 @@ class LaptopFilterStrategy(PollutionFilterStrategy):
             pollution_logs_path: Path for pollution logs output.
             gliner: Initialized GLiNER detector (for masker).
             config: Pipeline configuration.
+            demographic_columns: Optional list of demographic columns for LEACE.
+                If provided, only these columns are used. Supports single-label mode.
             
         Returns:
             LEACEContext with projection matrix and masked texts.
@@ -674,7 +729,10 @@ class LaptopFilterStrategy(PollutionFilterStrategy):
             special_tokens=mask_tokens,
         )
         
-        encoder = DemographicEncoder(get_demographic_columns()).fit(table)
+        # Use filtered demographic columns if provided, else all columns
+        demo_cols_for_leace = demographic_columns if demographic_columns else get_demographic_columns()
+        logger.info(f"LEACE using demographic columns: {demo_cols_for_leace}")
+        encoder = DemographicEncoder(demo_cols_for_leace).fit(table)
         
         # Force CPU for LEACE in laptop mode
         leace_force_cpu = bool(self._cfg_get(config, "leace.force_cpu"))
@@ -793,6 +851,7 @@ class LaptopFilterStrategy(PollutionFilterStrategy):
         gliner: GLiNERDetector,
         config: Dict[str, Any],
         output_dir: Path,
+        demographic_columns: Optional[List[str]] = None,
     ) -> ProbingContext:
         """
         Execute Stage 4: Amnesic drop metrics and visualizations.
@@ -804,6 +863,8 @@ class LaptopFilterStrategy(PollutionFilterStrategy):
             gliner: Initialized GLiNER detector.
             config: Pipeline configuration.
             output_dir: Directory for reports.
+            demographic_columns: Optional list of demographic columns for probing.
+                If provided, only these columns are probed. Supports single-label mode.
             
         Returns:
             ProbingContext with metrics by column.
@@ -883,7 +944,11 @@ class LaptopFilterStrategy(PollutionFilterStrategy):
         separability_after: Dict[str, Any] = {}
         class_imbalance: Dict[str, Any] = {}
         
-        for col in get_demographic_columns():
+        # Use filtered demographic columns if provided, else all columns
+        demo_cols = demographic_columns if demographic_columns else get_demographic_columns()
+        logger.info(f"Probing demographic columns: {demo_cols}")
+        
+        for col in demo_cols:
             labels_np = extract_probe_labels(probe_table, col)
             labels_t = torch.tensor(labels_np, dtype=torch.long)
             
@@ -953,10 +1018,27 @@ class LaptopFilterStrategy(PollutionFilterStrategy):
         
         probe_results_path = reports_dir / "probe_results.json"
         with open(probe_results_path, "w") as f:
-            json.dump(probe_results, f, indent=2)
+            json.dump(_convert_numpy_types(probe_results), f, indent=2)
         logger.info(f"Saved probe results: {probe_results_path}")
         
         logger.info("Stage 4 complete: probing finished")
+        
+        # Build visualization data for pipeline orchestration
+        labels_dict = {
+            col: extract_probe_labels(probe_table, col)
+            for col in demo_cols
+        }
+        visualization_data = {
+            "by_column_extended": by_column_extended,
+            "separability_before": separability_before,
+            "separability_after": separability_after,
+            "benchmark_results": {},  # Laptop mode doesn't do benchmark by default
+            "control_probe_results": {},
+            "demo_cols": demo_cols,
+            "X_before_np": X_before_np,
+            "X_after_np": X_after_np,
+            "labels_dict": labels_dict,
+        }
         
         # Cleanup after probing stage
         self._cleanup_memory()
@@ -971,6 +1053,9 @@ class LaptopFilterStrategy(PollutionFilterStrategy):
             class_imbalance=class_imbalance,
             reports_dir=reports_dir,
             stage_skipped=False,
+            visualization_data=visualization_data,
+            demo_cols=demo_cols,
+            probe_config=probe_config,
         )
     
     # =======================================================================
@@ -983,6 +1068,7 @@ class LaptopFilterStrategy(PollutionFilterStrategy):
         projection_matrix_path: Path,
         pollution_logs_path: Path,
         config: Dict[str, Any],
+        use_only_labels: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """
         Execute Phase A with staged execution architecture (laptop-optimized).
@@ -998,6 +1084,9 @@ class LaptopFilterStrategy(PollutionFilterStrategy):
         - skip_inference: Start at Stage 3 (requires inference_results.arrow).
         - skip_leace: Start at Stage 4 (requires projection_matrix.pt).
         - skip_probing: Exit after Stage 3 (skip metrics/visualizations).
+        
+        Args:
+            use_only_labels: Optional list of demographic labels to filter to.
         """
         logger.info("=" * 80)
         logger.info("Phase A: Laptop Strategy (Four-Stage Execution)")
@@ -1030,6 +1119,10 @@ class LaptopFilterStrategy(PollutionFilterStrategy):
             seed=int(self._cfg_get(config, "seed")),
         )
         table = dataset.table
+        
+        # Cast string columns to large_string early to prevent offset overflow
+        # during subsequent take/filter operations
+        table = _cast_strings_to_large(table)
 
         # Optional subset (strictly config-driven, recommended for laptop)
         if bool(self._cfg_get(config, "subset.enabled")):
@@ -1038,7 +1131,31 @@ class LaptopFilterStrategy(PollutionFilterStrategy):
                 rng = np.random.default_rng(int(self._cfg_get(config, "seed")))
                 indices = rng.choice(len(table), size=int(size), replace=False)
                 logger.info(f"Using subset (seeded): {int(size)}/{len(table)} samples")
-                table = table.take(pa.array(indices, type=pa.int64()))
+                table = _safe_take_subset(table, indices)
+        
+        # =======================================================================
+        # Apply --use-only Label Filter (if specified)
+        # =======================================================================
+        if use_only_labels:
+            logger.info(f"Applying --use-only filter for labels: {use_only_labels}")
+            original_count = len(table)
+            
+            # Filter rows where ANY specified label has a valid (non-null) value
+            # This is OR semantics: row is included if it has at least one label
+            mask = None
+            for col in use_only_labels:
+                if col not in table.column_names:
+                    logger.warning(f"Column '{col}' not found in dataset; skipping filter for it")
+                    continue
+                col_mask = pc.is_valid(table[col])
+                mask = col_mask if mask is None else pc.or_(mask, col_mask)
+            
+            if mask is not None:
+                table = table.filter(mask)
+                logger.info(f"Filtered dataset: {original_count} -> {len(table)} rows "
+                           f"(kept rows with valid {use_only_labels})")
+            else:
+                logger.warning("No valid columns found for --use-only filter; using full dataset")
         
         posts = table["post"].to_pylist()
         post_ids = table["post_id"].to_pylist()
@@ -1198,6 +1315,9 @@ class LaptopFilterStrategy(PollutionFilterStrategy):
                 stage_skipped=True,
             )
         else:
+            # Derive demographic columns from use_only_labels if provided
+            demographic_columns = use_only_labels if use_only_labels else None
+            
             leace_ctx = self._run_leace_stage(
                 chunking_ctx=chunking_ctx,
                 inference_ctx=inference_ctx,
@@ -1206,11 +1326,15 @@ class LaptopFilterStrategy(PollutionFilterStrategy):
                 pollution_logs_path=pollution_logs_path,
                 gliner=gliner,
                 config=config,
+                demographic_columns=demographic_columns,
             )
         
         # =======================================================================
         # Stage 4: Probing (skip if skip_probing is set)
         # =======================================================================
+        # Derive demographic columns for probing (use same as LEACE stage)
+        demographic_columns = use_only_labels if use_only_labels else None
+        
         if skip_cfg.skip_probing:
             logger.info("Skipping Stage 4 (probing) per skip flags - early exit")
             probing_ctx = ProbingContext(
@@ -1228,6 +1352,7 @@ class LaptopFilterStrategy(PollutionFilterStrategy):
                 gliner=gliner,
                 config=config,
                 output_dir=output_dir,
+                demographic_columns=demographic_columns,
             )
         
         # =======================================================================
@@ -1241,6 +1366,7 @@ class LaptopFilterStrategy(PollutionFilterStrategy):
             "num_pollution_spans": total_spans,
             "projection_matrix_shape": list(leace_ctx.projection_matrix.shape),
             "device": device,
+            "label_filter": use_only_labels,  # None for multi-label mode, list for single-label
             "staged_execution": True,
             "stages_skipped": {
                 "chunking": chunking_ctx.stage_skipped,
@@ -1286,6 +1412,14 @@ class LaptopFilterStrategy(PollutionFilterStrategy):
                 "after": probing_ctx.separability_after,
             }
             metadata["class_imbalance"] = probing_ctx.class_imbalance
+            
+            # Include visualization data for pipeline orchestration
+            if probing_ctx.visualization_data:
+                metadata["visualization_data"] = probing_ctx.visualization_data
+            if probing_ctx.demo_cols:
+                metadata["demo_cols"] = probing_ctx.demo_cols
+            if probing_ctx.probe_config:
+                metadata["probe_config"] = probing_ctx.probe_config
             
             # Enforce threshold if configured
             if bool(self._cfg_get(config, "quality.enforce_thresholds")):

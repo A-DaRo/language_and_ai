@@ -12,7 +12,7 @@ Implements: phaseA-D_implementation_plan.md Section 9.1
 
 import logging
 from pathlib import Path
-from typing import Dict, Any, Optional, Tuple
+from typing import Dict, Any, Optional, Tuple, List
 from dataclasses import dataclass, field
 
 from .pollution_guard.strategies.base import PollutionFilterStrategy
@@ -297,6 +297,7 @@ class PhaseAPipeline:
         self,
         input_dataset_path: Path,
         output_dir: Path,
+        use_only_labels: Optional[List[str]] = None,
     ) -> PhaseArtifacts:
         """
         Execute Phase A pipeline end-to-end.
@@ -304,6 +305,9 @@ class PhaseAPipeline:
         Args:
             input_dataset_path: Path to input SOBR dataset.
             output_dir: Directory for output artifacts.
+            use_only_labels: Optional list of demographic labels to filter to.
+                If provided, only these labels will be detected, masked, and
+                used for LEACE projection computation.
             
         Returns:
             PhaseArtifacts with paths to all outputs.
@@ -322,6 +326,8 @@ class PhaseAPipeline:
         logger.info("=" * 80)
         logger.info(f"Input dataset: {input_dataset_path}")
         logger.info(f"Output directory: {output_dir}")
+        if use_only_labels:
+            logger.info(f"Label filter (--use-only): {use_only_labels}")
         
         # Execute strategy
         metadata = self.strategy.execute(
@@ -330,6 +336,7 @@ class PhaseAPipeline:
             projection_matrix_path=projection_matrix_path,
             pollution_logs_path=pollution_logs_path,
             config=self.config,
+            use_only_labels=use_only_labels,
         )
         
         # Initialize paths for reports
@@ -337,6 +344,7 @@ class PhaseAPipeline:
         metrics_path = None
         
         # --- Reporting & Visualization (config-driven) ---
+        # Visualization is now orchestrated centrally from pipeline (not in strategy)
         viz_config = self.config.get("visualization", {})
         viz_enabled = viz_config.get("enabled", True)
         
@@ -354,7 +362,7 @@ class PhaseAPipeline:
                 logs_table = feather.read_table(pollution_logs_path)
                 projection_matrix = torch.load(projection_matrix_path, map_location="cpu")
 
-                # Compute and save metrics
+                # Compute and save metrics (with label filter info)
                 from .evaluation.metrics import compute_phase_a_metrics, save_metrics
                 metrics_data = compute_phase_a_metrics(
                     clean_table=clean_table,
@@ -362,12 +370,19 @@ class PhaseAPipeline:
                     projection_matrix=projection_matrix,
                     strategy_metadata=metadata,
                     config=self.config,
+                    use_only_labels=use_only_labels,
                 )
                 metrics_path = reports_dir / "phase_a_metrics.json"
                 save_metrics(metrics_data, metrics_path)
 
-                # Generate visualizations
-                from .evaluation.visualizations_phase_a import generate_phase_a_plots
+                # Generate standard visualizations (PCA, histograms, etc.)
+                from .evaluation.visualizations_phase_a import (
+                    generate_phase_a_plots,
+                    plot_amnesic_drop_with_ci,
+                    plot_embedding_separability,
+                    plot_solver_convergence_benchmark,
+                    plot_specificity_gap,
+                )
                 import numpy as np
                 
                 # Sample for pandas conversion based on config
@@ -390,7 +405,19 @@ class PhaseAPipeline:
                     metrics=metrics_data,
                     config=self.config,
                 )
-                logger.info(f"Saved visualizations to {reports_dir}")
+                
+                # =====================================================================
+                # Generate probing-stage visualizations from strategy's visualization_data
+                # This is the centralized orchestration point (fixes HPC duplicate issue)
+                # =====================================================================
+                self._generate_probing_visualizations(
+                    metadata=metadata,
+                    reports_dir=reports_dir,
+                    viz_config=viz_config,
+                    use_only_labels=use_only_labels,
+                )
+                
+                logger.info(f"Saved all visualizations to {reports_dir}")
 
             except Exception as e:
                 logger.warning(f"Reporting/Visualization failed: {e}", exc_info=True)
@@ -421,6 +448,126 @@ class PhaseAPipeline:
             logger.info(f"Reports directory: {reports_dir}")
         
         return artifacts
+
+    def _generate_probing_visualizations(
+        self,
+        metadata: Dict[str, Any],
+        reports_dir: Path,
+        viz_config: Dict[str, Any],
+        use_only_labels: Optional[List[str]] = None,
+    ) -> None:
+        """
+        Generate probing-stage visualizations from strategy's visualization_data.
+        
+        This is the centralized orchestration point for probing visualizations,
+        replacing the inline visualization generation that was previously in
+        HPC strategy (fixing the deadlock/duplication issue).
+        
+        Args:
+            metadata: Execution metadata returned by strategy.execute().
+            reports_dir: Directory to save visualization outputs.
+            viz_config: Visualization configuration dict.
+            use_only_labels: Optional list of demographic labels (for single-label detection).
+        """
+        import numpy as np
+        
+        # Get probing visualization data from metadata
+        probe_metadata = metadata.get("probe", {})
+        visualization_data = metadata.get("visualization_data")
+        
+        if not visualization_data:
+            logger.debug("No visualization_data in metadata; skipping probing visualizations")
+            return
+        
+        # Extract components from visualization_data
+        by_column_extended = visualization_data.get("by_column_extended", {})
+        separability_before = visualization_data.get("separability_before", {})
+        separability_after = visualization_data.get("separability_after", {})
+        benchmark_results = visualization_data.get("benchmark_results", {})
+        control_probe_results = visualization_data.get("control_probe_results", {})
+        demo_cols = visualization_data.get("demo_cols", [])
+        
+        # Single-label mode detection
+        effective_demo_cols = use_only_labels if use_only_labels else demo_cols
+        is_single_label = len(effective_demo_cols) == 1
+        
+        if is_single_label:
+            logger.info(f"Single-label mode detected: {effective_demo_cols[0]}")
+        
+        dpi = int(viz_config.get("figure_dpi", 150))
+        palette = viz_config.get("color_palette", "husl")
+        
+        from .evaluation.visualizations_phase_a import (
+            plot_amnesic_drop_with_ci,
+            plot_embedding_separability,
+            plot_solver_convergence_benchmark,
+            plot_specificity_gap,
+        )
+        
+        try:
+            # 1. Amnesic drop with CI (works for single-label too)
+            if by_column_extended:
+                plot_amnesic_drop_with_ci(
+                    per_column_results=by_column_extended,
+                    output_path=reports_dir / "amnesic_drop_with_ci.png",
+                    dpi=dpi,
+                    palette=palette,
+                )
+                logger.debug("Generated amnesic_drop_with_ci.png")
+            
+            # 2. Embedding separability (for first column)
+            first_col = effective_demo_cols[0] if effective_demo_cols else None
+            if first_col and first_col in separability_before and first_col in separability_after:
+                plot_embedding_separability(
+                    separability_before=separability_before[first_col],
+                    separability_after=separability_after[first_col],
+                    output_path=reports_dir / "embedding_separability.png",
+                    dpi=dpi,
+                )
+                logger.debug("Generated embedding_separability.png")
+            
+            # 3. Solver convergence benchmark
+            if benchmark_results and "torch_accuracy" in benchmark_results:
+                torch_final = benchmark_results.get("torch_accuracy", 0.5)
+                probe_config = visualization_data.get("probe_config")
+                epochs = probe_config.torch_epochs if probe_config else 100
+                learning_curve = [torch_final * (1 - 0.5 * np.exp(-i / 20)) for i in range(epochs)]
+                plot_solver_convergence_benchmark(
+                    benchmark_results=benchmark_results,
+                    learning_curve_torch=learning_curve,
+                    output_path=reports_dir / "solver_convergence_benchmark.png",
+                    dpi=dpi,
+                )
+                logger.debug("Generated solver_convergence_benchmark.png")
+            
+            # 4. Specificity gap (SKIP if single-label mode - requires ≥2 demographics)
+            if not is_single_label and control_probe_results and "error" not in control_probe_results:
+                target_results = control_probe_results.get("target", {})
+                control_key = [k for k in control_probe_results if k.startswith("control_")]
+                if target_results and control_key and len(effective_demo_cols) >= 2:
+                    plot_specificity_gap(
+                        target_results={
+                            "acc_before": target_results.get("acc_before", 0.5),
+                            "acc_after": target_results.get("acc_after", 0.5),
+                        },
+                        control_results={
+                            "acc_before": control_probe_results[control_key[0]].get("acc_before", 0.5),
+                            "acc_after": control_probe_results[control_key[0]].get("acc_after", 0.5),
+                        },
+                        target_name=effective_demo_cols[0],
+                        control_name=effective_demo_cols[1] if len(effective_demo_cols) > 1 else "control",
+                        output_path=reports_dir / "specificity_gap.png",
+                        dpi=dpi,
+                        palette=palette,
+                    )
+                    logger.debug("Generated specificity_gap.png")
+            elif is_single_label:
+                logger.info("Skipping specificity_gap.png (requires ≥2 demographics)")
+            
+            logger.info("Probing visualizations generated successfully")
+            
+        except Exception as viz_error:
+            logger.warning(f"Probing visualization generation failed: {viz_error}")
 
     def _check_quality_gates(self, metadata: Dict[str, Any]) -> None:
         """Check explicit recall and amnesic drop against configured thresholds."""

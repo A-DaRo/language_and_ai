@@ -34,9 +34,44 @@ from typing import Any, Dict, List, Optional, Set
 
 import numpy as np
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.feather as feather
 import torch
 from tqdm import tqdm
+
+
+def _cast_strings_to_large(table: pa.Table) -> pa.Table:
+    """Cast string columns to large_string to avoid offset overflow on take/filter ops."""
+    new_fields = []
+    for field in table.schema:
+        if pa.types.is_string(field.type):
+            new_fields.append(pa.field(field.name, pa.large_string(), nullable=field.nullable))
+        elif pa.types.is_large_string(field.type):
+            new_fields.append(field)
+        else:
+            new_fields.append(field)
+    
+    # Only cast if there are actual string columns to convert
+    has_regular_strings = any(pa.types.is_string(f.type) for f in table.schema)
+    if not has_regular_strings:
+        return table
+    
+    new_schema = pa.schema(new_fields)
+    return table.cast(new_schema)
+
+
+def _safe_take_subset(table: pa.Table, indices: np.ndarray) -> pa.Table:
+    """Take a subset of rows using pandas to avoid Arrow offset overflow issues.
+    
+    When taking random indices from a very large table, PyArrow's take() can fail
+    with offset overflow even with large_string types. This function converts
+    to pandas for the subsetting operation which handles large strings better.
+    """
+    # Use pandas iloc for safe row subsetting
+    df = table.to_pandas()
+    df_subset = df.iloc[indices].reset_index(drop=True)
+    # Convert back to Arrow with string inference disabled to preserve types
+    return pa.Table.from_pandas(df_subset, preserve_index=False)
 
 from .base import (
     PollutionFilterStrategy,
@@ -613,6 +648,7 @@ class HPCFilterStrategy(PollutionFilterStrategy):
         gliner: GLiNERDetector,
         taxonomy_config: Dict[str, Any],
         config: Dict[str, Any],
+        demographic_columns: Optional[List[str]] = None,
     ) -> LEACEContext:
         """
         Execute Stage 3: Masking, embedding, and LEACE projection computation.
@@ -626,6 +662,8 @@ class HPCFilterStrategy(PollutionFilterStrategy):
             gliner: Initialized GLiNER detector.
             taxonomy_config: Taxonomy configuration for masker.
             config: Pipeline configuration.
+            demographic_columns: Optional list of demographic columns for LEACE.
+                If provided, only these columns are used for concept encoding.
             
         Returns:
             LEACEContext with projection matrix and masked texts.
@@ -665,7 +703,10 @@ class HPCFilterStrategy(PollutionFilterStrategy):
             special_tokens=mask_tokens,
         )
         
-        encoder = DemographicEncoder(get_demographic_columns()).fit(table)
+        # Use filtered demographic columns if provided, else all columns
+        demo_cols_for_leace = demographic_columns if demographic_columns else get_demographic_columns()
+        logger.info(f"LEACE concept encoding for columns: {demo_cols_for_leace}")
+        encoder = DemographicEncoder(demo_cols_for_leace).fit(table)
         
         # LEACE configuration
         leace_device_spec = self._cfg_get_optional(config, "leace.device", None)
@@ -760,6 +801,7 @@ class HPCFilterStrategy(PollutionFilterStrategy):
         leace_ctx: LEACEContext,
         output_dir: Path,
         config: Dict[str, Any],
+        demographic_columns: Optional[List[str]] = None,
     ) -> ProbingContext:
         """
         Execute Stage 4: Amnesic drop metrics and visualizations.
@@ -768,6 +810,8 @@ class HPCFilterStrategy(PollutionFilterStrategy):
             leace_ctx: Context from LEACE stage.
             output_dir: Directory for reports.
             config: Pipeline configuration.
+            demographic_columns: Optional list of demographic columns for probing.
+                If provided, only these columns are probed. Supports single-label mode.
             
         Returns:
             ProbingContext with computed metrics.
@@ -790,6 +834,10 @@ class HPCFilterStrategy(PollutionFilterStrategy):
         
         X_before_np = embeddings_before.numpy()
         X_after_np = embeddings_after.numpy()
+        
+        # Use filtered demographic columns if provided, else all columns
+        demo_cols = demographic_columns if demographic_columns else get_demographic_columns()
+        logger.info(f"Probing demographic columns: {demo_cols}")
         
         # Build ProbeConfig
         probe_cfg = config.get("probe", {})
@@ -817,7 +865,7 @@ class HPCFilterStrategy(PollutionFilterStrategy):
         class_imbalance: Dict[str, Any] = {}
         labels_dict: Dict[str, np.ndarray] = {}
         
-        for col in get_demographic_columns():
+        for col in demo_cols:
             labels_np = extract_probe_labels(probe_table, col)
             labels_dict[col] = labels_np
             labels_t = torch.tensor(labels_np, dtype=torch.long)
@@ -847,7 +895,7 @@ class HPCFilterStrategy(PollutionFilterStrategy):
             class_imbalance[col] = compute_class_imbalance_metrics(labels_np)
             
             # Solver benchmark for first column
-            if probe_config.benchmark_solvers and col == get_demographic_columns()[0]:
+            if probe_config.benchmark_solvers and col == demo_cols[0]:
                 logger.info(f"Benchmarking solver convergence on {col}...")
                 valid_mask = labels_np != -1
                 X_bench = X_before_np[valid_mask]
@@ -864,7 +912,6 @@ class HPCFilterStrategy(PollutionFilterStrategy):
                 )
         
         # Control probe metrics
-        demo_cols = get_demographic_columns()
         control_probe_results = {}
         if len(demo_cols) >= 2:
             target_col = demo_cols[0]
@@ -888,25 +935,28 @@ class HPCFilterStrategy(PollutionFilterStrategy):
             if min_drop < threshold:
                 logger.warning(f"Amnesic drop gate failed: min={min_drop:.3f} < threshold={threshold:.3f}")
         
-        # Generate visualizations
+        # Build visualization data for pipeline orchestration
+        # (Visualization is now handled centrally in phase_a_pipeline.py)
         reports_dir = None
         viz_config = config.get("visualization", {})
         if viz_config.get("enabled", True):
             reports_dir = output_dir / "reports"
             reports_dir.mkdir(parents=True, exist_ok=True)
-            self._generate_visualizations(
-                by_column_extended=by_column_extended,
-                separability_before=separability_before,
-                separability_after=separability_after,
-                benchmark_results=benchmark_results,
-                control_probe_results=control_probe_results,
-                probe_config=probe_config,
-                demo_cols=demo_cols,
-                reports_dir=reports_dir,
-                viz_config=viz_config,
-            )
         
-        logger.info("Stage 4 complete")
+        # Build visualization_data dict for pipeline to use
+        visualization_data = {
+            "by_column_extended": by_column_extended,
+            "separability_before": separability_before,
+            "separability_after": separability_after,
+            "benchmark_results": benchmark_results,
+            "control_probe_results": control_probe_results,
+            "demo_cols": demo_cols,
+            "X_before_np": X_before_np,
+            "X_after_np": X_after_np,
+            "labels_dict": labels_dict,
+        }
+        
+        logger.info("Stage 4 complete (visualization data prepared for pipeline)")
         
         # Cleanup after probing stage
         self._cleanup_memory()
@@ -923,83 +973,10 @@ class HPCFilterStrategy(PollutionFilterStrategy):
             benchmark_results=benchmark_results,
             reports_dir=reports_dir,
             stage_skipped=False,
+            visualization_data=visualization_data,
+            demo_cols=demo_cols,
+            probe_config=probe_config,
         )
-    
-    def _generate_visualizations(
-        self,
-        by_column_extended: Dict[str, Any],
-        separability_before: Dict[str, Any],
-        separability_after: Dict[str, Any],
-        benchmark_results: Dict[str, Any],
-        control_probe_results: Dict[str, Any],
-        probe_config: ProbeConfig,
-        demo_cols: List[str],
-        reports_dir: Path,
-        viz_config: Dict[str, Any],
-    ) -> None:
-        """Generate Phase A visualizations."""
-        try:
-            from ...evaluation.visualizations_phase_a import (
-                plot_amnesic_drop_with_ci,
-                plot_embedding_separability,
-                plot_solver_convergence_benchmark,
-                plot_specificity_gap,
-            )
-            
-            dpi = int(viz_config.get("figure_dpi", 150))
-            palette = viz_config.get("color_palette", "husl")
-            
-            if by_column_extended:
-                plot_amnesic_drop_with_ci(
-                    per_column_results=by_column_extended,
-                    output_path=reports_dir / "amnesic_drop_with_ci.png",
-                    dpi=dpi,
-                    palette=palette,
-                )
-            
-            first_col = demo_cols[0] if demo_cols else None
-            if first_col and first_col in separability_before and first_col in separability_after:
-                plot_embedding_separability(
-                    separability_before=separability_before[first_col],
-                    separability_after=separability_after[first_col],
-                    output_path=reports_dir / "embedding_separability.png",
-                    dpi=dpi,
-                )
-            
-            if benchmark_results and "torch_accuracy" in benchmark_results:
-                torch_final = benchmark_results.get("torch_accuracy", 0.5)
-                epochs = probe_config.torch_epochs
-                learning_curve = [torch_final * (1 - 0.5 * np.exp(-i / 20)) for i in range(epochs)]
-                plot_solver_convergence_benchmark(
-                    benchmark_results=benchmark_results,
-                    learning_curve_torch=learning_curve,
-                    output_path=reports_dir / "solver_convergence_benchmark.png",
-                    dpi=dpi,
-                )
-            
-            if control_probe_results and "error" not in control_probe_results:
-                target_results = control_probe_results.get("target", {})
-                control_key = [k for k in control_probe_results if k.startswith("control_")]
-                if target_results and control_key:
-                    plot_specificity_gap(
-                        target_results={
-                            "acc_before": target_results.get("acc_before", 0.5),
-                            "acc_after": target_results.get("acc_after", 0.5),
-                        },
-                        control_results={
-                            "acc_before": control_probe_results[control_key[0]].get("acc_before", 0.5),
-                            "acc_after": control_probe_results[control_key[0]].get("acc_after", 0.5),
-                        },
-                        target_name=demo_cols[0],
-                        control_name=demo_cols[1] if len(demo_cols) > 1 else "control",
-                        output_path=reports_dir / "specificity_gap.png",
-                        dpi=dpi,
-                        palette=palette,
-                    )
-            
-            logger.info(f"Visualizations saved to: {reports_dir}")
-        except Exception as viz_error:
-            logger.warning(f"Visualization generation failed: {viz_error}")
     
     # =======================================================================
     # Main Execute Orchestrator
@@ -1011,6 +988,7 @@ class HPCFilterStrategy(PollutionFilterStrategy):
         projection_matrix_path: Path,
         pollution_logs_path: Path,
         config: Dict[str, Any],
+        use_only_labels: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """
         Execute Phase A with staged execution architecture.
@@ -1027,6 +1005,7 @@ class HPCFilterStrategy(PollutionFilterStrategy):
             projection_matrix_path: Path to save projection_matrix.pt.
             pollution_logs_path: Path to save pollution_logs.arrow.
             config: Pipeline configuration.
+            use_only_labels: Optional list of demographic labels to filter to.
             
         Returns:
             Execution metadata dictionary.
@@ -1062,6 +1041,10 @@ class HPCFilterStrategy(PollutionFilterStrategy):
         )
         table = dataset.table
         
+        # Cast string columns to large_string early to prevent offset overflow
+        # during subsequent take/filter operations
+        table = _cast_strings_to_large(table)
+        
         # Optional subset
         if bool(self._cfg_get(config, "subset.enabled")):
             size = self._cfg_get(config, "subset.size")
@@ -1069,7 +1052,31 @@ class HPCFilterStrategy(PollutionFilterStrategy):
                 rng = np.random.default_rng(int(self._cfg_get(config, "seed")))
                 indices = rng.choice(len(table), size=int(size), replace=False)
                 logger.info(f"Using subset (seeded): {int(size)}/{len(table)} samples")
-                table = table.take(pa.array(indices, type=pa.int64()))
+                table = _safe_take_subset(table, indices)
+        
+        # =======================================================================
+        # Apply --use-only Label Filter (if specified)
+        # =======================================================================
+        if use_only_labels:
+            logger.info(f"Applying --use-only filter for labels: {use_only_labels}")
+            original_count = len(table)
+            
+            # Filter rows where ANY specified label has a valid (non-null) value
+            # This is OR semantics: row is included if it has at least one label
+            mask = None
+            for col in use_only_labels:
+                if col not in table.column_names:
+                    logger.warning(f"Column '{col}' not found in dataset; skipping filter for it")
+                    continue
+                col_mask = pc.is_valid(table[col])
+                mask = col_mask if mask is None else pc.or_(mask, col_mask)
+            
+            if mask is not None:
+                table = table.filter(mask)
+                logger.info(f"Filtered dataset: {original_count} -> {len(table)} rows "
+                           f"(kept rows with valid {use_only_labels})")
+            else:
+                logger.warning("No valid columns found for --use-only filter; using full dataset")
         
         posts = table["post"].to_pylist()
         post_ids = table["post_id"].to_pylist()
@@ -1268,6 +1275,9 @@ class HPCFilterStrategy(PollutionFilterStrategy):
                 table_for_probing=table_for_probing,
             )
         else:
+            # Derive demographic columns from use_only_labels if provided
+            demographic_columns = use_only_labels if use_only_labels else None
+            
             leace_ctx = self._run_leace_stage(
                 chunking_ctx=chunking_ctx,
                 inference_ctx=inference_ctx,
@@ -1277,11 +1287,15 @@ class HPCFilterStrategy(PollutionFilterStrategy):
                 gliner=gliner,
                 taxonomy_config=taxonomy_config,
                 config=config,
+                demographic_columns=demographic_columns,
             )
         
         # =======================================================================
         # Stage 4: Probing
         # =======================================================================
+        # Derive demographic columns for probing (use same as LEACE stage)
+        demographic_columns = use_only_labels if use_only_labels else None
+        
         if skip_cfg.skip_probing:
             logger.info("Skipping Stage 4 (Probing)")
             probing_ctx = ProbingContext(stage_skipped=True)
@@ -1290,6 +1304,7 @@ class HPCFilterStrategy(PollutionFilterStrategy):
                 leace_ctx=leace_ctx,
                 output_dir=output_dir,
                 config=config,
+                demographic_columns=demographic_columns,
             )
         
         # =======================================================================
@@ -1301,6 +1316,7 @@ class HPCFilterStrategy(PollutionFilterStrategy):
             "projection_matrix_shape": list(leace_ctx.projection_matrix.shape),
             "device": device,
             "use_bf16": self.use_bf16,
+            "label_filter": use_only_labels,  # None for multi-label mode, list for single-label
             "staged_execution": True,
             "stages": {
                 "chunking_skipped": chunking_ctx.stage_skipped,
@@ -1351,6 +1367,13 @@ class HPCFilterStrategy(PollutionFilterStrategy):
                 metadata["probe"]["solver_benchmark"] = probing_ctx.benchmark_results
             if probing_ctx.reports_dir:
                 metadata["reports_dir"] = str(probing_ctx.reports_dir)
+            # Include visualization data for pipeline orchestration
+            if probing_ctx.visualization_data:
+                metadata["visualization_data"] = probing_ctx.visualization_data
+            if probing_ctx.demo_cols:
+                metadata["demo_cols"] = probing_ctx.demo_cols
+            if probing_ctx.probe_config:
+                metadata["probe_config"] = probing_ctx.probe_config
         
         logger.info("Phase A complete!")
         return metadata

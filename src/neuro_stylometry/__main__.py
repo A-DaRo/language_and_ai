@@ -83,6 +83,17 @@ def cli(verbose):
     is_flag=True,
     help="Force-skip missing prerequisites (injects execution.force_skip=True in config)"
 )
+@click.option(
+    "--use-only",
+    "use_only_labels",
+    type=str,
+    multiple=True,
+    help=(
+        "Filter to specified demographic label(s). Restricts dataset rows and LEACE/probing "
+        "to only the specified demographic columns. May be specified multiple times. "
+        "Example: --use-only gender --use-only birth_year"
+    )
+)
 def run_phase_a(
     dataset: Path, 
     output_dir: Path, 
@@ -94,6 +105,7 @@ def run_phase_a(
     skip_leace: bool,
     skip_probing: bool,
     force_skip: bool,
+    use_only_labels: tuple,
 ):
     """Execute Phase A pollution detection and mitigation pipeline."""
     from .phase_a_pipeline import PhaseAPipeline
@@ -141,7 +153,15 @@ def run_phase_a(
             click.echo("Resolved Configuration:")
             click.echo("-" * 40)
             click.echo(yaml.dump(config, default_flow_style=False, sort_keys=False))
+            if use_only_labels:
+                click.echo(f"\n--use-only labels: {list(use_only_labels)}")
             return
+        
+        # Convert tuple to list for use_only_labels
+        use_only_list = list(use_only_labels) if use_only_labels else None
+        
+        if use_only_list:
+            logger.info(f"Single-label mode enabled: filtering to {use_only_list}")
         
         # Create pipeline with PhaseAPipeline facade
         pipeline = PhaseAPipeline(strategy=strategy, config=config)
@@ -151,6 +171,7 @@ def run_phase_a(
         artifacts = pipeline.run(
             input_dataset_path=dataset,
             output_dir=output_dir,
+            use_only_labels=use_only_list,
         )
         
         # Report results
@@ -888,6 +909,239 @@ def report_phase_d(
         dataset_path=dataset,
     )
     click.echo(f"Report generated: {report_path}")
+
+
+@cli.command("run-full-pipeline")
+@click.option(
+    "--dataset",
+    type=click.Path(exists=True, path_type=Path),
+    required=True,
+    help="Path to input dataset Arrow file",
+)
+@click.option(
+    "--output-dir",
+    type=click.Path(path_type=Path),
+    required=True,
+    help="Output directory for all pipeline artifacts",
+)
+@click.option(
+    "--mode",
+    type=click.Choice(["auto", "laptop", "hpc"]),
+    default="auto",
+    help="Hardware mode (auto-detected if not specified)",
+)
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=False,
+    help="Optional experiment YAML config to merge on top of base+mode configs",
+)
+@click.option(
+    "--use-only",
+    "use_only_labels",
+    type=str,
+    multiple=True,
+    help=(
+        "Filter to specified demographic label(s). Restricts Phase A and Phase D "
+        "to only the specified demographic columns. May be specified multiple times. "
+        "Example: --use-only gender --use-only birth_year"
+    ),
+)
+@click.option(
+    "--skip-phase-a",
+    is_flag=True,
+    help="Skip Phase A (requires existing Phase A artifacts in output-dir/phase_a)",
+)
+@click.option(
+    "--skip-phase-d",
+    is_flag=True,
+    help="Skip Phase D (only run Phase A)",
+)
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    help="Print resolved config and execution plan without running",
+)
+def run_full_pipeline(
+    dataset: Path,
+    output_dir: Path,
+    mode: str,
+    config_path: Path | None,
+    use_only_labels: tuple,
+    skip_phase_a: bool,
+    skip_phase_d: bool,
+    dry_run: bool,
+):
+    """
+    Execute full pipeline: Phase A → Phase D.
+    
+    This command orchestrates the complete neuro-stylometry pipeline:
+    
+    1. Phase A: Pollution detection and LEACE projection
+       - Detects demographic pollution spans with GLiNER
+       - Applies typed masking
+       - Computes LEACE projection matrix
+       - Outputs: clean_dataset.arrow, projection_matrix.pt, pollution_logs.arrow
+    
+    2. Phase D: Comparative fine-tuning
+       - Runs baseline (no projection) and constrained (with projection) training
+       - Computes comparative metrics
+       - Outputs: tokenized_dataset.arrow, baseline/, constrained/
+    
+    Use --use-only to focus on specific demographic labels (single-label mode).
+    Use --skip-phase-a to start from existing Phase A artifacts.
+    Use --skip-phase-d to only run Phase A.
+    """
+    import json
+    import yaml
+    from .phase_a_pipeline import PhaseAPipeline
+    from .factories.strategy_factory import StrategyFactory
+    from .hardware_ops.detection import HardwareDetector, ProfileType
+    from .config import load_pipeline_config
+    
+    try:
+        # Auto-detect hardware mode if needed
+        if mode == "auto":
+            profile = HardwareDetector.detect()
+            mode = "laptop" if profile.profile_type == ProfileType.LAPTOP else "hpc"
+            logger.info(f"Auto-detected hardware mode: {mode}")
+        
+        # Convert use_only_labels tuple to list
+        use_only_list = list(use_only_labels) if use_only_labels else None
+        
+        # Create output directories
+        output_dir = Path(output_dir)
+        phase_a_dir = output_dir / "phase_a"
+        phase_d_dir = output_dir / "phase_d"
+        
+        # Load configuration
+        config = load_pipeline_config(mode=mode, experiment_config_path=config_path)
+        
+        # Dry run: print execution plan
+        if dry_run:
+            click.echo("=" * 80)
+            click.echo("FULL PIPELINE EXECUTION PLAN")
+            click.echo("=" * 80)
+            click.echo(f"\nDataset: {dataset}")
+            click.echo(f"Output directory: {output_dir}")
+            click.echo(f"Hardware mode: {mode}")
+            if use_only_list:
+                click.echo(f"Label filter (--use-only): {use_only_list}")
+            click.echo(f"\nPhase A: {'SKIP' if skip_phase_a else 'RUN'}")
+            click.echo(f"  - Artifacts: {phase_a_dir}")
+            click.echo(f"Phase D: {'SKIP' if skip_phase_d else 'RUN'}")
+            click.echo(f"  - Artifacts: {phase_d_dir}")
+            click.echo(f"\nResolved Configuration:")
+            click.echo("-" * 40)
+            click.echo(yaml.dump(config, default_flow_style=False, sort_keys=False))
+            return
+        
+        # =====================================================================
+        # Phase A Execution
+        # =====================================================================
+        if skip_phase_a:
+            logger.info("Skipping Phase A (--skip-phase-a)")
+            # Validate Phase A artifacts exist
+            required_artifacts = [
+                phase_a_dir / "clean_dataset.arrow",
+                phase_a_dir / "projection_matrix.pt",
+            ]
+            for artifact in required_artifacts:
+                if not artifact.exists():
+                    raise click.ClickException(
+                        f"--skip-phase-a requires {artifact} to exist"
+                    )
+            logger.info(f"Phase A artifacts validated: {phase_a_dir}")
+            phase_a_artifacts = None
+        else:
+            click.echo("\n" + "=" * 80)
+            click.echo("PHASE A: Pollution Detection & LEACE Projection")
+            click.echo("=" * 80 + "\n")
+            
+            # Create strategy based on mode
+            profile_type = ProfileType.HPC if mode == "hpc" else ProfileType.LAPTOP
+            strategy = StrategyFactory.create_filter_strategy(profile_type)
+            
+            # Create and run Phase A pipeline
+            pipeline_a = PhaseAPipeline(strategy=strategy, config=config)
+            phase_a_artifacts = pipeline_a.run(
+                input_dataset_path=dataset,
+                output_dir=phase_a_dir,
+                use_only_labels=use_only_list,
+            )
+            
+            click.echo(f"\nPhase A complete!")
+            click.echo(f"  Clean dataset: {phase_a_artifacts.clean_dataset_path}")
+            click.echo(f"  Projection matrix: {phase_a_artifacts.projection_matrix_path}")
+            click.echo(f"  Pollution logs: {phase_a_artifacts.pollution_logs_path}")
+        
+        # =====================================================================
+        # Phase D Execution
+        # =====================================================================
+        if skip_phase_d:
+            logger.info("Skipping Phase D (--skip-phase-d)")
+            click.echo("\n" + "=" * 80)
+            click.echo("FULL PIPELINE COMPLETE (Phase D skipped)")
+            click.echo("=" * 80)
+            click.echo(f"\nPhase A artifacts: {phase_a_dir}")
+            return
+        
+        click.echo("\n" + "=" * 80)
+        click.echo("PHASE D: Comparative Fine-Tuning")
+        click.echo("=" * 80 + "\n")
+        
+        # Import Phase D runner
+        from .phase_d_pipeline import run_phase_d_training
+        
+        # Determine Phase A input paths
+        clean_dataset_path = phase_a_dir / "clean_dataset.arrow"
+        projection_matrix_path = phase_a_dir / "projection_matrix.pt"
+        
+        # Run Phase D
+        phase_d_results = run_phase_d_training(
+            dataset_path=clean_dataset_path,
+            output_dir=phase_d_dir,
+            artifacts_dir=phase_a_dir,
+            mode=mode,
+            use_only_labels=tuple(use_only_list) if use_only_list else None,
+        )
+        
+        click.echo(f"\nPhase D complete!")
+        click.echo(f"  Baseline results: {phase_d_dir / 'baseline'}")
+        click.echo(f"  Constrained results: {phase_d_dir / 'constrained'}")
+        
+        # =====================================================================
+        # Final Summary
+        # =====================================================================
+        click.echo("\n" + "=" * 80)
+        click.echo("FULL PIPELINE COMPLETE")
+        click.echo("=" * 80)
+        click.echo(f"\nAll artifacts in: {output_dir}")
+        click.echo(f"  Phase A: {phase_a_dir}")
+        click.echo(f"  Phase D: {phase_d_dir}")
+        
+        if use_only_list:
+            click.echo(f"\nLabel filter applied: {use_only_list}")
+        
+        # Save pipeline summary
+        summary = {
+            "dataset": str(dataset),
+            "output_dir": str(output_dir),
+            "mode": mode,
+            "label_filter": use_only_list,
+            "phase_a_dir": str(phase_a_dir),
+            "phase_d_dir": str(phase_d_dir),
+        }
+        summary_path = output_dir / "pipeline_summary.json"
+        summary_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(summary_path, "w") as f:
+            json.dump(summary, f, indent=2)
+        click.echo(f"\nPipeline summary: {summary_path}")
+        
+    except Exception as e:
+        logger.error(f"Full pipeline execution failed: {e}", exc_info=True)
+        raise click.ClickException(str(e))
 
 
 @cli.command("hardware-info")

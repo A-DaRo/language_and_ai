@@ -3,7 +3,7 @@
 seed: 42
 
 gliner:
-  model: "knowledgator/gliner-bi-base-v1.0"
+  model: "urchade/gliner_multi-v2.1"
   confidence_threshold: 0.60
   batch_size: 32
   device: "auto"  # "auto" | "cpu" | "cuda" (explicit authority)
@@ -80,7 +80,7 @@ gliner:
     batch_size_per_worker: 0
 
 encoder:
-  model: "roberta-base"
+  model: "facebook/xlm-roberta-xl"
   hidden_dim: 768
   max_length: 512
   batch_size: 32
