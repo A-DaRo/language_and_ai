@@ -1,7 +1,7 @@
 # Phase D Verification Configuration (Base)
 
 model:
-  name: "facebook/xlm-roberta-xl"
+  name: "intfloat/multilingual-e5-large"
   max_length: 512
   taxonomy_path: "conf/base/gliner_taxonomy.yaml"
 
