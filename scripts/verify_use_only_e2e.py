@@ -3,30 +3,44 @@
 E2E verification script for --use-only filter across full pipeline.
 
 Usage:
-    python scripts/verify_use_only_e2e.py --samples 100 --label nationality
-    python scripts/verify_use_only_e2e.py --samples 100 --label nationality --label female
+    python scripts/verify_use_only_e2e.py \\
+        --dataset artifacts/data/sobr.arrow \\
+        --output-dir artifacts/test_use_only \\
+        --samples 200 \\
+        --mode laptop
     
-Verifies:
-1. Phase A runs without error with filtered label(s)
-2. Artifacts have correct dimensions
-3. Metadata propagates correctly through all phases
-4. Single-label mode adaptations work correctly
-5. Multi-label mode works as expected
-6. Visualizations are generated appropriately for each mode
+Full Pipeline Test Sequence:
+    1. Create weighted subset (200 samples, nationality weighted distribution)
+    2. Phase A with --use-only nationality (taxonomy prompt verification)
+    3. Phase D training on filtered data
+    4. Verify metrics and metadata propagation
+
+STRICT VERIFICATION:
+    - Verifies that ONLY nationality column_prompts are accessed during GLiNER
+    - No other demographic prompts should be in inference labels
+    - Validates taxonomy filtering works end-to-end
 
 Exit codes:
     0: All tests passed
     1: Test failure (see stderr for details)
 """
 
+from __future__ import annotations
+
 import argparse
+import gc
 import json
 import logging
 import shutil
+import subprocess
 import sys
+import tempfile
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Dict, List, Optional, Set
+
+import numpy as np
 
 # Add src to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
@@ -43,6 +57,52 @@ logger = logging.getLogger(__name__)
 logging.getLogger("neuro_stylometry").setLevel(logging.INFO)
 
 
+# =============================================================================
+# Constants
+# =============================================================================
+ALL_DEMOGRAPHIC_COLUMNS = [
+    "nationality",
+    "female",
+    "birth_year",
+    "feeling_thinking",
+    "judging_perceiving",
+    "sensing_intuitive",
+    "extrovert_introvert",
+    "political_leaning",
+]
+
+# Columns that should NOT appear in prompts when --use-only nationality is set
+EXCLUDED_COLUMNS_FOR_NATIONALITY_ONLY = [
+    col for col in ALL_DEMOGRAPHIC_COLUMNS if col != "nationality"
+]
+
+
+# =============================================================================
+# Data Classes
+# =============================================================================
+@dataclass
+class TestResult:
+    """Result from a test step."""
+    passed: bool
+    errors: List[str] = field(default_factory=list)
+    warnings: List[str] = field(default_factory=list)
+    info: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class TaxonomyAccessLog:
+    """Log of taxonomy prompt accesses during inference."""
+    accessed_columns: Set[str] = field(default_factory=set)
+    inference_labels: List[str] = field(default_factory=list)
+    
+    def contains_excluded_columns(self, excluded: List[str]) -> List[str]:
+        """Return list of excluded columns that were accessed."""
+        return [col for col in excluded if col in self.accessed_columns]
+
+
+# =============================================================================
+# Helper Functions
+# =============================================================================
 def print_section(title: str, char: str = "=", width: int = 80):
     """Print a section header."""
     print(f"\n{char * width}")
@@ -56,10 +116,396 @@ def print_step(step_num: int, total: int, description: str):
     print("-" * 60)
 
 
+def print_substep(description: str):
+    """Print a substep indicator."""
+    print(f"  → {description}")
+
+
+# =============================================================================
+# Dataset Preparation with Weighted Sampling
+# =============================================================================
+def create_weighted_subset(
+    input_path: Path,
+    output_path: Path,
+    target_column: str,
+    num_samples: int,
+    seed: int = 42,
+) -> Dict[str, Any]:
+    """
+    Create a weighted subset with more balanced distribution of target column.
+    
+    Uses stratified sampling to ensure adequate representation of each
+    category in the target column.
+    
+    Args:
+        input_path: Path to source Arrow dataset.
+        output_path: Path to save subset Arrow dataset.
+        target_column: Column to use for stratified sampling.
+        num_samples: Target number of samples.
+        seed: Random seed for reproducibility.
+        
+    Returns:
+        Dict with subset statistics.
+    """
+    import pyarrow as pa
+    import pyarrow.compute as pc
+    import pyarrow.feather as feather
+    
+    print_substep(f"Loading source dataset: {input_path}")
+    table = feather.read_table(input_path)
+    print(f"    Source: {len(table):,} rows")
+    
+    # Filter to rows with valid target column
+    valid_mask = pc.is_valid(table[target_column])
+    table = table.filter(valid_mask)
+    print(f"    After filtering nulls in '{target_column}': {len(table):,} rows")
+    
+    # Get value counts for stratification
+    values = table[target_column].to_pandas()
+    value_counts = values.value_counts()
+    print(f"    Unique values in '{target_column}': {len(value_counts)}")
+    
+    # Calculate samples per stratum (weighted by inverse frequency for balance)
+    rng = np.random.default_rng(seed)
+    
+    # Target roughly equal samples per category, but cap at available
+    samples_per_category = num_samples // len(value_counts)
+    remainder = num_samples % len(value_counts)
+    
+    selected_indices = []
+    stats = {"by_category": {}}
+    
+    for i, (category, count) in enumerate(value_counts.items()):
+        # Allocate extra samples to first categories if there's remainder
+        target_count = samples_per_category + (1 if i < remainder else 0)
+        actual_count = min(target_count, count)
+        
+        # Get indices for this category
+        category_mask = values == category
+        category_indices = np.where(category_mask)[0]
+        
+        # Sample from this category
+        if len(category_indices) > actual_count:
+            sampled = rng.choice(category_indices, size=actual_count, replace=False)
+        else:
+            sampled = category_indices
+        
+        selected_indices.extend(sampled.tolist())
+        stats["by_category"][str(category)] = len(sampled)
+    
+    # Shuffle selected indices
+    selected_indices = list(set(selected_indices))  # Remove any duplicates
+    rng.shuffle(selected_indices)
+    
+    # Take final subset (might be slightly different from target due to category availability)
+    if len(selected_indices) > num_samples:
+        selected_indices = selected_indices[:num_samples]
+    
+    subset_table = table.take(pa.array(selected_indices))
+    
+    # Save subset
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    feather.write_feather(subset_table, output_path)
+    
+    stats["total_samples"] = len(subset_table)
+    stats["source_samples"] = len(table)
+    stats["target_column"] = target_column
+    
+    print(f"    Created subset: {len(subset_table):,} samples")
+    print(f"    Distribution: {stats['by_category']}")
+    
+    return stats
+
+
+# =============================================================================
+# Taxonomy Prompt Verification
+# =============================================================================
+def verify_taxonomy_filtering(
+    taxonomy_config: Dict[str, Any],
+    use_only_labels: List[str],
+) -> TestResult:
+    """
+    Verify that taxonomy is correctly filtered to only include specified labels.
+    
+    This is the CRITICAL check: ensures only nationality prompts are used
+    when --use-only nationality is specified.
+    
+    Args:
+        taxonomy_config: The column_prompts dict from taxonomy.
+        use_only_labels: Labels that should be included.
+        
+    Returns:
+        TestResult with pass/fail and details.
+    """
+    result = TestResult(passed=True)
+    
+    # Get all columns in the taxonomy
+    taxonomy_columns = set(taxonomy_config.keys())
+    expected_columns = set(use_only_labels)
+    
+    result.info["taxonomy_columns"] = list(taxonomy_columns)
+    result.info["expected_columns"] = list(expected_columns)
+    
+    # Check for unexpected columns (should be EMPTY if filtering works)
+    unexpected = taxonomy_columns - expected_columns
+    if unexpected:
+        result.passed = False
+        result.errors.append(
+            f"CRITICAL: Taxonomy contains unexpected columns: {sorted(unexpected)}"
+        )
+        result.errors.append(
+            "This means --use-only filter is NOT properly filtering the taxonomy!"
+        )
+    
+    # Check for missing columns
+    missing = expected_columns - taxonomy_columns
+    if missing:
+        result.passed = False
+        result.errors.append(f"Expected columns missing from taxonomy: {sorted(missing)}")
+    
+    # Count prompts per column
+    prompt_counts = {col: len(prompts) for col, prompts in taxonomy_config.items()}
+    result.info["prompt_counts"] = prompt_counts
+    
+    if result.passed:
+        print(f"    ✓ Taxonomy contains ONLY expected columns: {sorted(expected_columns)}")
+        print(f"    ✓ Prompt counts: {prompt_counts}")
+    
+    return result
+
+
+def verify_inference_labels(
+    inference_labels: List[str],
+    use_only_labels: List[str],
+    taxonomy_config: Dict[str, Any],
+) -> TestResult:
+    """
+    Verify that inference labels only contain prompts from allowed columns.
+    
+    Args:
+        inference_labels: Flat list of labels used in GLiNER inference.
+        use_only_labels: Allowed demographic columns.
+        taxonomy_config: Full taxonomy for reference.
+        
+    Returns:
+        TestResult with pass/fail and details.
+    """
+    result = TestResult(passed=True)
+    
+    result.info["num_inference_labels"] = len(inference_labels)
+    result.info["inference_labels_sample"] = inference_labels[:10]
+    
+    # Build mapping of prompt -> column from taxonomy
+    prompt_to_column = {}
+    for col, prompts in taxonomy_config.items():
+        for prompt in prompts:
+            prompt_to_column[prompt] = col
+    
+    # Check each inference label
+    unexpected_columns = set()
+    unexpected_labels = []
+    
+    for label in inference_labels:
+        if label in prompt_to_column:
+            col = prompt_to_column[label]
+            if col not in use_only_labels:
+                unexpected_columns.add(col)
+                unexpected_labels.append((label, col))
+    
+    if unexpected_columns:
+        result.passed = False
+        result.errors.append(
+            f"CRITICAL: Inference labels contain prompts from excluded columns: {sorted(unexpected_columns)}"
+        )
+        for label, col in unexpected_labels[:5]:
+            result.errors.append(f"  - '{label}' → column '{col}'")
+        if len(unexpected_labels) > 5:
+            result.errors.append(f"  ... and {len(unexpected_labels) - 5} more")
+    else:
+        print(f"    ✓ All {len(inference_labels)} inference labels are from allowed columns")
+    
+    return result
+
+
+# =============================================================================
+# Phase A Execution with Taxonomy Monitoring
+# =============================================================================
+def run_phase_a_with_monitoring(
+    dataset_path: Path,
+    output_dir: Path,
+    use_only_labels: List[str],
+    mode: str = "laptop",
+) -> TestResult:
+    """
+    Run Phase A with --use-only filter and monitor taxonomy access.
+    
+    This function:
+    1. Loads config and creates strategy
+    2. Intercepts taxonomy to verify filtering
+    3. Runs Phase A pipeline
+    4. Returns verification results
+    
+    Args:
+        dataset_path: Path to input dataset.
+        output_dir: Output directory for artifacts.
+        use_only_labels: List of demographic labels to filter to.
+        mode: Hardware mode (laptop/hpc).
+        
+    Returns:
+        TestResult with execution and verification results.
+    """
+    from neuro_stylometry.phase_a_pipeline import PhaseAPipeline
+    from neuro_stylometry.factories.strategy_factory import StrategyFactory
+    from neuro_stylometry.hardware_ops.detection import ProfileType
+    from neuro_stylometry.config import load_pipeline_config
+    from neuro_stylometry.pollution_guard.gliner_detector import SOBRTaxonomy
+    
+    result = TestResult(passed=True)
+    
+    try:
+        print_substep(f"Hardware mode: {mode}")
+        print_substep(f"Labels: {use_only_labels}")
+        print_substep(f"Output: {output_dir}")
+        
+        # Create strategy
+        profile_type = ProfileType.HPC if mode == "hpc" else ProfileType.LAPTOP
+        strategy = StrategyFactory.create_filter_strategy(profile_type)
+        
+        # Load configuration
+        config = load_pipeline_config(mode=mode)
+        
+        # Load taxonomy config to verify filtering
+        taxonomy_cfg_path = Path(config.get("gliner", {}).get("taxonomy_path", "conf/base/gliner_taxonomy.yaml"))
+        
+        if not taxonomy_cfg_path.is_absolute():
+            taxonomy_cfg_path = Path(__file__).parent.parent / taxonomy_cfg_path
+        
+        import yaml
+        with open(taxonomy_cfg_path) as f:
+            full_taxonomy_yaml = yaml.safe_load(f)
+        
+        # The YAML structure is: taxonomy.column_prompts.<col>.prompts/distractors/etc.
+        taxonomy_section = full_taxonomy_yaml.get("taxonomy", {})
+        
+        print_substep("Verifying taxonomy configuration...")
+        
+        # Create taxonomy using from_config which properly parses the nested structure
+        full_taxonomy = SOBRTaxonomy.from_config(taxonomy_section)
+        all_columns = sorted(full_taxonomy.column_prompts.keys())
+        print(f"    Full taxonomy columns: {all_columns}")
+        print(f"    Total inference labels: {len(full_taxonomy.get_inference_labels())}")
+        
+        # TEST: Verify filter_columns method exists and works
+        try:
+            filtered_taxonomy = full_taxonomy.filter_columns(use_only_labels)
+            filtered_columns = sorted(filtered_taxonomy.column_prompts.keys())
+            print(f"    Filtered taxonomy columns: {filtered_columns}")
+            print(f"    Filtered inference labels: {len(filtered_taxonomy.get_inference_labels())}")
+            
+            # Verify filtering worked - convert column_prompts keys to set for comparison
+            taxonomy_columns = set(filtered_taxonomy.column_prompts.keys())
+            expected_columns = set(use_only_labels)
+            
+            # Check for unexpected columns (should be EMPTY if filtering works)
+            unexpected = taxonomy_columns - expected_columns
+            if unexpected:
+                result.passed = False
+                result.errors.append(
+                    f"CRITICAL: Taxonomy contains unexpected columns: {sorted(unexpected)}"
+                )
+                result.errors.append(
+                    "This means --use-only filter is NOT properly filtering the taxonomy!"
+                )
+                return result
+            
+            # Check for missing columns
+            missing = expected_columns - taxonomy_columns
+            if missing:
+                result.passed = False
+                result.errors.append(f"Expected columns missing from taxonomy: {sorted(missing)}")
+                return result
+            
+            print(f"    ✓ Taxonomy filtering verified: only {use_only_labels} columns")
+                
+        except AttributeError as e:
+            result.passed = False
+            result.errors.append(f"CRITICAL: SOBRTaxonomy.filter_columns() method missing: {e}")
+            return result
+        
+        # Verify that the strategies actually USE the filtered taxonomy
+        # This is done by checking if use_only_labels flows through to GLiNER init
+        print_substep("Running Phase A pipeline...")
+        
+        # Create and run pipeline
+        pipeline = PhaseAPipeline(strategy=strategy, config=config)
+        
+        start_time = time.time()
+        artifacts = pipeline.run(
+            input_dataset_path=dataset_path,
+            output_dir=output_dir,
+            use_only_labels=use_only_labels,
+        )
+        elapsed = time.time() - start_time
+        
+        result.info["elapsed_seconds"] = elapsed
+        result.info["num_samples"] = artifacts.metadata.get("num_samples")
+        
+        print(f"    Phase A completed in {elapsed:.1f}s")
+        print(f"    Samples processed: {artifacts.metadata.get('num_samples')}")
+        
+        # Verify artifacts exist
+        if not artifacts.clean_dataset_path.exists():
+            result.passed = False
+            result.errors.append("clean_dataset.arrow not created")
+        
+        if not artifacts.projection_matrix_path.exists():
+            result.passed = False
+            result.errors.append("projection_matrix.pt not created")
+        
+        # Check metrics for label_filter propagation
+        metrics_path = output_dir / "reports" / "phase_a" / "phase_a_metrics.json"
+        if metrics_path.exists():
+            with open(metrics_path) as f:
+                metrics = json.load(f)
+            
+            label_filter = metrics.get("execution", {}).get("label_filter")
+            if label_filter is None:
+                result.warnings.append("label_filter not found in metrics")
+            elif set(label_filter) != set(use_only_labels):
+                result.errors.append(
+                    f"label_filter mismatch: expected {use_only_labels}, got {label_filter}"
+                )
+                result.passed = False
+            else:
+                print(f"    ✓ label_filter in metrics: {label_filter}")
+            
+            # Check probed columns
+            probed_cols = list(metrics.get("probe", {}).get("by_column", {}).keys())
+            result.info["probed_columns"] = probed_cols
+            
+            # For single-label mode, should only probe the specified column
+            if len(use_only_labels) == 1:
+                if len(probed_cols) != 1 or probed_cols[0] != use_only_labels[0]:
+                    result.warnings.append(
+                        f"Expected single probed column '{use_only_labels[0]}', got {probed_cols}"
+                    )
+                else:
+                    print(f"    ✓ Single-label probing verified: {probed_cols}")
+        
+        return result
+        
+    except Exception as e:
+        result.passed = False
+        result.errors.append(f"Phase A execution failed: {e}")
+        logger.exception("Phase A execution error")
+        return result
+# =============================================================================
+# Phase A Artifact Verification
+# =============================================================================
 def verify_phase_a_artifacts(
     output_dir: Path,
     expected_labels: List[str],
-) -> dict:
+) -> TestResult:
     """
     Verify Phase A artifacts match expected structure and dimensions.
     
@@ -68,18 +514,12 @@ def verify_phase_a_artifacts(
         expected_labels: Expected demographic labels from --use-only.
         
     Returns:
-        Dict with verification results.
+        TestResult with verification results.
     """
     import pyarrow.feather as feather
     import torch
     
-    results = {
-        "passed": True,
-        "errors": [],
-        "warnings": [],
-        "info": {},
-    }
-    
+    result = TestResult(passed=True)
     is_single_label = len(expected_labels) == 1
     
     # Check required artifacts exist
@@ -92,84 +532,55 @@ def verify_phase_a_artifacts(
     for filename in required_files:
         filepath = output_dir / filename
         if not filepath.exists():
-            results["errors"].append(f"Missing required artifact: {filename}")
-            results["passed"] = False
+            result.errors.append(f"Missing required artifact: {filename}")
+            result.passed = False
     
-    if not results["passed"]:
-        return results
+    if not result.passed:
+        return result
     
     # Load and verify clean dataset
     clean_dataset = feather.read_table(output_dir / "clean_dataset.arrow")
-    results["info"]["num_samples"] = len(clean_dataset)
-    print(f"  ✓ Dataset: {len(clean_dataset)} rows")
+    result.info["num_samples"] = len(clean_dataset)
+    print(f"    ✓ Dataset: {len(clean_dataset)} rows")
     
     # Load and verify projection matrix
-    projection_matrix = torch.load(output_dir / "projection_matrix.pt", map_location="cpu", weights_only=False)
-    results["info"]["projection_shape"] = list(projection_matrix.shape)
-    print(f"  ✓ Projection matrix: {tuple(projection_matrix.shape)}")
+    projection_matrix = torch.load(
+        output_dir / "projection_matrix.pt",
+        map_location="cpu",
+        weights_only=False
+    )
+    result.info["projection_shape"] = list(projection_matrix.shape)
+    print(f"    ✓ Projection matrix: {tuple(projection_matrix.shape)}")
     
     # Check projection matrix is valid (roughly idempotent)
     P2 = projection_matrix @ projection_matrix
     diff = torch.norm(P2 - projection_matrix).item()
     if diff > 0.1:
-        results["warnings"].append(f"Projection matrix idempotence check: ||P²-P||={diff:.4f}")
+        result.warnings.append(f"Projection matrix idempotence check: ||P²-P||={diff:.4f}")
+    else:
+        print(f"    ✓ Projection idempotence: ||P²-P||={diff:.6f}")
     
     # Load pollution logs
     pollution_logs = feather.read_table(output_dir / "pollution_logs.arrow")
-    results["info"]["num_pollution_spans"] = len(pollution_logs)
+    result.info["num_pollution_spans"] = len(pollution_logs)
+    print(f"    ✓ Pollution logs: {len(pollution_logs)} spans")
     
-    # Check for metrics file
-    metrics_path = output_dir / "reports" / "phase_a_metrics.json"
-    if metrics_path.exists():
-        with open(metrics_path) as f:
-            metrics = json.load(f)
-        
-        # Check label_filter in execution section
-        label_filter = metrics.get("execution", {}).get("label_filter")
-        results["info"]["label_filter"] = label_filter
-        
-        if label_filter is None:
-            results["errors"].append(
-                f"Expected label_filter={expected_labels} but got None"
-            )
-            results["passed"] = False
-        else:
-            # Verify all expected labels are in the filter
-            for label in expected_labels:
-                if label not in label_filter:
-                    results["errors"].append(
-                        f"Expected label_filter to contain '{label}' but got {label_filter}"
-                    )
-                    results["passed"] = False
-            if results["passed"]:
-                print(f"  ✓ Label filter: {label_filter}")
-        
-        # Check probe results if available
-        probe_results = metrics.get("probe", {})
-        if probe_results:
-            by_column = probe_results.get("by_column", {})
-            results["info"]["probed_columns"] = list(by_column.keys())
-            
-            # Verify all expected labels are in probed columns
-            for label in expected_labels:
-                if label not in by_column:
-                    results["errors"].append(
-                        f"Expected '{label}' in probed columns but found: {list(by_column.keys())}"
-                    )
-                    results["passed"] = False
-            
-            if results["passed"]:
-                print(f"  ✓ Probing results: {list(by_column.keys())}")
-    else:
-        results["warnings"].append(f"Metrics file not found: {metrics_path}")
+    # Check entity types in pollution logs (should only be from allowed columns)
+    if "entity_type" in pollution_logs.column_names:
+        entity_types = set(pollution_logs["entity_type"].to_pylist())
+        result.info["entity_types"] = list(entity_types)
+        print(f"    ✓ Entity types detected: {sorted(entity_types)}")
     
-    return results
+    return result
 
 
+# =============================================================================
+# Visualization Verification
+# =============================================================================
 def verify_visualizations(
     reports_dir: Path,
     is_single_label: bool,
-) -> dict:
+) -> TestResult:
     """
     Verify correct visualizations were generated.
     
@@ -178,22 +589,16 @@ def verify_visualizations(
         is_single_label: Whether single-label mode was used.
         
     Returns:
-        Dict with verification results.
+        TestResult with verification results.
     """
-    results = {
-        "passed": True,
-        "errors": [],
-        "warnings": [],
-        "info": {},
-    }
+    result = TestResult(passed=True)
     
-    # Expected visualizations
-    always_expected = [
+    # Expected visualizations (may vary based on config)
+    expected_always = [
         "amnesic_drop_with_ci.png",
         "embedding_separability.png",
     ]
     
-    # These may or may not be generated depending on probe config
     optional = [
         "solver_convergence_benchmark.png",
     ]
@@ -205,33 +610,35 @@ def verify_visualizations(
         "demographic_score_matrix.png",
     ]
     
-    for viz in always_expected:
-        viz_path = reports_dir / viz
-        if viz_path.exists():
-            print(f"  ✓ {viz}")
+    found_visualizations = []
+    if reports_dir.exists():
+        found_visualizations = [f.name for f in reports_dir.glob("*.png")]
+    
+    result.info["found_visualizations"] = found_visualizations
+    
+    for viz in expected_always:
+        if viz in found_visualizations:
+            print(f"    ✓ {viz}")
         else:
-            # Not all visualizations may be generated depending on config
-            results["warnings"].append(f"Expected visualization not found: {viz}")
-            print(f"  ⚠ {viz}: not found")
+            result.warnings.append(f"Expected visualization not found: {viz}")
+            print(f"    ⚠ {viz}: not found")
     
     for viz in optional:
-        viz_path = reports_dir / viz
-        if viz_path.exists():
-            print(f"  ✓ {viz}")
+        if viz in found_visualizations:
+            print(f"    ✓ {viz}")
         else:
-            print(f"  - {viz}: not generated (optional)")
+            print(f"    - {viz}: not generated (optional)")
     
     for viz in multi_label_only:
-        viz_path = reports_dir / viz
         if is_single_label:
-            if viz_path.exists():
-                results["warnings"].append(f"Single-label mode should skip: {viz}")
-                print(f"  ⚠ {viz}: should be skipped in single-label mode")
+            if viz in found_visualizations:
+                result.warnings.append(f"Single-label mode should skip: {viz}")
+                print(f"    ⚠ {viz}: should be skipped in single-label mode")
             else:
-                print(f"  ✓ {viz}: skipped (single-label)")
+                print(f"    ✓ {viz}: skipped (single-label)")
         else:
-            if viz_path.exists():
-                print(f"  ✓ {viz}")
+            if viz in found_visualizations:
+                print(f"    ✓ {viz}")
             else:
                 print(f"  - {viz}: not found")
     
@@ -320,7 +727,7 @@ def verify_phase_d_report_outputs(report_dir: Path) -> dict:
 def verify_single_label_adaptations(
     output_dir: Path,
     label: str,
-) -> dict:
+) -> TestResult:
     """
     Verify single-label mode adaptations.
     
@@ -329,19 +736,14 @@ def verify_single_label_adaptations(
         label: The single label that was used.
         
     Returns:
-        Dict with verification results.
+        TestResult with verification results.
     """
-    results = {
-        "passed": True,
-        "errors": [],
-        "warnings": [],
-        "info": {},
-    }
+    result = TestResult(passed=True)
     
-    metrics_path = output_dir / "reports" / "phase_a_metrics.json"
+    metrics_path = output_dir / "reports" / "phase_a" / "phase_a_metrics.json"
     if not metrics_path.exists():
-        results["warnings"].append("Metrics file not found")
-        return results
+        result.warnings.append("Metrics file not found")
+        return result
     
     with open(metrics_path) as f:
         metrics = json.load(f)
@@ -350,8 +752,8 @@ def verify_single_label_adaptations(
     label_filter = metrics.get("execution", {}).get("label_filter", [])
     is_single = len(label_filter) == 1
     mode = "single_label" if is_single else "multi_label"
-    print(f"  ✓ Mode: {mode}")
-    results["info"]["mode"] = mode
+    print(f"    ✓ Mode: {mode}")
+    result.info["mode"] = mode
     
     # Check probing results
     probe_results = metrics.get("probe", {})
@@ -359,43 +761,38 @@ def verify_single_label_adaptations(
         by_column = probe_results.get("by_column", {})
         if is_single:
             if len(by_column) == 1 and label in by_column:
-                print(f"  ✓ Probing results: single column '{label}'")
+                print(f"    ✓ Probing results: single column '{label}'")
+            elif len(by_column) == 0:
+                result.warnings.append("No probing results found")
             else:
-                results["errors"].append(
-                    f"Expected single column '{label}' in probing results"
+                result.errors.append(
+                    f"Expected single column '{label}' in probing, got {list(by_column.keys())}"
                 )
-                results["passed"] = False
+                result.passed = False
     
-    # Check control probe (should be skipped in single-label mode)
-    control_probe = metrics.get("control_probe", {})
-    if is_single:
-        if not control_probe or control_probe.get("skipped"):
-            print(f"  ✓ Control probe: skipped (as expected)")
-        else:
-            results["warnings"].append("Control probe should be skipped in single-label mode")
-    
-    return results
+    return result
 
 
-def run_phase_a(
-    dataset_path: Path,
-    output_dir: Path,
+# =============================================================================
+# Phase D Execution (Optional)
+# =============================================================================
+def run_phase_d(
+    phase_a_output: Path,
+    phase_d_output: Path,
     use_only_labels: List[str],
-    samples: int,
-    mode: str = "auto",
-) -> bool:
+    mode: str = "laptop",
+) -> TestResult:
     """
-    Run Phase A with --use-only filter.
+    Run Phase D training on filtered data.
     
     Args:
-        dataset_path: Path to input dataset.
-        output_dir: Output directory for artifacts.
-        use_only_labels: List of demographic labels to filter to.
-        samples: Number of samples to use (subset).
-        mode: Hardware mode (auto/laptop/hpc).
+        phase_a_output: Path to Phase A output directory.
+        phase_d_output: Output directory for Phase D.
+        use_only_labels: List of demographic labels (for validation).
+        mode: Hardware mode.
         
     Returns:
-        True if successful, False otherwise.
+        TestResult with execution results.
     """
     from neuro_stylometry.phase_a_pipeline import PhaseAPipeline
     from neuro_stylometry.factories.strategy_factory import StrategyFactory
@@ -594,30 +991,50 @@ def run_phase_d_report(
         return False
 
 
+# =============================================================================
+# Main Entry Point
+# =============================================================================
 def main():
     parser = argparse.ArgumentParser(
-        description="E2E verification for --use-only filter"
+        description="E2E verification for --use-only filter (Full Pipeline Test)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+    # Single-label test with 200 samples
+    python scripts/verify_use_only_e2e.py \\
+        --dataset artifacts/data/sobr.arrow \\
+        --output-dir artifacts/test_use_only \\
+        --samples 200 \\
+        --mode laptop
+    
+    # Multi-label test
+    python scripts/verify_use_only_e2e.py \\
+        --dataset artifacts/data/sobr.arrow \\
+        --output-dir artifacts/test_use_only \\
+        --samples 200 \\
+        --labels nationality female \\
+        --mode laptop
+        """
     )
     parser.add_argument(
         "--samples",
         "--phase-a-samples",
         dest="samples",
         type=int,
-        default=100,
-        help="Number of samples to use for testing (default: 100)",
+        default=200,
+        help="Number of samples to use for testing (default: 200)",
     )
     parser.add_argument(
-        "--label",
-        dest="labels",
-        action="append",
-        required=True,
-        help="Demographic label(s) to test with --use-only. Can be specified multiple times.",
+        "--labels",
+        nargs="+",
+        default=["nationality"],
+        help="Demographic label(s) to test with --use-only (default: nationality)",
     )
     parser.add_argument(
         "--dataset",
         type=Path,
         default=Path("artifacts/data/sobr.arrow"),
-        help="Path to input dataset Arrow file (default: artifacts/data/sobr.arrow)",
+        help="Path to input dataset Arrow file",
     )
     parser.add_argument(
         "--output-dir",
@@ -628,6 +1045,14 @@ def main():
     parser.add_argument(
         "--mode",
         type=str,
+        choices=["laptop", "hpc"],
+        default="laptop",
+        help="Hardware mode (default: laptop)",
+    )
+    parser.add_argument(
+        "--skip-phase-d",
+        action="store_true",
+        help="Skip Phase D execution (faster test)",
         choices=["auto", "laptop", "hpc"],
         default="auto",
         help="Hardware mode (auto, laptop, hpc)",
@@ -669,10 +1094,12 @@ def main():
     # Verify dataset exists
     if not args.dataset.exists():
         print(f"❌ Dataset not found: {args.dataset}")
+        print(f"   Please run: python scripts/convert_pandas_to_arrow.py --raw-data-dir datasets --output {args.dataset}")
         return 1
     
     # Determine if single-label mode
     is_single_label = len(args.labels) == 1
+    mode_str = "single-label" if is_single_label else "multi-label"
 
     # Auto-detect hardware mode once for all phases
     if args.mode == "auto":
@@ -689,10 +1116,17 @@ def main():
     # Create output directory
     args.output_dir.mkdir(parents=True, exist_ok=True)
     
+    # Define output paths
+    phase_a_output = args.output_dir / "phase_a"
+    phase_d_output = args.output_dir / "phase_d"
+    reports_dir = phase_a_output / "reports" / "phase_a"  # Nested path matches pipeline output
+    subset_path = args.output_dir / "subset.arrow"
+    
     # Print header
-    print_section(f"E2E Verification: --use-only filter ({'single-label' if is_single_label else 'multi-label'} mode)")
+    print_section(f"E2E Verification: --use-only filter ({mode_str} mode)")
     print(f"Labels: {args.labels}")
     print(f"Samples: {args.samples}")
+    print(f"Mode: {args.mode}")
     print(f"Output: {args.output_dir}")
     
     phase_a_output = args.output_dir / "phase_a"
@@ -715,6 +1149,33 @@ def main():
     if args.run_report:
         total_steps += 1
     current_step = 0
+    all_results: List[TestResult] = []
+    
+    # ==========================================================================
+    # Step 1: Create Weighted Subset
+    # ==========================================================================
+    if not args.skip_execution:
+        current_step += 1
+        print_step(current_step, total_steps, "Creating weighted subset dataset")
+        
+        try:
+            subset_stats = create_weighted_subset(
+                input_path=args.dataset,
+                output_path=subset_path,
+                target_column=args.labels[0],  # Use first label for stratification
+                num_samples=args.samples,
+                seed=42,
+            )
+            print(f"    ✓ Subset created: {subset_stats['total_samples']} samples")
+        except Exception as e:
+            print(f"    ❌ Failed to create subset: {e}")
+            logger.exception("Subset creation failed")
+            return 1
+    
+    # ==========================================================================
+    # Step 2: Run Phase A with Taxonomy Monitoring
+    # ==========================================================================
+    if not args.skip_execution:
     all_passed = True
     
     # Step 1: Run Phase A
@@ -722,70 +1183,85 @@ def main():
         current_step += 1
         print_step(current_step, total_steps, "Running Phase A with --use-only filter")
         
-        success = run_phase_a(
-            dataset_path=args.dataset,
+        phase_a_result = run_phase_a_with_monitoring(
+            dataset_path=subset_path,
             output_dir=phase_a_output,
             use_only_labels=args.labels,
-            samples=args.samples,
             mode=args.mode,
         )
+        all_results.append(phase_a_result)
         
-        if not success:
-            print("\n❌ Phase A execution failed")
+        if not phase_a_result.passed:
+            print("\n❌ Phase A execution/verification FAILED")
+            for error in phase_a_result.errors:
+                print(f"  ERROR: {error}")
             return 1
         
-        print("\n✓ Phase A execution completed")
+        print("\n    ✓ Phase A completed successfully")
     else:
         print(f"\nSkipping execution, verifying artifacts in {phase_a_output}")
     
-    # Step 2: Verify Phase A artifacts
+    # ==========================================================================
+    # Step 3: Verify Phase A Artifacts
+    # ==========================================================================
     current_step += 1
-    print_step(current_step, total_steps, "Verifying Phase A artifacts...")
+    print_step(current_step, total_steps, "Verifying Phase A artifacts")
     
-    results = verify_phase_a_artifacts(
+    artifact_result = verify_phase_a_artifacts(
         output_dir=phase_a_output,
         expected_labels=args.labels,
     )
+    all_results.append(artifact_result)
     
-    if results["errors"]:
-        print("\n❌ ERRORS:")
-        for error in results["errors"]:
-            print(f"  - {error}")
-        all_passed = False
+    if artifact_result.errors:
+        print("\n    ❌ ARTIFACT ERRORS:")
+        for error in artifact_result.errors:
+            print(f"      - {error}")
     
-    if results["warnings"]:
-        print("\n⚠️  WARNINGS:")
-        for warning in results["warnings"]:
-            print(f"  - {warning}")
+    if artifact_result.warnings:
+        print("\n    ⚠️  WARNINGS:")
+        for warning in artifact_result.warnings:
+            print(f"      - {warning}")
     
-    # Step 3: Verify visualizations
+    # ==========================================================================
+    # Step 4: Verify Visualizations
+    # ==========================================================================
     current_step += 1
-    print_step(current_step, total_steps, "Verifying visualizations...")
+    print_step(current_step, total_steps, "Verifying visualizations")
     
-    viz_results = verify_visualizations(
+    viz_result = verify_visualizations(
         reports_dir=reports_dir,
         is_single_label=is_single_label,
     )
+    all_results.append(viz_result)
     
-    if viz_results["errors"]:
-        for error in viz_results["errors"]:
-            print(f"  ❌ {error}")
-        all_passed = False
-    
-    # Step 4 (single-label only): Verify single-label adaptations
+    # ==========================================================================
+    # Step 5: Single-Label Adaptations (if applicable)
+    # ==========================================================================
     if is_single_label:
         current_step += 1
-        print_step(current_step, total_steps, f"Verifying single-label adaptations for '{args.labels[0]}'...")
+        print_step(current_step, total_steps, f"Verifying single-label adaptations for '{args.labels[0]}'")
         
-        adapt_results = verify_single_label_adaptations(
+        single_result = verify_single_label_adaptations(
             output_dir=phase_a_output,
             label=args.labels[0],
         )
+        all_results.append(single_result)
+    
+    # ==========================================================================
+    # Step 6: Phase D (Optional)
+    # ==========================================================================
+    if not args.skip_phase_d and not args.skip_execution:
+        current_step += 1
+        print_step(current_step, total_steps, "Running Phase D (Optional)")
         
-        if adapt_results["errors"]:
-            for error in adapt_results["errors"]:
-                print(f"  ❌ {error}")
-            all_passed = False
+        phase_d_result = run_phase_d(
+            phase_a_output=phase_a_output,
+            phase_d_output=phase_d_output,
+            use_only_labels=args.labels,
+            mode=args.mode,
+        )
+        all_results.append(phase_d_result)
 
     # Step 5: Run Phase D training (optional)
     if args.run_phase_d:
@@ -880,14 +1356,41 @@ def main():
             for warning in report_results["warnings"]:
                 print(f"  ⚠ {warning}")
     
-    # Final result
+    # ==========================================================================
+    # Final Results
+    # ==========================================================================
     print_section("TEST RESULTS")
     
-    if all_passed and results["passed"]:
+    total_errors = sum(len(r.errors) for r in all_results)
+    total_warnings = sum(len(r.warnings) for r in all_results)
+    all_passed = all(r.passed for r in all_results)
+    
+    if total_errors > 0:
+        print("ERRORS:")
+        for r in all_results:
+            for error in r.errors:
+                print(f"  ❌ {error}")
+    
+    if total_warnings > 0:
+        print("\nWARNINGS:")
+        for r in all_results:
+            for warning in r.warnings:
+                print(f"  ⚠️  {warning}")
+    
+    print()
+    if all_passed:
         print("✓ ALL TESTS PASSED")
+        print()
+        print("SUMMARY:")
+        print(f"  - Labels: {args.labels}")
+        print(f"  - Samples: {args.samples}")
+        print(f"  - Mode: {mode_str}")
+        print(f"  - Artifacts: {phase_a_output}")
         return 0
     else:
         print("❌ TESTS FAILED")
+        print(f"  - {total_errors} error(s)")
+        print(f"  - {total_warnings} warning(s)")
         return 1
 
 

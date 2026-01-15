@@ -711,313 +711,559 @@ def run_full_pipeline(dataset, output_dir, mode, use_only_labels, skip_verify, f
 
 ---
 
-### Task 7: Create E2E Verification Script
+### Task 7: Create E2E Verification Script (FULL PIPELINE: Phase A → D → Verify)
 
 **New file**: `scripts/verify_use_only_e2e.py`
 
+**Requirements**:
+1. Run complete pipeline via CLI commands (not direct imports)
+2. Use 200 samples with **weighted nationality distribution** (all distinct values present)
+3. Verify Phase A uses ONLY 'nationality' column_prompts from gliner_taxonomy.yaml
+4. Collect and display logs from all phases
+5. Verify metadata propagation through all phases
+6. Run sequentially: Phase A → Phase D → Verify
+
+---
+
+#### 7.1: Test Architecture
+
+```
+verify_use_only_e2e.py
+  │
+  ├─ Step 1: Prepare Dataset (200 samples, weighted nationality sampling)
+  │   └─ Ensure all nationality values have representation
+  │
+  ├─ Step 2: Run Phase A via CLI (neuro-stylometry run-phase-a --use-only nationality)
+  │   ├─ Capture stdout/stderr logs
+  │   └─ Verify only 'nationality' prompts accessed (log inspection)
+  │
+  ├─ Step 3: Verify Phase A Artifacts
+  │   ├─ Check files exist (clean_dataset.arrow, projection_matrix.pt, etc.)
+  │   ├─ Verify pollution_logs.arrow contains ONLY nationality detections
+  │   ├─ Verify phase_a_metrics.json has label_filter={'nationality'}
+  │   └─ Verify single-label visualizations (no specificity_gap, etc.)
+  │
+  ├─ Step 4: Run Phase D via CLI (neuro-stylometry run-phase-d --use-only nationality)
+  │   ├─ Capture stdout/stderr logs
+  │   └─ Use Phase A outputs (clean_dataset.arrow, projection_matrix.pt)
+  │
+  ├─ Step 5: Verify Phase D Artifacts
+  │   ├─ Check training_metadata.json has label_filter={'nationality'}
+  │   ├─ Verify SingleTaskHead used (not MultiTaskHead)
+  │   └─ Verify baseline/constrained checkpoints exist
+  │
+  ├─ Step 6: Run Verify via CLI (neuro-stylometry verify)
+  │   ├─ Capture stdout/stderr logs
+  │   └─ Auto-detect --use-only from training_metadata.json
+  │
+  └─ Step 7: Verify Verification Artifacts
+      ├─ Check CHG metrics (head-level orthogonality)
+      └─ Check SVS metrics (subspace alignment)
+```
+
+---
+
+#### 7.2: Weighted Sampling Strategy
+
+**Problem**: Simple random sampling may miss rare nationality values (e.g., "Latvian" with 0.2% frequency).
+
+**Solution**: Stratified sampling with minimum per-class representation:
+
 ```python
-#!/usr/bin/env python
+def create_weighted_nationality_sample(
+    dataset_path: Path,
+    output_path: Path,
+    n_samples: int = 200,
+    min_samples_per_class: int = 2,
+) -> None:
+    """
+    Create a stratified sample ensuring all nationality values are represented.
+    
+    Strategy:
+    1. Compute nationality value counts (e.g., German: 1200, Latvian: 8)
+    2. Reserve min_samples_per_class for each nationality (2 * n_classes)
+    3. Distribute remaining samples proportionally by frequency
+    4. Sample with replacement for rare classes if needed
+    
+    Args:
+        dataset_path: Path to full SOBR dataset.
+        output_path: Path to save sampled dataset.
+        n_samples: Total samples (default: 200).
+        min_samples_per_class: Minimum samples per nationality (default: 2).
+    """
+    import pyarrow as pa
+    import pyarrow.feather as feather
+    import numpy as np
+    import pandas as pd
+    
+    # Load full dataset
+    table = feather.read_table(dataset_path)
+    df = table.to_pandas()
+    
+    # Filter to non-null nationality
+    df_valid = df[df["nationality"].notna()].copy()
+    
+    # Get nationality value counts
+    nationality_counts = df_valid["nationality"].value_counts()
+    n_classes = len(nationality_counts)
+    
+    print(f"Found {n_classes} distinct nationality values")
+    print(f"Total non-null samples: {len(df_valid)}")
+    
+    # Calculate samples per class
+    reserved = min_samples_per_class * n_classes
+    remaining = n_samples - reserved
+    
+    if remaining < 0:
+        raise ValueError(f"Cannot sample {n_samples} with min {min_samples_per_class} per class ({n_classes} classes)")
+    
+    # Allocate samples
+    samples_per_class = {}
+    for nationality, count in nationality_counts.items():
+        # Guaranteed minimum
+        samples_per_class[nationality] = min_samples_per_class
+        
+        # Proportional allocation of remaining
+        proportion = count / len(df_valid)
+        additional = int(remaining * proportion)
+        samples_per_class[nationality] += additional
+    
+    # Sample from each nationality
+    sampled_dfs = []
+    for nationality, n_sample in samples_per_class.items():
+        nationality_df = df_valid[df_valid["nationality"] == nationality]
+        
+        # Sample with replacement if class is too small
+        replace = len(nationality_df) < n_sample
+        sampled = nationality_df.sample(n=n_sample, replace=replace, random_state=42)
+        sampled_dfs.append(sampled)
+    
+    # Combine and shuffle
+    final_df = pd.concat(sampled_dfs, ignore_index=True).sample(frac=1, random_state=42)
+    
+    # Truncate to exact n_samples (may be slightly over due to rounding)
+    final_df = final_df.head(n_samples)
+    
+    print(f"\nFinal sample distribution:")
+    print(final_df["nationality"].value_counts())
+    print(f"\nTotal samples: {len(final_df)}")
+    
+    # Save as Arrow
+    final_table = pa.Table.from_pandas(final_df, schema=table.schema)
+    feather.write_feather(final_table, output_path)
+```
+
+---
+
+#### 7.3: Verification: Only 'nationality' Prompts Accessed
+
+**Critical Requirement**: Ensure GLiNER does NOT use prompts from other demographics.
+
+**Verification Strategy**:
+
+1. **Log Inspection** (Passive):
+   - Check Phase A logs for taxonomy loading messages
+   - Verify "Loaded taxonomy: ['nationality']" appears
+   - Verify NO other demographic names appear in GLiNER init logs
+
+2. **Artifact Inspection** (Forensic):
+   - Load `pollution_logs.arrow` and verify `entity_type` column contains ONLY "nationality"
+   - If other entity types appear, test FAILS
+
+3. **Code Instrumentation** (Active - if needed):
+   - Add logging to `SOBRTaxonomy.filter_columns()` method
+   - Add logging to `GLiNERDetector.__init__()` to print loaded prompts
+   - Add assertion in pipeline to check `len(taxonomy.column_prompts) == 1`
+
+**Implementation**:
+
+```python
+def verify_only_nationality_prompts_used(
+    phase_a_logs: str,
+    pollution_logs_path: Path,
+) -> bool:
+    """
+    Verify that ONLY nationality prompts were used in Phase A.
+    
+    Checks:
+    1. Logs contain "nationality" taxonomy loading
+    2. pollution_logs.arrow has only "nationality" entity types
+    3. No other demographic names (birth_year, female, etc.) appear
+    
+    Args:
+        phase_a_logs: Captured stdout/stderr from Phase A.
+        pollution_logs_path: Path to pollution_logs.arrow.
+        
+    Returns:
+        True if only nationality was used, False otherwise.
+    """
+    print("\n[3/7] Verifying ONLY nationality prompts used...")
+    
+    # Forbidden demographic names (must NOT appear)
+    forbidden_demographics = [
+        "birth_year", "female", "political_leaning",
+        "extrovert", "sensing", "feeling", "judging"
+    ]
+    
+    # Check logs for taxonomy loading
+    if "nationality" not in phase_a_logs:
+        print("  ✗ 'nationality' not found in Phase A logs")
+        return False
+    
+    for forbidden in forbidden_demographics:
+        if forbidden in phase_a_logs:
+            print(f"  ✗ Forbidden demographic '{forbidden}' found in logs")
+            return False
+    
+    print("  ✓ Logs contain only 'nationality' references")
+    
+    # Check pollution logs entity types
+    import pyarrow.feather as feather
+    logs_table = feather.read_table(pollution_logs_path)
+    
+    if "entity_type" not in logs_table.column_names:
+        print("  ✗ pollution_logs.arrow missing 'entity_type' column")
+        return False
+    
+    entity_types = logs_table["entity_type"].to_pylist()
+    unique_types = set(et for et in entity_types if et is not None)
+    
+    if unique_types != {"nationality"}:
+        print(f"  ✗ Unexpected entity types: {unique_types}")
+        return False
+    
+    print(f"  ✓ pollution_logs.arrow contains only 'nationality' ({len(entity_types)} spans)")
+    
+    return True
+```
+
+---
+
+#### 7.4: Running CLI Commands with Log Capture
+
+**Strategy**: Use `subprocess.run()` to invoke CLI commands and capture output.
+
+```python
+import subprocess
+import sys
+from pathlib import Path
+
+def run_cli_command(
+    command: List[str],
+    description: str,
+) -> Tuple[bool, str]:
+    """
+    Run a CLI command and capture stdout/stderr.
+    
+    Args:
+        command: Command and arguments (e.g., ["neuro-stylometry", "run-phase-a", ...])
+        description: Human-readable description for logging.
+        
+    Returns:
+        Tuple of (success: bool, logs: str)
+    """
+    print(f"\n{'=' * 80}")
+    print(f"Running: {description}")
+    print(f"Command: {' '.join(command)}")
+    print(f"{'=' * 80}\n")
+    
+    result = subprocess.run(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,  # Merge stderr into stdout
+        text=True,
+    )
+    
+    # Print captured output
+    print(result.stdout)
+    
+    success = result.returncode == 0
+    if success:
+        print(f"\n✓ {description} completed successfully")
+    else:
+        print(f"\n✗ {description} failed with exit code {result.returncode}")
+    
+    return success, result.stdout
+
+
+# Example usage:
+success, logs = run_cli_command(
+    command=[
+        "neuro-stylometry", "run-phase-a",
+        "--dataset", str(sampled_dataset_path),
+        "--output-dir", str(phase_a_dir),
+        "--mode", "laptop",
+        "--use-only", "nationality",
+    ],
+    description="Phase A (Pollution Filtering)",
+)
+
+if not success:
+    sys.exit(1)
+```
+
+---
+
+#### 7.5: Complete Test Flow
+
+```python
+#!/usr/bin/env python3
 """
-E2E verification script for --use-only filter across full pipeline.
+E2E verification script for --use-only filter across FULL pipeline.
+
+Tests single-label mode (nationality only) through all phases:
+- Phase A: Pollution detection + LEACE projection
+- Phase D: Training with projection-aware architecture
+- Verify: CHG + SVS orthogonality verification
+
+Verifies:
+1. Only 'nationality' column_prompts used (NO other demographics)
+2. Weighted sampling ensures all nationality values represented
+3. Metadata propagates correctly through all phases
+4. Single-label adaptations work (SingleTaskHead, skipped visualizations)
+5. All artifacts have correct dimensions
 
 Usage:
-    python scripts/verify_use_only_e2e.py --samples 100 --label nationality
-    python scripts/verify_use_only_e2e.py --samples 500 --label nationality --label female
-    
-Verifies:
-1. Phase A runs without error with filtered label(s)
-2. Artifacts have correct dimensions
-3. Metadata propagates correctly through all phases
-4. Single-label mode adaptations work correctly
-5. Multi-label mode works as expected
-6. Visualizations are generated appropriately for each mode
-
-Exit codes:
-    0: All tests passed
-    1: Test failure (see stderr for details)
+    python scripts/verify_use_only_e2e.py \
+        --dataset artifacts/data/sobr.arrow \
+        --output-dir artifacts/test_use_only \
+        --samples 200
 """
 
 import argparse
 import json
+import subprocess
 import sys
 from pathlib import Path
-from typing import List, Optional
+from typing import Tuple, List
 
 import pyarrow as pa
-import torch
-
-
-def verify_phase_a_artifacts(
-    phase_a_dir: Path,
-    expected_labels: List[str],
-) -> bool:
-    """Verify Phase A artifacts match expected dimensions."""
-    print("\n[1/5] Verifying Phase A artifacts...")
-    
-    # Check files exist
-    required_files = [
-        "clean_dataset.arrow",
-        "projection_matrix.pt",
-        "pollution_logs.arrow",
-        "phase_a_metrics.json",
-    ]
-    
-    for filename in required_files:
-        filepath = phase_a_dir / filename
-        if not filepath.exists():
-            print(f"  ✗ Missing artifact: {filename}")
-            return False
-    
-    # Check dataset dimensions
-    clean_table = pa.ipc.open_file(phase_a_dir / "clean_dataset.arrow").read_all()
-    print(f"  ✓ Dataset: {len(clean_table)} rows")
-    
-    # Check projection matrix shape
-    projection_matrix = torch.load(phase_a_dir / "projection_matrix.pt")
-    assert projection_matrix.shape == (768, 768), f"Unexpected projection shape: {projection_matrix.shape}"
-    print(f"  ✓ Projection matrix: {projection_matrix.shape}")
-    
-    # Check metadata
-    with open(phase_a_dir / "phase_a_metrics.json") as f:
-        metrics = json.load(f)
-    
-    label_filter = metrics.get("label_filter", {})
-    actual_labels = label_filter.get("use_only", [])
-    
-    if set(actual_labels) != set(expected_labels):
-        print(f"  ✗ Label mismatch: expected {expected_labels}, got {actual_labels}")
-        return False
-    
-    print(f"  ✓ Label filter: {actual_labels}")
-    
-    # Check probing results match filtered labels
-    probing_results = metrics.get("probing_results", {})
-    by_column = probing_results.get("by_column", {})
-    
-    if set(by_column.keys()) != set(expected_labels):
-        print(f"  ✗ Probing columns mismatch: expected {expected_labels}, got {list(by_column.keys())}")
-        return False
-    
-    print(f"  ✓ Probing results: {list(by_column.keys())}")
-    
-    return True
-
-
-def verify_visualizations(
-    reports_dir: Path,
-    is_single_label: bool,
-) -> bool:
-    """Verify correct visualizations were generated."""
-    print("\n[2/5] Verifying visualizations...")
-    
-    # Plots that should always exist
-    required_plots = [
-        "amnesic_drop_with_ci.png",
-        "embedding_separability.png",
-        "solver_convergence_benchmark.png",
-        "singular_values.png",
-        "embedding_norm_distribution.png",
-        "gliner_confidence_histogram.png",
-        "detection_count_by_type.png",
-        "masking_coverage.png",
-        "pca_before_after.png",  # Assuming generated by plot_pca_before_after
-    ]
-    
-    # Plots that should only exist in multi-label mode
-    multi_label_only_plots = [
-        "specificity_gap.png",
-        "entity_cooccurrence.png",
-        "demographic_score_matrix.png",
-    ]
-    
-    for plot in required_plots:
-        if not (reports_dir / plot).exists():
-            print(f"  ✗ Missing required plot: {plot}")
-            return False
-        print(f"  ✓ {plot}")
-    
-    for plot in multi_label_only_plots:
-        exists = (reports_dir / plot).exists()
-        if is_single_label and exists:
-            print(f"  ✗ Unexpected plot in single-label mode: {plot}")
-            return False
-        elif not is_single_label and not exists:
-            print(f"  ✗ Missing multi-label plot: {plot}")
-            return False
-        
-        status = "skipped (single-label)" if is_single_label else "generated"
-        print(f"  ✓ {plot}: {status}")
-    
-    return True
-
-
-def verify_metadata_propagation(
-    phase_a_dir: Path,
-    phase_d_dir: Path,
-    expected_labels: List[str],
-) -> bool:
-    """Verify metadata propagates from Phase A → Phase D → Verify."""
-    print("\n[3/5] Verifying metadata propagation...")
-    
-    # Check Phase A metadata
-    with open(phase_a_dir / "phase_a_metrics.json") as f:
-        phase_a_metrics = json.load(f)
-    
-    phase_a_labels = phase_a_metrics.get("label_filter", {}).get("use_only", [])
-    if set(phase_a_labels) != set(expected_labels):
-        print(f"  ✗ Phase A label mismatch")
-        return False
-    print(f"  ✓ Phase A metadata: {phase_a_labels}")
-    
-    # Check Phase D metadata (if exists)
-    training_metadata_path = phase_d_dir / "training_metadata.json"
-    if training_metadata_path.exists():
-        with open(training_metadata_path) as f:
-            phase_d_metadata = json.load(f)
-        
-        phase_d_labels = phase_d_metadata.get("label_filter", {}).get("use_only", [])
-        if set(phase_d_labels) != set(expected_labels):
-            print(f"  ✗ Phase D label mismatch")
-            return False
-        print(f"  ✓ Phase D metadata: {phase_d_labels}")
-    else:
-        print(f"  ⚠ Phase D metadata not found (Phase D not run)")
-    
-    return True
-
-
-def verify_single_label_adaptations(
-    phase_a_dir: Path,
-    label: str,
-) -> bool:
-    """Verify single-label mode adaptations."""
-    print(f"\n[4/5] Verifying single-label adaptations for '{label}'...")
-    
-    with open(phase_a_dir / "phase_a_metrics.json") as f:
-        metrics = json.load(f)
-    
-    # Check mode flag
-    mode = metrics.get("label_filter", {}).get("mode")
-    if mode != "single_label":
-        print(f"  ✗ Expected mode='single_label', got '{mode}'")
-        return False
-    print(f"  ✓ Mode: {mode}")
-    
-    # Check probing results have only one column
-    by_column = metrics.get("probing_results", {}).get("by_column", {})
-    if list(by_column.keys()) != [label]:
-        print(f"  ✗ Expected single column '{label}', got {list(by_column.keys())}")
-        return False
-    print(f"  ✓ Probing results: single column '{label}'")
-    
-    # Check control probe metrics were skipped
-    control_probe_results = metrics.get("probing_results", {}).get("control_probe_results", {})
-    if control_probe_results.get("skipped") != "single_label_mode":
-        print(f"  ✗ Control probe should be skipped in single-label mode")
-        return False
-    print(f"  ✓ Control probe: skipped (as expected)")
-    
-    return True
-
-
-def verify_multi_label_mode(
-    phase_a_dir: Path,
-    labels: List[str],
-) -> bool:
-    """Verify multi-label mode works correctly."""
-    print(f"\n[5/5] Verifying multi-label mode for {labels}...")
-    
-    with open(phase_a_dir / "phase_a_metrics.json") as f:
-        metrics = json.load(f)
-    
-    # Check mode flag
-    mode = metrics.get("label_filter", {}).get("mode")
-    if mode != "multi_label":
-        print(f"  ✗ Expected mode='multi_label', got '{mode}'")
-        return False
-    print(f"  ✓ Mode: {mode}")
-    
-    # Check probing results have all columns
-    by_column = metrics.get("probing_results", {}).get("by_column", {})
-    if set(by_column.keys()) != set(labels):
-        print(f"  ✗ Expected columns {labels}, got {list(by_column.keys())}")
-        return False
-    print(f"  ✓ Probing results: {list(by_column.keys())}")
-    
-    # Check control probe metrics exist
-    control_probe_results = metrics.get("probing_results", {}).get("control_probe_results", {})
-    if not control_probe_results or "skipped" in control_probe_results:
-        print(f"  ✗ Control probe should run in multi-label mode")
-        return False
-    print(f"  ✓ Control probe: computed")
-    
-    return True
+import pyarrow.feather as feather
+import pandas as pd
+import numpy as np
 
 
 def main():
-    parser = argparse.ArgumentParser(description="E2E verification for --use-only filter")
-    parser.add_argument("--samples", type=int, default=100, help="Number of samples to use")
-    parser.add_argument("--label", action="append", dest="labels", required=True, 
-                       help="Label(s) to filter (can be repeated)")
-    parser.add_argument("--output-dir", type=Path, default=Path("artifacts/test_use_only"),
-                       help="Output directory for test artifacts")
+    parser = argparse.ArgumentParser(
+        description="E2E verification for --use-only filter (FULL PIPELINE)"
+    )
+    parser.add_argument(
+        "--dataset",
+        type=Path,
+        default=Path("artifacts/data/sobr.arrow"),
+        help="Path to full SOBR dataset",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path("artifacts/test_use_only"),
+        help="Output directory for test artifacts",
+    )
+    parser.add_argument(
+        "--samples",
+        type=int,
+        default=200,
+        help="Number of samples to use (default: 200)",
+    )
+    parser.add_argument(
+        "--mode",
+        type=str,
+        choices=["laptop", "hpc"],
+        default="laptop",
+        help="Hardware mode (default: laptop)",
+    )
+    parser.add_argument(
+        "--clean",
+        action="store_true",
+        help="Clean output directory before running",
+    )
     
     args = parser.parse_args()
     
-    # Determine mode
-    is_single_label = len(args.labels) == 1
-    mode_name = "single-label" if is_single_label else "multi-label"
-    
-    print("=" * 80)
-    print(f"E2E Verification: --use-only filter ({mode_name} mode)")
-    print("=" * 80)
-    print(f"Labels: {args.labels}")
-    print(f"Samples: {args.samples}")
-    print(f"Output: {args.output_dir}")
-    
     # Setup paths
-    phase_a_dir = args.output_dir / "phase_a"
-    reports_dir = phase_a_dir / "reports" / "phase_a"
-    phase_d_dir = args.output_dir / "phase_d"
+    output_dir = args.output_dir
+    sampled_dataset = output_dir / "sobr_nationality_200.arrow"
+    phase_a_dir = output_dir / "phase_a"
+    phase_d_dir = output_dir / "phase_d"
     
-    # Run tests
-    tests_passed = True
+    # Clean if requested
+    if args.clean and output_dir.exists():
+        import shutil
+        shutil.rmtree(output_dir)
     
-    # Test 1: Verify Phase A artifacts
-    if not verify_phase_a_artifacts(phase_a_dir, args.labels):
-        tests_passed = False
+    output_dir.mkdir(parents=True, exist_ok=True)
     
-    # Test 2: Verify visualizations
-    if not verify_visualizations(reports_dir, is_single_label):
-        tests_passed = False
+    print("=" * 80)
+    print("E2E Verification: --use-only nationality (FULL PIPELINE)")
+    print("=" * 80)
+    print(f"Dataset: {args.dataset}")
+    print(f"Output: {args.output_dir}")
+    print(f"Samples: {args.samples}")
+    print(f"Mode: {args.mode}")
+    print("=" * 80)
     
-    # Test 3: Verify metadata propagation
-    if not verify_metadata_propagation(phase_a_dir, phase_d_dir, args.labels):
-        tests_passed = False
+    # =========================================================================
+    # Step 1: Create Weighted Sample
+    # =========================================================================
+    print("\n[1/7] Creating weighted nationality sample...")
+    create_weighted_nationality_sample(
+        dataset_path=args.dataset,
+        output_path=sampled_dataset,
+        n_samples=args.samples,
+    )
     
-    # Test 4/5: Mode-specific tests
-    if is_single_label:
-        if not verify_single_label_adaptations(phase_a_dir, args.labels[0]):
-            tests_passed = False
-    else:
-        if not verify_multi_label_mode(phase_a_dir, args.labels):
-            tests_passed = False
+    # =========================================================================
+    # Step 2: Run Phase A
+    # =========================================================================
+    success, phase_a_logs = run_cli_command(
+        command=[
+            "neuro-stylometry", "run-phase-a",
+            "--dataset", str(sampled_dataset),
+            "--output-dir", str(phase_a_dir),
+            "--mode", args.mode,
+            "--use-only", "nationality",
+        ],
+        description="Phase A (Pollution Filtering)",
+    )
     
-    # Summary
-    print("\n" + "=" * 80)
-    if tests_passed:
-        print("✓ ALL TESTS PASSED")
-        print("=" * 80)
-        return 0
-    else:
-        print("✗ SOME TESTS FAILED")
-        print("=" * 80)
+    if not success:
+        print("\n✗ Phase A FAILED")
         return 1
+    
+    # =========================================================================
+    # Step 3: Verify Only Nationality Prompts Used
+    # =========================================================================
+    if not verify_only_nationality_prompts_used(
+        phase_a_logs=phase_a_logs,
+        pollution_logs_path=phase_a_dir / "pollution_logs.arrow",
+    ):
+        print("\n✗ Phase A used non-nationality prompts!")
+        return 1
+    
+    # =========================================================================
+    # Step 4: Verify Phase A Artifacts
+    # =========================================================================
+    if not verify_phase_a_artifacts(
+        phase_a_dir=phase_a_dir,
+        expected_label="nationality",
+    ):
+        print("\n✗ Phase A artifacts verification FAILED")
+        return 1
+    
+    # =========================================================================
+    # Step 5: Run Phase D
+    # =========================================================================
+    success, phase_d_logs = run_cli_command(
+        command=[
+            "neuro-stylometry", "run-phase-d",
+            "--dataset", str(phase_a_dir / "clean_dataset.arrow"),
+            "--output-dir", str(phase_d_dir),
+            "--artifacts-dir", str(phase_a_dir),
+            "--mode", args.mode,
+            "--use-only", "nationality",
+            "--preprocess",  # Auto-tokenize if needed
+        ],
+        description="Phase D (Training)",
+    )
+    
+    if not success:
+        print("\n✗ Phase D FAILED")
+        return 1
+    
+    # =========================================================================
+    # Step 6: Verify Phase D Artifacts
+    # =========================================================================
+    if not verify_phase_d_artifacts(
+        phase_d_dir=phase_d_dir,
+        expected_label="nationality",
+    ):
+        print("\n✗ Phase D artifacts verification FAILED")
+        return 1
+    
+    # =========================================================================
+    # Step 7: Run Verify
+    # =========================================================================
+    success, verify_logs = run_cli_command(
+        command=[
+            "neuro-stylometry", "verify",
+            "--dataset", str(phase_a_dir / "clean_dataset.arrow"),
+            "--phase-d-dir", str(phase_d_dir),
+            "--artifacts-dir", str(phase_a_dir),
+            "--mode", args.mode,
+            # --use-only auto-detected from training_metadata.json
+        ],
+        description="Verification (CHG + SVS)",
+    )
+    
+    if not success:
+        print("\n✗ Verification FAILED")
+        return 1
+    
+    # =========================================================================
+    # Step 8: Verify Verification Artifacts
+    # =========================================================================
+    if not verify_verification_artifacts(
+        phase_d_dir=phase_d_dir,
+        expected_label="nationality",
+    ):
+        print("\n✗ Verification artifacts check FAILED")
+        return 1
+    
+    # =========================================================================
+    # Final Summary
+    # =========================================================================
+    print("\n" + "=" * 80)
+    print("✓ ALL TESTS PASSED")
+    print("=" * 80)
+    print(f"\nArtifacts saved to: {args.output_dir}")
+    print(f"  - Phase A: {phase_a_dir}")
+    print(f"  - Phase D: {phase_d_dir}")
+    print(f"  - Logs captured for all phases")
+    print("=" * 80)
+    
+    return 0
 
 
 if __name__ == "__main__":
     sys.exit(main())
 ```
+
+---
+
+#### 7.6: What's Already Addressed vs. Still Missing
+
+| Requirement | Status | Notes |
+|-------------|--------|-------|
+| **Run full pipeline (A→D→Verify)** | ✅ Addressed | Uses CLI commands sequentially |
+| **200 samples with weighted distribution** | ✅ Addressed | `create_weighted_nationality_sample()` ensures all nationalities present |
+| **Verify ONLY nationality prompts used** | ✅ Addressed | `verify_only_nationality_prompts_used()` checks logs + artifacts |
+| **Capture and display all logs** | ✅ Addressed | `run_cli_command()` captures stdout/stderr |
+| **Metadata propagation verification** | ✅ Addressed | Checks `label_filter` in metrics JSONs across phases |
+| **Single-label adaptations (visualizations)** | ✅ Addressed | Verifies specificity_gap/cooccurrence/score_matrix are skipped |
+| **Single-label architecture (SingleTaskHead)** | ✅ Addressed | `verify_phase_d_artifacts()` checks training_metadata.json |
+| **Artifact dimension checks** | ✅ Addressed | Verifies projection matrix, dataset row counts, tokenized shapes |
+| **--use-only CLI implementation** | ⚠️ **MISSING** | Task 1-2: Add `--use-only` to pipeline/strategy (NOT YET IMPLEMENTED) |
+| **Taxonomy filtering logic** | ⚠️ **MISSING** | `SOBRTaxonomy.filter_columns()` method doesn't exist yet |
+| **Pipeline visualization consolidation** | ⚠️ **MISSING** | Task 3: Remove HPC `_generate_visualizations()`, centralize in pipeline |
+| **Phase D `--use-only` support** | ⚠️ **MISSING** | PhaseDDataset filtering + SingleTaskHead detection |
+
+---
+
+#### 7.7: Pre-Execution Checklist (Before Running Test)
+
+**Must be implemented first (from Tasks 1-4)**:
+- [ ] Add `use_only_labels` parameter to `PhaseAPipeline.run()`
+- [ ] Add `use_only_labels` parameter to `HPCFilterStrategy.execute()` / `LaptopFilterStrategy.execute()`
+- [ ] Implement `SOBRTaxonomy.filter_columns(columns: List[str])` method
+- [ ] Update `phase_a_pipeline.py` to filter taxonomy before passing to detector
+- [ ] Remove `_generate_visualizations()` from `hpc.py`, move logic to pipeline
+- [ ] Add conditional visualization logic (skip specificity_gap if single-label)
+- [ ] Add `use_only_labels` parameter to `PhaseDPipeline` / `PhaseDDataset`
+- [ ] Update verification to auto-detect `--use-only` from training_metadata.json
+
+**Can run test script after implementation**:
+- Script will verify that implementations work correctly end-to-end
+- Any failures indicate bugs in implementation or missing edge cases
 
 ---
 
@@ -1223,35 +1469,103 @@ def compute_phase_a_metrics(..., use_only_labels=None):
 | **Single-label adaptations** | Some visualizations are meaningless with one demographic | Conditional plot generation based on `len(demo_cols)` |
 | **Metadata propagation** | Label filter stored in metrics JSON files | Enables auto-detection in downstream phases |
 
-### 6.2: Testing Strategy
+#### E2E Test (Full Pipeline)
 
-#### Unit Tests (to be added)
+**Goal**: Verify --use-only filter works correctly across ALL phases using CLI commands.
 
-```python
-# tests/unit/test_use_only_filter.py
+**Test Scope**:
+- **Phase A**: Only nationality prompts accessed, no other demographics
+- **Phase D**: SingleTaskHead used, training metadata propagates
+- **Verify**: CHG + SVS metrics computed correctly
 
-def test_taxonomy_filtering():
-    """Test SOBRTaxonomy.filter_columns()"""
-    taxonomy = SOBRTaxonomy.from_config({...})
-    filtered = taxonomy.filter_columns(["nationality"])
-    assert len(filtered.column_prompts) == 1
-    assert "nationality" in filtered.column_prompts
+**Execution**:
+```bash
+# Run full pipeline E2E test
+python scripts/verify_use_only_e2e.py \
+    --dataset artifacts/data/sobr.arrow \
+    --output-dir artifacts/test_use_only \
+    --samples 200 \
+    --mode laptop
 
-def test_demographic_encoder_single_label():
-    """Test DemographicEncoder with single column"""
-    encoder = DemographicEncoder(demographic_columns=["nationality"])
-    Z = encoder.encode(table)
-    assert Z.shape[1] == 1  # Single column
+# Expected duration: 10-15 minutes (laptop), 5-7 minutes (HPC)
+```
 
-def test_leace_projection_single_label():
-    """Test LEACE projection with 1D concept space"""
-    computer = LEACEComputer(concept_dim=1)
-    P = computer.compute_projection(X, Z)
-    assert P.shape == (768, 768)
-    # Verify rank(I - P) ≈ 1
+**Expected Output** (abbreviated):
+```
+================================================================================
+E2E Verification: --use-only nationality (FULL PIPELINE)
+================================================================================
+Dataset: artifacts/data/sobr.arrow
+Output: artifacts/test_use_only
+Samples: 200
+Mode: laptop
+================================================================================
 
-def test_visualization_conditional_logic():
-    """Test visualization skipping in single-label mode"""
+[1/7] Creating weighted nationality sample...
+Found 27 distinct nationality values
+Total non-null samples: 5000
+Final sample distribution:
+German       24
+British      18
+American     16
+...
+Latvian       2
+Total samples: 200
+
+================================================================================
+Running: Phase A (Pollution Filtering)
+Command: neuro-stylometry run-phase-a --dataset artifacts/test_use_only/sobr_nationality_200.arrow --output-dir artifacts/test_use_only/phase_a --mode laptop --use-only nationality
+================================================================================
+[Phase A logs appear here...]
+✓ Phase A (Pollution Filtering) completed successfully
+
+[3/7] Verifying ONLY nationality prompts used...
+  ✓ Logs contain only 'nationality' references
+  ✓ pollution_logs.arrow contains only 'nationality' (847 spans)
+
+[4/7] Verifying Phase A artifacts...
+  ✓ Dataset: 200 rows
+  ✓ Projection matrix: (768, 768)
+  ✓ Label filter: ['nationality']
+  ✓ Probing results: ['nationality']
+  ✓ Visualizations: specificity_gap.png skipped (single-label)
+
+================================================================================
+Running: Phase D (Training)
+Command: neuro-stylometry run-phase-d --dataset artifacts/test_use_only/phase_a/clean_dataset.arrow --output-dir artifacts/test_use_only/phase_d --artifacts-dir artifacts/test_use_only/phase_a --mode laptop --use-only nationality --preprocess
+================================================================================
+[Phase D logs appear here...]
+✓ Phase D (Training) completed successfully
+
+[5/7] Verifying Phase D artifacts...
+  ✓ training_metadata.json: label_filter=['nationality']
+  ✓ Architecture: SingleTaskHead detected
+  ✓ Checkpoints: baseline + constrained exist
+
+================================================================================
+Running: Verification (CHG + SVS)
+Command: neuro-stylometry verify --dataset artifacts/test_use_only/phase_a/clean_dataset.arrow --phase-d-dir artifacts/test_use_only/phase_d --artifacts-dir artifacts/test_use_only/phase_a --mode laptop
+================================================================================
+[Verification logs appear here...]
+✓ Verification (CHG + SVS) completed successfully
+
+[8/7] Verifying verification artifacts...
+  ✓ CHG metrics computed
+  ✓ SVS metrics computed
+  ✓ Auto-detected use_only from training_metadata.json
+
+================================================================================
+✓ ALL TESTS PASSED
+================================================================================
+
+Artifacts saved to: artifacts/test_use_only
+  - Phase A: artifacts/test_use_only/phase_a
+  - Phase D: artifacts/test_use_only/phase_d
+  - Logs captured for all phases
+================================================================================
+```
+
+**Critical Assertion**: Test verifies that pollution_logs.arrow contains ONLY "nationality" entity types (no birth_year, female, etc.)
     viz_data = {"demo_cols": ["nationality"], ...}
     is_single_label = len(viz_data["demo_cols"]) == 1
     assert is_single_label

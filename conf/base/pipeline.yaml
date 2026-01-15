@@ -81,7 +81,6 @@ gliner:
 
 encoder:
   model: "facebook/xlm-roberta-xl"
-  hidden_dim: 768
   max_length: 512
   batch_size: 32
   device: "auto"  # "auto" | "cpu" | "cuda"
