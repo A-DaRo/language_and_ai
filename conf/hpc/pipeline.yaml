@@ -185,7 +185,7 @@ gliner:
     shard_size: 50000              # Large shards for HPC memory
 
 encoder:
-  model: "facebook/xlm-roberta-base"
+  model: "FacebookAI/xlm-roberta-base"
   device: "cuda"
   output_device: "cpu"             # Move to CPU immediately (prevent VRAM exhaustion during accumulation)
   batch_size: 512                  # Large batch for embedding
