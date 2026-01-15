@@ -780,6 +780,8 @@ def run_phase_d(
     artifacts_dir: Path,
     use_only_labels: List[str],
     mode: str,
+    dataset_path_post: Optional[Path] = None,
+    dataset_path_masked: Optional[Path] = None,
 ) -> bool:
     """Run Phase D training for baseline + constrained."""
     from neuro_stylometry.phase_d_pipeline import run_phase_d_training
@@ -789,6 +791,8 @@ def run_phase_d(
             dataset_path=dataset_path,
             output_dir=output_dir,
             artifacts_dir=artifacts_dir,
+            dataset_path_post=dataset_path_post,
+            dataset_path_masked=dataset_path_masked,
             mode=mode,
             use_only_labels=tuple(use_only_labels) if use_only_labels else None,
         )
@@ -1170,12 +1174,26 @@ Examples:
             print(f"❌ Missing Phase A dataset: {clean_dataset}")
             return 1
 
+        # Check for pre-tokenized datasets (for AOT mode)
+        tokenized_post = phase_a_output / "clean_dataset_post.arrow"
+        tokenized_masked = phase_a_output / "clean_dataset_post_masked.arrow"
+        
+        dataset_path_post = tokenized_post if tokenized_post.exists() else None
+        dataset_path_masked = tokenized_masked if tokenized_masked.exists() else None
+        
+        if dataset_path_post:
+            print(f"    Using pre-tokenized 'post' dataset: {tokenized_post}")
+        if dataset_path_masked:
+            print(f"    Using pre-tokenized 'post_masked' dataset: {tokenized_masked}")
+
         success = run_phase_d(
             dataset_path=clean_dataset,
             output_dir=phase_d_output,
             artifacts_dir=phase_a_output,
             use_only_labels=args.labels,
             mode=args.mode,
+            dataset_path_post=dataset_path_post,
+            dataset_path_masked=dataset_path_masked,
         )
         if not success:
             print("\n❌ Phase D execution failed")

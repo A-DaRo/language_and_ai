@@ -71,8 +71,9 @@ try:
     _FP8_AVAILABLE = True
     _TE_MODULE = te
     logger.info("TransformerEngine FP8 support available")
-except ImportError:
-    logger.debug("TransformerEngine not available, FP8 disabled")
+except (ImportError, OSError) as e:
+    # OSError can occur due to cuDNN library incompatibilities
+    logger.debug(f"TransformerEngine not available, FP8 disabled: {e}")
 
 
 def is_fp8_available() -> bool:
@@ -124,6 +125,8 @@ class PhaseDTrainConfig:
     use_aot_mode: bool = True  # Use pre-tokenized data + FastCollator
     use_torch_compile: bool = True  # Apply torch.compile to model
     torch_compile_mode: str = "reduce-overhead"  # CUDA Graph optimization
+    torch_compile_dynamic: bool = False  # Use dynamic shapes in torch.compile
+    torch_compile_backend: str = "inductor"  # Compiler backend
     compile_train_step: bool = False  # Compile full train step (forward+loss+backward)
     torch_compile_disable_cudagraphs: bool = False
     use_cuda_graph_training: bool = False  # Manual CUDA-graph training path

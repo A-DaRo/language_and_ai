@@ -231,6 +231,23 @@ class BaseProbe(ABC):
         """Evaluate probe on test data."""
         y_pred = self.predict(X)
         
+        # Sanity check: if all predictions are the same, log a warning
+        unique_preds = np.unique(y_pred)
+        unique_true = np.unique(y)
+        if len(unique_preds) == 1:
+            logger.warning(
+                f"Probe predicts single class {unique_preds[0]} for all {len(y_pred)} samples. "
+                f"This may indicate degenerate embeddings or numerical issues."
+            )
+        
+        # Check for label mismatch
+        missing_in_pred = set(unique_true) - set(unique_preds)
+        if len(missing_in_pred) == len(unique_true):
+            logger.warning(
+                f"Predictions ({unique_preds.tolist()}) have no overlap with true labels "
+                f"({unique_true.tolist()[:10]}...). This will result in 0% accuracy."
+            )
+        
         # Compute metrics
         accuracy = accuracy_score(y, y_pred)
         balanced_acc = balanced_accuracy_score(y, y_pred)
@@ -311,6 +328,7 @@ class CuMLProbe(BaseProbe):
         self.config = config
         self.classifier = None
         self._fallback_sklearn = False
+        self._classes = None  # Store unique classes for prediction validation
     
     def fit(self, X: np.ndarray, y: np.ndarray, sample_weights: Optional[np.ndarray] = None) -> None:
         """Fit cuML logistic regression."""
@@ -324,6 +342,8 @@ class CuMLProbe(BaseProbe):
             ) from e
         
         unique_labels = np.unique(y)
+        self._classes = unique_labels  # Store for later validation
+        
         if len(unique_labels) < 2:
             logger.warning("Less than 2 unique labels, falling back to sklearn")
             sklearn_probe = SklearnProbe(self.config)
@@ -332,11 +352,20 @@ class CuMLProbe(BaseProbe):
             self._fallback_sklearn = True
             return
         
+        # Check for numerical issues in input data
+        x_std = np.std(X, axis=0)
+        if np.any(x_std < 1e-8):
+            n_degenerate = np.sum(x_std < 1e-8)
+            logger.warning(
+                f"cuML probe: {n_degenerate}/{X.shape[1]} features have near-zero variance. "
+                f"This may cause numerical issues."
+            )
+        
         self._fallback_sklearn = False
         
-        # Convert to cupy arrays
+        # Convert to cupy arrays - use int labels, not float
         X_gpu = cp.asarray(X, dtype=cp.float32)
-        y_gpu = cp.asarray(y, dtype=cp.float32)
+        y_gpu = cp.asarray(y, dtype=cp.int32)  # Changed from float32 to int32
         
         # cuML LogisticRegression
         self.classifier = CuMLLogisticRegression(
@@ -357,7 +386,24 @@ class CuMLProbe(BaseProbe):
         
         import cupy as cp
         X_gpu = cp.asarray(X, dtype=cp.float32)
-        return cp.asnumpy(self.classifier.predict(X_gpu)).astype(int)
+        preds = cp.asnumpy(self.classifier.predict(X_gpu))
+        
+        # Ensure predictions are integers and in valid range
+        preds_int = np.round(preds).astype(np.int64)
+        
+        # Sanity check: clamp predictions to valid class range if needed
+        if self._classes is not None and len(self._classes) > 0:
+            min_class, max_class = self._classes.min(), self._classes.max()
+            out_of_range = (preds_int < min_class) | (preds_int > max_class)
+            if out_of_range.any():
+                n_invalid = out_of_range.sum()
+                logger.warning(
+                    f"cuML probe: {n_invalid}/{len(preds_int)} predictions out of valid class range "
+                    f"[{min_class}, {max_class}]. Clamping."
+                )
+                preds_int = np.clip(preds_int, min_class, max_class)
+        
+        return preds_int
     
     def get_weights(self) -> np.ndarray:
         """Get weight coefficients."""
@@ -746,13 +792,30 @@ def _compute_cv_result(
     # If 2 <= min_samples < 5, use StratifiedShuffleSplit to maintain 5 splits
     # but relax the strict partition constraint of KFold.
     if 2 <= min_samples_per_class < 5:
+        n_samples = len(y)
+        # StratifiedShuffleSplit requires test_size >= n_classes
+        # Calculate minimum test_size that allows at least 1 sample per class
+        min_test_size = n_classes / n_samples
+        
+        # If test_size=0.2 is too small, use the minimum needed + margin
+        # But cap at 0.5 to ensure a reasonable train set
+        test_size = max(0.2, min_test_size + 0.05)  # Add 5% margin
+        
+        if test_size > 0.5:
+            # Too many classes relative to samples - fall back to holdout with non-stratified
+            logger.warning(
+                f"Too many classes ({n_classes}) relative to samples ({n_samples}) "
+                f"for stratified shuffle split. Falling back to holdout."
+            )
+            return _compute_holdout_result(X, y, config, device)
+        
         logger.info(
             f"Low sample count ({min_samples_per_class}/class). "
-            f"Using StratifiedShuffleSplit(n_splits={config.n_folds}) instead of KFold."
+            f"Using StratifiedShuffleSplit(n_splits={config.n_folds}, test_size={test_size:.2f}) instead of KFold."
         )
         splitter = StratifiedShuffleSplit(
             n_splits=config.n_folds,
-            test_size=0.2,
+            test_size=test_size,
             random_state=config.random_state
         )
     else:
@@ -786,6 +849,14 @@ def _compute_cv_result(
     std_acc = np.std(fold_accs, ddof=1)
     mean_balanced = np.mean(fold_balanced_accs)
     std_balanced = np.std(fold_balanced_accs, ddof=1)
+    
+    # Sanity check: accuracy below 1/n_classes suggests numerical issues
+    chance_level = 1.0 / n_classes
+    if mean_acc < chance_level * 0.5 and mean_acc < 0.01:
+        logger.warning(
+            f"Mean accuracy {mean_acc:.2%} is far below chance level ({chance_level:.2%}). "
+            f"This may indicate numerical issues or degenerate embeddings."
+        )
     
     # 95% CI using t-distribution
     from scipy import stats

@@ -8,7 +8,7 @@ gliner:
   batch_size: 32
   device: "auto"  # "auto" | "cpu" | "cuda" (explicit authority)
   taxonomy_path: "conf/base/gliner_taxonomy.yaml"
-  compute_explicit_recall: true
+  compute_explicit_recall: false
   explicit_recall_threshold: 0.80
   
   # ---------------------------------------------------------------------------
