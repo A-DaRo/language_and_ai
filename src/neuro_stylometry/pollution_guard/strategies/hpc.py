@@ -341,7 +341,7 @@ class HPCFilterStrategy(PollutionFilterStrategy):
         # Get tokenizer config
         tokenizer_name = gliner.tokenizer.name_or_path
         words_splitter_type = gliner.chunker._words_splitter_type
-        budget_config = gliner.chunker.budget_config
+        budget_config = gliner.chunker.config
         
         num_workers = int(chunking_cfg.get("parallel_chunking_workers", 16))
         micro_batch_size = int(chunking_cfg.get("micro_batch_size", 1000))
