@@ -944,6 +944,8 @@ class HPCFilterStrategy(PollutionFilterStrategy):
             reports_dir.mkdir(parents=True, exist_ok=True)
         
         # Build visualization_data dict for pipeline to use
+        # Avoid attaching raw large arrays to metadata; include lightweight summaries
+        labels_summary = {col: int(len(labels_dict[col])) for col in labels_dict}
         visualization_data = {
             "by_column_extended": by_column_extended,
             "separability_before": separability_before,
@@ -951,9 +953,12 @@ class HPCFilterStrategy(PollutionFilterStrategy):
             "benchmark_results": benchmark_results,
             "control_probe_results": control_probe_results,
             "demo_cols": demo_cols,
-            "X_before_np": X_before_np,
-            "X_after_np": X_after_np,
-            "labels_dict": labels_dict,
+            "X_shapes": {
+                "before": tuple(X_before_np.shape) if hasattr(X_before_np, "shape") else None,
+                "after": tuple(X_after_np.shape) if hasattr(X_after_np, "shape") else None,
+            },
+            "labels_summary": labels_summary,
+            "probe_config": probe_config,
         }
         
         logger.info("Stage 4 complete (visualization data prepared for pipeline)")

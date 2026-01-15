@@ -1177,24 +1177,72 @@ Examples:
         # Check for pre-tokenized datasets (for AOT mode)
         tokenized_post = phase_a_output / "clean_dataset_post.arrow"
         tokenized_masked = phase_a_output / "clean_dataset_post_masked.arrow"
-        
-        dataset_path_post = tokenized_post if tokenized_post.exists() else None
-        dataset_path_masked = tokenized_masked if tokenized_masked.exists() else None
-        
+
+        # If missing, run AOT tokenization to produce both post and post_masked
+        def _run_preprocess(input_path: Path, output_path: Path, text_field: str) -> bool:
+            try:
+                cmd = [
+                    sys.executable,
+                    str(Path(__file__).parent / "preprocess_tokens.py"),
+                    "--input",
+                    str(input_path),
+                    "--output",
+                    str(output_path),
+                    "--model",
+                    "roberta-base",
+                    "--max-length",
+                    "512",
+                    "--text-field",
+                    text_field,
+                ]
+                print(f"      Running: {' '.join(cmd)}")
+                subprocess.run(cmd, check=True)
+                return True
+            except subprocess.CalledProcessError:
+                logger.exception("Preprocess tokens failed for %s", output_path)
+                return False
+
+        # Ensure phase_a_output dir exists
+        phase_a_output.mkdir(parents=True, exist_ok=True)
+
+        # Create post tokenization if missing
+        if not tokenized_post.exists():
+            print(f"    → Generating tokenized 'post' at {tokenized_post}")
+            ok_post = _run_preprocess(clean_dataset, tokenized_post, "post")
+        else:
+            ok_post = True
+            print(f"    ✓ Found tokenized 'post': {tokenized_post}")
+
+        # Create post_masked tokenization if missing
+        if not tokenized_masked.exists():
+            print(f"    → Generating tokenized 'post_masked' at {tokenized_masked}")
+            ok_masked = _run_preprocess(clean_dataset, tokenized_masked, "post_masked")
+        else:
+            ok_masked = True
+            print(f"    ✓ Found tokenized 'post_masked': {tokenized_masked}")
+
+        dataset_path_post = tokenized_post if ok_post and tokenized_post.exists() else None
+        dataset_path_masked = tokenized_masked if ok_masked and tokenized_masked.exists() else None
+
         if dataset_path_post:
             print(f"    Using pre-tokenized 'post' dataset: {tokenized_post}")
         if dataset_path_masked:
             print(f"    Using pre-tokenized 'post_masked' dataset: {tokenized_masked}")
 
-        success = run_phase_d(
-            dataset_path=clean_dataset,
-            output_dir=phase_d_output,
-            artifacts_dir=phase_a_output,
-            use_only_labels=args.labels,
-            mode=args.mode,
-            dataset_path_post=dataset_path_post,
-            dataset_path_masked=dataset_path_masked,
-        )
+        # Only proceed to Phase D if at least the post_masked dataset is available
+        if not dataset_path_masked:
+            print("\n⚠️  Phase D skipped: tokenized 'post_masked' dataset not available")
+            success = False
+        else:
+            success = run_phase_d(
+                dataset_path=clean_dataset,
+                output_dir=phase_d_output,
+                artifacts_dir=phase_a_output,
+                use_only_labels=args.labels,
+                mode=args.mode,
+                dataset_path_post=dataset_path_post,
+                dataset_path_masked=dataset_path_masked,
+            )
         if not success:
             print("\n❌ Phase D execution failed")
             return 1
