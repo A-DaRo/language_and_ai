@@ -1057,6 +1057,16 @@ def report_phase_d(
     help="Skip Phase D (only run Phase A)",
 )
 @click.option(
+    "--skip-verify",
+    is_flag=True,
+    help="Skip Phase D verification (CHG + SVS)",
+)
+@click.option(
+    "--skip-report",
+    is_flag=True,
+    help="Skip Phase D report generation",
+)
+@click.option(
     "--dry-run",
     is_flag=True,
     help="Print resolved config and execution plan without running",
@@ -1069,6 +1079,8 @@ def run_full_pipeline(
     use_only_labels: tuple,
     skip_phase_a: bool,
     skip_phase_d: bool,
+    skip_verify: bool,
+    skip_report: bool,
     dry_run: bool,
 ):
     """
@@ -1099,6 +1111,17 @@ def run_full_pipeline(
     from .config import load_pipeline_config
     
     try:
+        def _derive_tokenized_paths(base_path: Path) -> tuple[Path, Path]:
+            if base_path.suffix:
+                return (
+                    base_path.with_name(f"{base_path.stem}_post{base_path.suffix}"),
+                    base_path.with_name(f"{base_path.stem}_post_masked{base_path.suffix}"),
+                )
+            return (
+                base_path / "tokenized_post.arrow",
+                base_path / "tokenized_post_masked.arrow",
+            )
+
         # Auto-detect hardware mode if needed
         if mode == "auto":
             profile = HardwareDetector.detect()
@@ -1130,6 +1153,10 @@ def run_full_pipeline(
             click.echo(f"  - Artifacts: {phase_a_dir}")
             click.echo(f"Phase D: {'SKIP' if skip_phase_d else 'RUN'}")
             click.echo(f"  - Artifacts: {phase_d_dir}")
+            click.echo(f"Verify (CHG+SVS): {'SKIP' if skip_verify else 'RUN'}")
+            click.echo(f"  - Artifacts: {phase_d_dir / 'chg'}")
+            click.echo(f"Report: {'SKIP' if skip_report else 'RUN'}")
+            click.echo(f"  - Output: {phase_d_dir / 'reports'}")
             click.echo(f"\nResolved Configuration:")
             click.echo("-" * 40)
             click.echo(yaml.dump(config, default_flow_style=False, sort_keys=False))
@@ -1208,6 +1235,103 @@ def run_full_pipeline(
         click.echo(f"\nPhase D complete!")
         click.echo(f"  Baseline results: {phase_d_dir / 'baseline'}")
         click.echo(f"  Constrained results: {phase_d_dir / 'constrained'}")
+
+        # =====================================================================
+        # Phase D Verification (CHG + SVS)
+        # =====================================================================
+        if not skip_verify:
+            click.echo("\n" + "=" * 80)
+            click.echo("PHASE D VERIFY: CHG + SVS")
+            click.echo("=" * 80 + "\n")
+
+            from .stylometry_net.verification import run_verification
+            from .config import find_config_root, load_verify_config
+
+            verify_config = load_verify_config(mode=mode, experiment_config_path=None)
+            verify_root = find_config_root("verify.yaml")
+
+            model_name = verify_config.get("model", {}).get("name", "roberta-base")
+            max_length = int(verify_config.get("model", {}).get("max_length", 512))
+            taxonomy_value = verify_config.get("model", {}).get("taxonomy_path")
+            if taxonomy_value:
+                taxonomy_candidate = Path(taxonomy_value)
+                taxonomy_path = (
+                    taxonomy_candidate
+                    if taxonomy_candidate.is_absolute()
+                    else verify_root / taxonomy_candidate
+                )
+            else:
+                taxonomy_path = verify_root / "conf/base/gliner_taxonomy.yaml"
+
+            verify_cfg = verify_config.get("verify", {})
+            chg_cfg = verify_cfg.get("chg", {})
+            svs_cfg = verify_cfg.get("svs", {})
+
+            dataset_post, dataset_masked = _derive_tokenized_paths(clean_dataset_path)
+            if not dataset_post.exists():
+                dataset_post = None
+            if not dataset_masked.exists():
+                dataset_masked = None
+
+            verify_output_dir = phase_d_dir / "chg"
+            verify_output_dir.mkdir(parents=True, exist_ok=True)
+
+            run_verification(
+                dataset_path=clean_dataset_path,
+                dataset_path_post=dataset_post,
+                dataset_path_masked=dataset_masked,
+                artifacts_dir=phase_a_dir,
+                phase_d_dir=phase_d_dir,
+                output_dir=verify_output_dir,
+                model_name=model_name,
+                taxonomy_path=taxonomy_path,
+                max_length=max_length,
+                batch_size=int(verify_cfg.get("batch_size", 8)),
+                chg_epochs=int(chg_cfg.get("epochs", 5)),
+                chg_lr=float(chg_cfg.get("learning_rate", 1e-3)),
+                chg_regularization=float(chg_cfg.get("regularization", 0.01)),
+                facilitating_threshold=float(chg_cfg.get("facilitating_threshold", 0.7)),
+                irrelevant_threshold=float(chg_cfg.get("irrelevant_threshold", 0.3)),
+                svs_max_batches=int(svs_cfg.get("max_batches", 5)),
+                svs_query_strategy=svs_cfg.get("query_strategy", "mean_tokens"),
+                svs_pos_backend=svs_cfg.get("pos_backend", "lexical"),
+                svs_use_pos=bool(svs_cfg.get("use_pos", True)),
+                svs_spacy_model=svs_cfg.get("spacy_model", "en_core_web_sm"),
+                svs_spacy_use_gpu=bool(svs_cfg.get("spacy_use_gpu", False)),
+                svs_spacy_gpu_id=svs_cfg.get("spacy_gpu_id", 0),
+                svs_spacy_batch_size=int(svs_cfg.get("spacy_batch_size", 32)),
+                svs_spacy_n_process=int(svs_cfg.get("spacy_n_process", 1)),
+                svs_spacy_disable=list(svs_cfg.get("spacy_disable", [])),
+                svs_hf_model=svs_cfg.get(
+                    "hf_model",
+                    "vblagoje/bert-english-uncased-finetuned-pos",
+                ),
+                svs_hf_device=int(svs_cfg.get("hf_device", 0)),
+                svs_hf_batch_size=int(svs_cfg.get("hf_batch_size", 16)),
+                use_only_labels=tuple(use_only_list) if use_only_list else None,
+            )
+            click.echo(f"Verification complete. Outputs in: {verify_output_dir}")
+
+        # =====================================================================
+        # Phase D Report
+        # =====================================================================
+        if not skip_report:
+            click.echo("\n" + "=" * 80)
+            click.echo("PHASE D REPORT")
+            click.echo("=" * 80 + "\n")
+
+            from .evaluation.comparative_report import generate_phase_d_report
+
+            report_dir = phase_d_dir / "reports"
+            report_dir.mkdir(parents=True, exist_ok=True)
+            report_path = generate_phase_d_report(
+                phase_d_dir=phase_d_dir,
+                output_dir=report_dir,
+                dataset_path=clean_dataset_path,
+                chg_subdir="chg",
+                use_only=use_only_list,
+            )
+            click.echo(f"Report generated: {report_path}")
         
         # =====================================================================
         # Final Summary
