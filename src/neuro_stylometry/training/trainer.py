@@ -54,6 +54,7 @@ from ..stylometry_net.tokenizer import PhaseDTokenizer
 from .checkpointing import config_to_metadata, load_checkpoint, save_checkpoint, save_metadata
 from .metrics import compute_task_metrics
 from .optimizer import build_optimizer, build_param_groups, build_scheduler
+import shutil
 
 logger = logging.getLogger(__name__)
 
@@ -118,6 +119,8 @@ class PhaseDTrainConfig:
     early_stopping_metric: str = "f1_macro"
     save_every_steps: Optional[int] = None
     save_every_epochs: Optional[int] = None
+    # How many intermediate checkpoints to keep when checkpointing is enabled
+    keep_checkpoints: int = 1
     split_ratios: Dict[str, float] = None
     execution_config: Dict[str, Any] = field(default_factory=dict)
     
@@ -1052,6 +1055,11 @@ class PhaseDTrainer:
                                 },
                             },
                         )
+                        # Prune older checkpoints to limit disk usage
+                        try:
+                            self._prune_checkpoints(checkpoint_dir)
+                        except Exception:
+                            logger.debug("Checkpoint pruning failed", exc_info=True)
                 if self.config.max_steps and step >= self.config.max_steps:
                     break
             
@@ -1091,6 +1099,11 @@ class PhaseDTrainer:
                         },
                     },
                 )
+                # Prune older checkpoints to limit disk usage
+                try:
+                    self._prune_checkpoints(checkpoint_dir)
+                except Exception:
+                    logger.debug("Checkpoint pruning failed", exc_info=True)
             if self.config.early_stopping_enabled and eval_loader is not None:
                 eval_metrics = self._evaluate(
                     model=model,
@@ -1187,6 +1200,36 @@ class PhaseDTrainer:
                 },
             },
         )
+        # Remove checkpoint artifacts to save disk: we only keep final model weights
+        try:
+            if checkpoint_path.exists():
+                checkpoint_path.unlink()
+            if checkpoint_dir.exists():
+                shutil.rmtree(checkpoint_dir)
+            logger.info("Pruned checkpoint artifacts; only final model weights are retained")
+        except Exception as exc:
+            logger.warning(f"Failed to prune checkpoint artifacts: {exc}")
+
+    def _prune_checkpoints(self, checkpoint_dir: Path) -> None:
+        """Keep only the most recent N checkpoints in `checkpoint_dir`.
+
+        Checkpoint files are matched by name 'checkpoint_*'. Older files
+        are deleted, newest `self.config.keep_checkpoints` are retained.
+        """
+        if not checkpoint_dir.exists():
+            return
+        files = [p for p in checkpoint_dir.glob("checkpoint_*.pt") if p.is_file()]
+        if not files:
+            return
+        # Sort by modification time (oldest first)
+        files_sorted = sorted(files, key=lambda p: p.stat().st_mtime)
+        keep = max(0, int(getattr(self.config, "keep_checkpoints", 1)))
+        to_delete = files_sorted[:-keep] if keep > 0 else files_sorted
+        for p in to_delete:
+            try:
+                p.unlink()
+            except Exception:
+                logger.debug("Failed to remove checkpoint %s", p, exc_info=True)
 
 
 def _aggregate_metric(metrics: Dict[str, Dict[str, float]], *, metric: str) -> float:

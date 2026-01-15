@@ -11,7 +11,8 @@ training:
   learning_rate: 3e-5
   layerwise_lr_decay: 0.9
   gradient_accumulation_steps: 2
-  save_every_epochs: 10
+  save_every_epochs: null
+  save_every_steps: null
   
   # FP8 for maximum tensor core throughput (requires TransformerEngine)
   # Falls back to BF16 if TransformerEngine not installed
@@ -22,8 +23,10 @@ training:
   
   early_stopping:
     enabled: true
-    patience: 2
-    min_delta: 0.0
+    # Increased patience to tolerate transient regressions during warmup
+    patience: 6
+    # Require a small meaningful improvement to count as better
+    min_delta: 0.01
     metric: "f1_macro"
 
 # Scheduler optimized for longer training
