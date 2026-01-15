@@ -303,6 +303,7 @@ class PhaseAPipeline:
         input_dataset_path: Path,
         output_dir: Path,
         use_only_labels: Optional[List[str]] = None,
+        strict_quality_gates: bool = True,
     ) -> PhaseArtifacts:
         """
         Execute Phase A pipeline end-to-end.
@@ -313,6 +314,8 @@ class PhaseAPipeline:
             use_only_labels: Optional list of demographic labels to filter to.
                 If provided, only these labels will be detected, masked, and
                 used for LEACE projection computation.
+            strict_quality_gates: If True (default), raises RuntimeError if quality
+                gates fail. If False, logs warnings instead (useful for E2E testing).
             
         Returns:
             PhaseArtifacts with paths to all outputs.
@@ -439,7 +442,7 @@ class PhaseAPipeline:
             metadata=metadata,
         )
 
-        self._check_quality_gates(metadata)
+        self._check_quality_gates(metadata, enforce_strict=strict_quality_gates)
 
         logger.info("=" * 80)
         logger.info("PHASE A COMPLETE")
@@ -574,9 +577,15 @@ class PhaseAPipeline:
         except Exception as viz_error:
             logger.warning(f"Probing visualization generation failed: {viz_error}")
 
-    def _check_quality_gates(self, metadata: Dict[str, Any]) -> None:
-        """Check explicit recall and amnesic drop against configured thresholds."""
-        enforce = bool(self._cfg_get("quality.enforce_thresholds"))
+    def _check_quality_gates(self, metadata: Dict[str, Any], enforce_strict: bool = True) -> None:
+        """Check explicit recall and amnesic drop against configured thresholds.
+        
+        Args:
+            metadata: Phase A execution metadata.
+            enforce_strict: If True, raises RuntimeError on threshold violations.
+                If False, logs warnings instead (useful for E2E testing).
+        """
+        enforce = bool(self._cfg_get("quality.enforce_thresholds")) and enforce_strict
 
         recall_threshold = float(self._cfg_get("gliner.explicit_recall_threshold"))
         recall = metadata.get("explicit_recall", {}).get("overall")

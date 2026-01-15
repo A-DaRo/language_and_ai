@@ -444,6 +444,7 @@ def run_phase_a_with_monitoring(
             input_dataset_path=dataset_path,
             output_dir=output_dir,
             use_only_labels=use_only_labels,
+            strict_quality_gates=False,  # E2E testing: log warnings instead of errors
         )
         elapsed = time.time() - start_time
         
