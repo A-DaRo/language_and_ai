@@ -6,8 +6,8 @@
 
 # HPC training overrides
 training:
-  num_epochs: 3
-  batch_size: 32  # Base batch (dynamic batching uses token budget instead)
+  num_epochs: 300
+  batch_size: 64  # Base batch (dynamic batching uses token budget instead)
   learning_rate: 3e-5
   layerwise_lr_decay: 0.9
   gradient_accumulation_steps: 2
@@ -75,7 +75,7 @@ optimization:
 # HPC execution overrides
 execution:
   autotuning:
-    enabled: false  # Let runtime find optimal budget
+    enabled: true  # Let runtime find optimal budget
     warmup_batches: 10
     initial_token_budget: 32768  # Start conservative, scale up if headroom
     min_token_budget: 4096

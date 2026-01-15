@@ -1255,7 +1255,50 @@ Examples:
             print("\n❌ Phase D execution failed")
             return 1
         print("\n✓ Phase D execution completed")
+        # Ensure comparative metrics JSON exists; regenerate if missing
+        comparative_path = phase_d_output / "phase_d_comparative_metrics.json"
+        if not comparative_path.exists():
+            print("    → phase_d_comparative_metrics.json missing; regenerating from artifacts")
+            try:
+                # Prefer test_metrics.json, fall back to phase_d_metrics.json
+                import json
 
+                def _safe_read(path):
+                    try:
+                        with open(path, "r", encoding="utf-8") as f:
+                            return json.load(f)
+                    except Exception:
+                        return None
+
+                baseline_metrics = _safe_read(phase_d_output / "baseline" / "test_metrics.json") or _safe_read(phase_d_output / "baseline" / "phase_d_metrics.json") or {}
+                constrained_metrics = _safe_read(phase_d_output / "constrained" / "test_metrics.json") or _safe_read(phase_d_output / "constrained" / "phase_d_metrics.json") or {}
+
+                # Detect tasks from baseline metadata if available
+                baseline_meta = _safe_read(phase_d_output / "baseline" / "training_metadata.json") or {}
+                label_maps = baseline_meta.get("label_maps", {}) or {}
+                if label_maps:
+                    tasks = list(label_maps.keys())
+                else:
+                    tasks = sorted(set(list(baseline_metrics.keys()) + list(constrained_metrics.keys())))
+
+                summary = {"baseline": {"test": baseline_metrics}, "constrained": {"test": constrained_metrics}, "delta": {}}
+                for task in tasks:
+                    base = baseline_metrics.get(task, {})
+                    cons = constrained_metrics.get(task, {})
+                    base_acc = base.get("accuracy", 0.0)
+                    cons_acc = cons.get("accuracy", 0.0)
+                    summary["delta"][task] = {
+                        "accuracy_delta": cons_acc - base_acc,
+                        "baseline_accuracy": base_acc,
+                        "constrained_accuracy": cons_acc,
+                    }
+
+                with open(comparative_path, "w", encoding="utf-8") as f:
+                    json.dump(summary, f, indent=2)
+                print(f"    ✓ Wrote comparative summary: {comparative_path}")
+            except Exception as exc:
+                print(f"    ⚠️ Failed to regenerate comparative metrics: {exc}")
+                logger.exception("Failed to regenerate comparative metrics")
         phase_d_result = verify_phase_d_artifacts(phase_d_output)
         all_results.append(phase_d_result)
         if phase_d_result.errors:
