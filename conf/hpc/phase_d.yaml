@@ -7,7 +7,7 @@
 # HPC training overrides
 training:
   num_epochs: 300
-  batch_size: 64  # Base batch (dynamic batching uses token budget instead)
+  batch_size: 32  # Base batch (dynamic batching uses token budget instead)
   learning_rate: 3e-5
   layerwise_lr_decay: 0.9
   gradient_accumulation_steps: 2
