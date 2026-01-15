@@ -895,18 +895,116 @@ def verify(
     default=None,
     help="Optional dataset path for report metadata",
 )
+@click.option(
+    "--use-only",
+    "use_only_labels",
+    multiple=True,
+    type=str,
+    help="Filter to specific labels (auto-detected from training_metadata.json if not provided). "
+         "Can be specified multiple times. Example: --use-only nationality",
+)
+@click.option(
+    "--baseline-dir",
+    type=str,
+    default="baseline",
+    show_default=True,
+    help="Baseline subdirectory name within phase-d-dir",
+)
+@click.option(
+    "--constrained-dir",
+    type=str,
+    default="constrained",
+    show_default=True,
+    help="Constrained subdirectory name within phase-d-dir",
+)
+@click.option(
+    "--chg-dir",
+    type=str,
+    default=None,
+    help="CHG/verification subdirectory name (defaults to 'chg' or 'chg-data' if found)",
+)
 def report_phase_d(
     phase_d_dir: Path,
     output_dir: Path,
     dataset: Path | None,
+    use_only_labels: tuple[str, ...],
+    baseline_dir: str,
+    constrained_dir: str,
+    chg_dir: str | None,
 ):
-    """Generate Phase D report from existing artifacts."""
+    """Generate Phase D comparative report with visualizations.
+
+    This command generates an HTML report comparing baseline and constrained
+    model performance. It auto-detects the tasks trained from training_metadata.json
+    or can be explicitly filtered with --use-only.
+
+    The report includes:
+
+    \b
+    - Executive summary with key metrics
+    - Training loss curves (combined overlay)
+    - Per-task accuracy and F1 comparisons
+    - Per-class F1 bar charts (sorted by performance)
+    - Top-N confusion matrices (zoomed to most frequent classes)
+    - Confusion change analysis (baseline vs constrained)
+    - Class distribution histograms
+    - Performance vs sample count scatter plots
+    - Precision/recall trade-off analysis
+    - CHG head classification comparison
+    - SVS verification scores with interpretation
+
+    \b
+    Examples:
+      # Auto-detect tasks from metadata
+      python -m neuro_stylometry report-phase-d --phase-d-dir artifacts/phase_d
+
+      # Custom directory names (for non-standard layouts)
+      python -m neuro_stylometry report-phase-d \\
+        --phase-d-dir artifacts/phase-d-for-reports \\
+        --baseline-dir baseline-data \\
+        --constrained-dir constrained-data \\
+        --chg-dir chg-data
+
+      # Explicit single-task mode
+      python -m neuro_stylometry report-phase-d \\
+        --phase-d-dir artifacts/phase_d \\
+        --use-only nationality
+    """
+    import json as json_module
     from .evaluation.comparative_report import generate_phase_d_report
+
+    # Auto-detect use_only from training_metadata.json if not provided
+    use_only = list(use_only_labels) if use_only_labels else None
+
+    if not use_only:
+        # Try to auto-detect from baseline training_metadata.json
+        baseline_meta_path = phase_d_dir / baseline_dir / "training_metadata.json"
+
+        if baseline_meta_path.exists():
+            try:
+                with open(baseline_meta_path) as f:
+                    baseline_meta = json_module.load(f)
+                    label_filter = baseline_meta.get("label_filter", {})
+                    detected_labels = label_filter.get("use_only")
+                    if detected_labels:
+                        use_only = detected_labels
+                        click.echo(f"Auto-detected label filter from metadata: {use_only}")
+            except Exception as e:
+                logger.warning(f"Failed to load baseline metadata: {e}")
+
+    if use_only:
+        click.echo(f"Generating report for task(s): {', '.join(use_only)}")
+    else:
+        click.echo("Generating report for all detected tasks")
 
     report_path = generate_phase_d_report(
         phase_d_dir=phase_d_dir,
         output_dir=output_dir,
         dataset_path=dataset,
+        baseline_subdir=baseline_dir,
+        constrained_subdir=constrained_dir,
+        chg_subdir=chg_dir,
+        use_only=use_only,
     )
     click.echo(f"Report generated: {report_path}")
 

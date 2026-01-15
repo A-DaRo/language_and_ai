@@ -77,3 +77,5 @@ Thumbs.db
 *.bak
 
 artifacts/data/output
+
+artifacts/phase-d-for-reports
