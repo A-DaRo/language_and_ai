@@ -10,7 +10,6 @@ import torch
 import torch.nn as nn
 from transformers import AutoConfig, AutoModel
 
-from .roberta_local import RobertaModel
 from .affine_guard import AffineGuard
 from .tokenizer import PhaseDTokenizer
 
@@ -35,28 +34,32 @@ class AffineGuardTransformer(nn.Module):
         taxonomy_path: str | Path = "conf/base/gliner_taxonomy.yaml",
         max_length: int = 512,
         freeze_projection: bool = True,
+        freeze_embeddings: bool = True,  # Default to True to preserve P validity
         enforce_single_token_masks: bool = True,
     ) -> None:
         super().__init__()
 
         self.config = AutoConfig.from_pretrained(model_name)
 
-        # Enable Scaled Dot-Product Attention (SDPA) with Flash backend
-        # Requires: transformers >= 4.36, torch >= 2.0
+        # Initialize standard HF model
+        # Use simple SDPA or Flash Attn 2 if supported by hardware/environment
         try:
-            # Use local RobertaModel implementation for debugging
-            self.model = RobertaModel.from_pretrained(
+            self.model = AutoModel.from_pretrained(
                 model_name,
-                attn_implementation="sdpa", # Try SDPA again with local model
+                attn_implementation="sdpa",
+                add_pooling_layer=False, # We usually don't need the pooler for CLS extraction if using raw states
             )
-            logger.info(f"Using local RobertaModel with SDPA for {model_name}")
-        except Exception as e:
-            logger.warning(f"Failed to init local RobertaModel: {e}")
-            self.model = RobertaModel.from_pretrained(model_name)
+            logger.info(f"Initialized AutoModel ({model_name}) with SDPA.")
+        except Exception:
+            self.model = AutoModel.from_pretrained(model_name, add_pooling_layer=False)
+            logger.info(f"Initialized AutoModel ({model_name}) with default attention.")
 
         if not hasattr(self.model, "embeddings") or not hasattr(self.model, "encoder"):
+            # Fallback for models where embeddings might be named differently (e.g. distilbert)
+            # But for RoBERTa/XLM-R/BERT, this API is stable.
             raise TypeError(
-                f"Base model {model_name} does not expose embeddings/encoder attributes"
+                f"Base model {model_name} does not expose standard embeddings/encoder attributes. "
+                "This architecture requires a standard BERT/RoBERTa-like structure."
             )
 
         self.tokenizer = PhaseDTokenizer(
@@ -67,6 +70,17 @@ class AffineGuardTransformer(nn.Module):
             enforce_single_token=enforce_single_token_masks,
         )
         self.tokenizer.resize_model_embeddings(self.model)
+
+        # Freeze Embeddings logic (Critical for Phase A -> D handover validity)
+        if freeze_embeddings:
+            logger.info(f"Freezing base embeddings for {model_name} to maintain Affine Guard alignment.")
+            for param in self.model.embeddings.parameters():
+                param.requires_grad = False
+        else:
+            logger.warning(
+                "Embeddings are TRAINABLE. This may degrade the Affine Guard "
+                "if the embedding space drifts from the calculated projection matrix."
+            )
 
         self.affine_guard: Optional[AffineGuard]
         if projection_matrix_path is not None:
@@ -86,6 +100,7 @@ class AffineGuardTransformer(nn.Module):
         taxonomy_path: str | Path = "conf/base/gliner_taxonomy.yaml",
         max_length: int = 512,
         freeze_projection: bool = True,
+        freeze_embeddings: bool = True,
         enforce_single_token_masks: bool = True,
     ) -> "AffineGuardTransformer":
         artifacts_dir = Path(artifacts_dir)
@@ -99,6 +114,7 @@ class AffineGuardTransformer(nn.Module):
             taxonomy_path=taxonomy_path,
             max_length=max_length,
             freeze_projection=freeze_projection,
+            freeze_embeddings=freeze_embeddings,
             enforce_single_token_masks=enforce_single_token_masks,
         )
 
