@@ -65,7 +65,9 @@ optimization:
   
   # Conservative token budget - autotuning will scale up if headroom exists
   # Start lower to avoid OOM cascade during warmup
-  token_budget: 32768  # 64K tokens
+  # Reduced conservative token budget to avoid large single allocations
+  # Original 32768 produced very large intermediate buffers; lower to 8192.
+  token_budget: 8192  # safer default for large models
 
 # HPC execution overrides
 execution:
@@ -86,8 +88,9 @@ execution:
   dynamic_batching:
     enabled: true
     # NO artificial cap - token budget controls batch size
-    max_batch_size: 4096  # Effectively uncapped
-    min_batch_size: 64  # Minimum for GPU efficiency
+    # Added conservative caps to avoid runaway batch sizes causing OOM
+    max_batch_size: 1024
+    min_batch_size: 16
     drop_last: false
     shuffle: true
     seed: 42

@@ -787,6 +787,14 @@ def run_phase_d(
     from neuro_stylometry.phase_d_pipeline import run_phase_d_training
 
     try:
+        # Also clear any cached allocations before heavy Phase D work
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+
         run_phase_d_training(
             dataset_path=dataset_path,
             output_dir=output_dir,
