@@ -642,12 +642,12 @@ def verify_visualizations(
             else:
                 print(f"  - {viz}: not found")
     
-    return results
+    return result
 
 
-def verify_phase_d_artifacts(phase_d_dir: Path) -> dict:
+def verify_phase_d_artifacts(phase_d_dir: Path) -> TestResult:
     """Verify Phase D training artifacts exist and look compatible."""
-    results = {"passed": True, "errors": [], "warnings": [], "info": {}}
+    result = TestResult(passed=True)
 
     baseline_dir = phase_d_dir / "baseline"
     constrained_dir = phase_d_dir / "constrained"
@@ -655,8 +655,8 @@ def verify_phase_d_artifacts(phase_d_dir: Path) -> dict:
 
     for run_dir, label in ((baseline_dir, "baseline"), (constrained_dir, "constrained")):
         if not run_dir.exists():
-            results["errors"].append(f"Missing Phase D {label} dir: {run_dir}")
-            results["passed"] = False
+            result.errors.append(f"Missing Phase D {label} dir: {run_dir}")
+            result.passed = False
             continue
 
         required = [
@@ -673,21 +673,21 @@ def verify_phase_d_artifacts(phase_d_dir: Path) -> dict:
 
         for path in required:
             if not path.exists():
-                results["errors"].append(f"Missing {label} artifact: {path.name}")
-                results["passed"] = False
+                result.errors.append(f"Missing {label} artifact: {path.name}")
+                result.passed = False
         for path in optional:
             if not path.exists():
-                results["warnings"].append(f"Missing optional {label} artifact: {path.name}")
+                result.warnings.append(f"Missing optional {label} artifact: {path.name}")
 
     if not comparative_path.exists():
-        results["warnings"].append("Missing comparative metrics: phase_d_comparative_metrics.json")
+        result.warnings.append("Missing comparative metrics: phase_d_comparative_metrics.json")
 
-    return results
+    return result
 
 
-def verify_phase_d_verify_outputs(verify_dir: Path) -> dict:
+def verify_phase_d_verify_outputs(verify_dir: Path) -> TestResult:
     """Verify Phase D verification (CHG + SVS) outputs."""
-    results = {"passed": True, "errors": [], "warnings": [], "info": {}}
+    result = TestResult(passed=True)
 
     required = [
         verify_dir / "head_classification_baseline.json",
@@ -698,30 +698,30 @@ def verify_phase_d_verify_outputs(verify_dir: Path) -> dict:
     ]
     for path in required:
         if not path.exists():
-            results["errors"].append(f"Missing verification artifact: {path.name}")
-            results["passed"] = False
+            result.errors.append(f"Missing verification artifact: {path.name}")
+            result.passed = False
 
     comparative_path = verify_dir / "phase_d_comparative_metrics.json"
     if not comparative_path.exists():
-        results["warnings"].append("Missing verification comparative metrics: phase_d_comparative_metrics.json")
+        result.warnings.append("Missing verification comparative metrics: phase_d_comparative_metrics.json")
 
-    return results
+    return result
 
 
-def verify_phase_d_report_outputs(report_dir: Path) -> dict:
+def verify_phase_d_report_outputs(report_dir: Path) -> TestResult:
     """Verify Phase D report output directory and report HTML."""
-    results = {"passed": True, "errors": [], "warnings": [], "info": {}}
+    result = TestResult(passed=True)
 
     report_path = report_dir / "phase_d_report.html"
     assets_dir = report_dir / "phase_d_assets"
 
     if not report_path.exists():
-        results["errors"].append(f"Missing report: {report_path.name}")
-        results["passed"] = False
+        result.errors.append(f"Missing report: {report_path.name}")
+        result.passed = False
     if not assets_dir.exists():
-        results["warnings"].append(f"Missing report assets dir: {assets_dir.name}")
+        result.warnings.append(f"Missing report assets dir: {assets_dir.name}")
 
-    return results
+    return result
 
 
 def verify_single_label_adaptations(
@@ -771,84 +771,6 @@ def verify_single_label_adaptations(
                 result.passed = False
     
     return result
-
-
-# =============================================================================
-# Phase D Execution (Optional)
-# =============================================================================
-def run_phase_d(
-    phase_a_output: Path,
-    phase_d_output: Path,
-    use_only_labels: List[str],
-    mode: str = "laptop",
-) -> TestResult:
-    """
-    Run Phase D training on filtered data.
-    
-    Args:
-        phase_a_output: Path to Phase A output directory.
-        phase_d_output: Output directory for Phase D.
-        use_only_labels: List of demographic labels (for validation).
-        mode: Hardware mode.
-        
-    Returns:
-        TestResult with execution results.
-    """
-    from neuro_stylometry.phase_a_pipeline import PhaseAPipeline
-    from neuro_stylometry.factories.strategy_factory import StrategyFactory
-    from neuro_stylometry.hardware_ops.detection import HardwareDetector, ProfileType
-    from neuro_stylometry.config import load_pipeline_config
-    
-    try:
-        # Auto-detect hardware mode
-        if mode == "auto":
-            profile = HardwareDetector.detect()
-            mode = "laptop" if profile.profile_type == ProfileType.LAPTOP else "hpc"
-        
-        print(f"Hardware mode: {mode}")
-        print(f"Labels: {use_only_labels}")
-        print(f"Samples: {samples}")
-        print(f"Output: {output_dir}")
-        print()
-        
-        # Create strategy
-        profile_type = ProfileType.HPC if mode == "hpc" else ProfileType.LAPTOP
-        strategy = StrategyFactory.create_filter_strategy(profile_type)
-        
-        # Load configuration
-        config = load_pipeline_config(mode=mode)
-        
-        # Enable subset for faster testing
-        config["subset"] = {"enabled": True, "size": samples}
-        
-        # Disable some optional features for speed
-        config.setdefault("gliner", {})["compute_explicit_recall"] = False
-        
-        # Create and run pipeline
-        pipeline = PhaseAPipeline(strategy=strategy, config=config)
-        
-        print("Starting Phase A execution...")
-        print("-" * 60)
-        
-        start_time = time.time()
-        artifacts = pipeline.run(
-            input_dataset_path=dataset_path,
-            output_dir=output_dir,
-            use_only_labels=use_only_labels,
-        )
-        elapsed = time.time() - start_time
-        
-        print("-" * 60)
-        print(f"Phase A completed in {elapsed:.1f}s")
-        print(f"  Clean dataset: {artifacts.clean_dataset_path}")
-        print(f"  Projection matrix: {artifacts.projection_matrix_path}")
-        print(f"  Num samples: {artifacts.metadata.get('num_samples')}")
-        
-        return True
-        
-    except Exception as e:
-        logger.error(f"Phase A execution failed: {e}", exc_info=True)
-        return False
 
 
 def run_phase_d(
@@ -1045,17 +967,14 @@ Examples:
     parser.add_argument(
         "--mode",
         type=str,
-        choices=["laptop", "hpc"],
-        default="laptop",
-        help="Hardware mode (default: laptop)",
+        choices=["auto", "laptop", "hpc"],
+        default="auto",
+        help="Hardware mode (auto, laptop, hpc)",
     )
     parser.add_argument(
         "--skip-phase-d",
         action="store_true",
         help="Skip Phase D execution (faster test)",
-        choices=["auto", "laptop", "hpc"],
-        default="auto",
-        help="Hardware mode (auto, laptop, hpc)",
     )
     parser.add_argument(
         "--skip-execution",
@@ -1119,7 +1038,9 @@ Examples:
     # Define output paths
     phase_a_output = args.output_dir / "phase_a"
     phase_d_output = args.output_dir / "phase_d"
-    reports_dir = phase_a_output / "reports" / "phase_a"  # Nested path matches pipeline output
+    reports_dir = phase_a_output / "reports" / "phase_a"
+    phase_d_verify_output = phase_d_output / "chg"
+    phase_d_report_output = phase_d_output / "reports"
     subset_path = args.output_dir / "subset.arrow"
     
     # Print header
@@ -1129,17 +1050,11 @@ Examples:
     print(f"Mode: {args.mode}")
     print(f"Output: {args.output_dir}")
     
-    phase_a_output = args.output_dir / "phase_a"
-    reports_dir = phase_a_output / "reports"
-    phase_d_output = args.output_dir / "phase_d"
-    phase_d_verify_output = phase_d_output / "chg"
-    phase_d_report_output = phase_d_output / "reports"
-    
-    total_steps = 0
     skip_phase_a = args.skip_execution or args.skip_phase_a
+
+    total_steps = 2  # artifacts + visualizations
     if not skip_phase_a:
-        total_steps += 1
-    total_steps += 2  # artifacts + visualizations
+        total_steps += 2  # subset + phase A
     if is_single_label:
         total_steps += 1
     if args.run_phase_d:
@@ -1154,7 +1069,7 @@ Examples:
     # ==========================================================================
     # Step 1: Create Weighted Subset
     # ==========================================================================
-    if not args.skip_execution:
+    if not skip_phase_a:
         current_step += 1
         print_step(current_step, total_steps, "Creating weighted subset dataset")
         
@@ -1175,10 +1090,6 @@ Examples:
     # ==========================================================================
     # Step 2: Run Phase A with Taxonomy Monitoring
     # ==========================================================================
-    if not args.skip_execution:
-    all_passed = True
-    
-    # Step 1: Run Phase A
     if not skip_phase_a:
         current_step += 1
         print_step(current_step, total_steps, "Running Phase A with --use-only filter")
@@ -1248,23 +1159,8 @@ Examples:
         )
         all_results.append(single_result)
     
-    # ==========================================================================
-    # Step 6: Phase D (Optional)
-    # ==========================================================================
-    if not args.skip_phase_d and not args.skip_execution:
-        current_step += 1
-        print_step(current_step, total_steps, "Running Phase D (Optional)")
-        
-        phase_d_result = run_phase_d(
-            phase_a_output=phase_a_output,
-            phase_d_output=phase_d_output,
-            use_only_labels=args.labels,
-            mode=args.mode,
-        )
-        all_results.append(phase_d_result)
-
     # Step 5: Run Phase D training (optional)
-    if args.run_phase_d:
+    if args.run_phase_d and not args.skip_phase_d:
         current_step += 1
         print_step(current_step, total_steps, "Running Phase D training...")
 
@@ -1285,13 +1181,13 @@ Examples:
             return 1
         print("\n✓ Phase D execution completed")
 
-        phase_d_results = verify_phase_d_artifacts(phase_d_output)
-        if phase_d_results["errors"]:
-            for error in phase_d_results["errors"]:
+        phase_d_result = verify_phase_d_artifacts(phase_d_output)
+        all_results.append(phase_d_result)
+        if phase_d_result.errors:
+            for error in phase_d_result.errors:
                 print(f"  ❌ {error}")
-            all_passed = False
-        if phase_d_results["warnings"]:
-            for warning in phase_d_results["warnings"]:
+        if phase_d_result.warnings:
+            for warning in phase_d_result.warnings:
                 print(f"  ⚠ {warning}")
 
     # Step 6: Run Phase D verification (optional)
@@ -1317,13 +1213,13 @@ Examples:
             return 1
         print("\n✓ Phase D verification completed")
 
-        verify_results = verify_phase_d_verify_outputs(phase_d_verify_output)
-        if verify_results["errors"]:
-            for error in verify_results["errors"]:
+        verify_result = verify_phase_d_verify_outputs(phase_d_verify_output)
+        all_results.append(verify_result)
+        if verify_result.errors:
+            for error in verify_result.errors:
                 print(f"  ❌ {error}")
-            all_passed = False
-        if verify_results["warnings"]:
-            for warning in verify_results["warnings"]:
+        if verify_result.warnings:
+            for warning in verify_result.warnings:
                 print(f"  ⚠ {warning}")
 
     # Step 7: Run Phase D report (optional)
@@ -1347,13 +1243,13 @@ Examples:
             return 1
         print("\n✓ Phase D report generated")
 
-        report_results = verify_phase_d_report_outputs(phase_d_report_output)
-        if report_results["errors"]:
-            for error in report_results["errors"]:
+        report_result = verify_phase_d_report_outputs(phase_d_report_output)
+        all_results.append(report_result)
+        if report_result.errors:
+            for error in report_result.errors:
                 print(f"  ❌ {error}")
-            all_passed = False
-        if report_results["warnings"]:
-            for warning in report_results["warnings"]:
+        if report_result.warnings:
+            for warning in report_result.warnings:
                 print(f"  ⚠ {warning}")
     
     # ==========================================================================
