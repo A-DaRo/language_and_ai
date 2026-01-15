@@ -30,7 +30,7 @@ execution:
     enabled: true
     warmup_batches: 5              # Reduced warmup to get to peak speed faster
     initial_token_budget: 65536    # Aggressive start for 5090
-    min_token_budget: 4096
+    min_token_budget: 2048
     max_token_budget: 393216       # Tuned for ~24-32GB VRAM usage (Safety cap)
     memory_headroom_mb: 4096       # Larger headroom for 5090 burst allocations
     scale_up_factor: 1.25          # 25% increase when scaling up
