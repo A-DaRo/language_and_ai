@@ -1166,6 +1166,12 @@ class LaptopFilterStrategy(PollutionFilterStrategy):
         # Initialize GLiNER Detector
         logger.info("Initializing GLiNER detector and components")
         taxonomy_config, constraints_config = self._load_taxonomy_config(config)
+        
+        # Apply --use-only label filter to taxonomy (if specified)
+        if use_only_labels:
+            taxonomy_config = self._filter_taxonomy_config(taxonomy_config, use_only_labels)
+            logger.info(f"Filtered taxonomy to columns: {use_only_labels}")
+        
         gliner_cfg = config.get("gliner", {})
         batch_inference_cfg = gliner_cfg.get("batch_inference", {})
         
@@ -1492,3 +1498,48 @@ class LaptopFilterStrategy(PollutionFilterStrategy):
         taxonomy_cfg = cfg.get("taxonomy", {})
         constraints_cfg = taxonomy_cfg.get("width_constraints", {})
         return taxonomy_cfg, constraints_cfg
+
+    def _filter_taxonomy_config(
+        self, taxonomy_config: Dict[str, Any], use_only_labels: List[str]
+    ) -> Dict[str, Any]:
+        """
+        Filter taxonomy config to only include specified demographic columns.
+        
+        This is the key integration point for --use-only functionality.
+        When filtering is applied, only prompts for the specified columns
+        will be used in GLiNER inference.
+        
+        Args:
+            taxonomy_config: Full taxonomy configuration dict.
+            use_only_labels: List of demographic columns to keep.
+            
+        Returns:
+            Filtered taxonomy config with only specified columns.
+        """
+        filtered = dict(taxonomy_config)  # Shallow copy
+        
+        # Filter column_prompts to only include specified columns
+        if "column_prompts" in filtered:
+            original_columns = set(filtered["column_prompts"].keys())
+            filtered["column_prompts"] = {
+                col: prompts
+                for col, prompts in filtered["column_prompts"].items()
+                if col in use_only_labels
+            }
+            filtered_columns = set(filtered["column_prompts"].keys())
+            removed_columns = original_columns - filtered_columns
+            
+            logger.info(
+                f"Taxonomy filtering: kept {len(filtered_columns)} columns, "
+                f"removed {len(removed_columns)}: {sorted(removed_columns)}"
+            )
+        
+        # Filter mask_tokens to only include specified columns
+        if "mask_tokens" in filtered:
+            filtered["mask_tokens"] = {
+                col: token
+                for col, token in filtered["mask_tokens"].items()
+                if col in use_only_labels
+            }
+        
+        return filtered

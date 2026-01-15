@@ -38,12 +38,14 @@ def _safe_float(values: np.ndarray) -> np.ndarray:
 class NumericFeatureSpec:
     mean: float
     std: float
+    has_missing: bool = True
 
 
 @dataclass(frozen=True)
 class CategoricalFeatureSpec:
     categories: Tuple[str, ...]
     index: Dict[str, int]
+    has_missing: bool = True
 
 
 class DemographicEncoder:
@@ -75,22 +77,36 @@ class DemographicEncoder:
                 raise KeyError(f"Missing demographic column '{col}' in table")
 
             arr = table[col]
-            # Treat dictionary-encoded string as categorical.
-            if pa.types.is_string(arr.type) or pa.types.is_dictionary(arr.type):
+            # Treat string-like columns (including large_string) as categorical.
+            is_string_like = (
+                pa.types.is_string(arr.type)
+                or pa.types.is_large_string(arr.type)
+                or pa.types.is_dictionary(arr.type)
+            )
+            if is_string_like:
                 series = arr.to_pandas()
                 # Normalize missing to NaN; keep strings as str.
                 non_null = series.dropna().astype(str)
                 cats = tuple(sorted(non_null.unique().tolist()))
                 index = {c: i for i, c in enumerate(cats)}
-                self.categorical_specs[col] = CategoricalFeatureSpec(categories=cats, index=index)
+                
+                # Check for missing values (Plan Item 1: Refined Concept Encoding)
+                has_missing = series.isna().any()
+                
+                self.categorical_specs[col] = CategoricalFeatureSpec(
+                    categories=cats, index=index, has_missing=has_missing
+                )
                 for c in cats:
                     feature_names.append(f"{col}__{c}")
-                feature_names.append(f"{col}__MISSING")
+                
+                if has_missing:
+                    feature_names.append(f"{col}__MISSING")
             else:
                 series = arr.to_pandas()
                 values = series.to_numpy()
                 values_f = _safe_float(values)
                 missing = _is_missing_numeric(values_f)
+                has_missing = missing.any()
 
                 observed = values_f[~missing]
                 if observed.size == 0:
@@ -102,9 +118,12 @@ class DemographicEncoder:
                     if not np.isfinite(std) or std <= 1e-12:
                         std = 1.0
 
-                self.numeric_specs[col] = NumericFeatureSpec(mean=mean, std=std)
+                self.numeric_specs[col] = NumericFeatureSpec(
+                    mean=mean, std=std, has_missing=has_missing
+                )
                 feature_names.append(f"{col}__VALUE")
-                feature_names.append(f"{col}__MISSING")
+                if has_missing:
+                    feature_names.append(f"{col}__MISSING")
 
         self._feature_names = feature_names
         return self
@@ -137,8 +156,11 @@ class DemographicEncoder:
                             continue
                         Z[i, offset + j] = 1.0
 
-                Z[:, offset + len(spec.categories)] = missing.astype(np.float32)
-                offset += len(spec.categories) + 1
+                if spec.has_missing:
+                    Z[:, offset + len(spec.categories)] = missing.astype(np.float32)
+                    offset += len(spec.categories) + 1
+                else:
+                    offset += len(spec.categories)
             else:
                 spec = self.numeric_specs[col]
                 series = table[col].to_pandas()
@@ -149,8 +171,11 @@ class DemographicEncoder:
                 standardized = np.where(missing, 0.0, standardized).astype(np.float32)
 
                 Z[:, offset] = standardized
-                Z[:, offset + 1] = missing.astype(np.float32)
-                offset += 2
+                if spec.has_missing:
+                    Z[:, offset + 1] = missing.astype(np.float32)
+                    offset += 2
+                else:
+                    offset += 1
 
         return Z
 

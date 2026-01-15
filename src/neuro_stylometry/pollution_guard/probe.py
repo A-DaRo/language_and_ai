@@ -666,25 +666,112 @@ class LinearProbe:
 # K-Fold Cross-Validation
 # =============================================================================
 
+def _compute_holdout_result(
+    X: np.ndarray,
+    y: np.ndarray,
+    config: ProbeConfig,
+    device: str = "auto",
+) -> "CrossValidationResult":
+    """Fallback to simple train/test holdout when k-fold is infeasible.
+    
+    Used when there aren't enough samples per class for stratified k-fold.
+    """
+    from sklearn.model_selection import train_test_split
+    
+    # Try stratified split, fall back to random if that fails too
+    try:
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y,
+            test_size=0.2,
+            random_state=config.random_state,
+            stratify=y,
+        )
+    except ValueError:
+        # Stratified split also failed, use random split
+        logger.warning("Stratified split failed, using random holdout")
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y,
+            test_size=0.2,
+            random_state=config.random_state,
+        )
+    
+    probe = create_probe(config, device=device)
+    probe.fit(X_train, y_train)
+    result = probe.evaluate(X_test, y_test)
+    
+    # Return as CrossValidationResult with single "fold"
+    return CrossValidationResult(
+        mean_accuracy=result.accuracy,
+        std_accuracy=0.0,  # No variance estimate from single split
+        mean_balanced_accuracy=result.balanced_accuracy,
+        std_balanced_accuracy=0.0,
+        ci_95_lower=result.accuracy,  # No CI from single split
+        ci_95_upper=result.accuracy,
+        fold_accuracies=[result.accuracy],
+        fold_balanced_accuracies=[result.balanced_accuracy],
+    )
+
+
 def _compute_cv_result(
     X: np.ndarray,
     y: np.ndarray,
     config: ProbeConfig,
     device: str = "auto",
 ) -> CrossValidationResult:
-    """Perform stratified k-fold cross-validation."""
-    from sklearn.model_selection import StratifiedKFold
+    """Perform stratified k-fold cross-validation.
     
-    skf = StratifiedKFold(
-        n_splits=config.n_folds,
-        shuffle=True,
-        random_state=config.random_state,
-    )
+    Automatically reduces n_splits if there aren't enough samples per class.
+    Falls back to holdout evaluation if k-fold is impossible.
+    Implements robust low-sample strategy (Plan Item 2).
+    """
+    from sklearn.model_selection import StratifiedKFold, StratifiedShuffleSplit, train_test_split
+    
+    # Check minimum samples per class to determine feasible n_splits
+    unique, counts = np.unique(y, return_counts=True)
+    min_samples_per_class = counts.min()
+    n_classes = len(unique)
+    
+    # Determine feasible number of folds
+    feasible_folds = min(config.n_folds, min_samples_per_class)
+    
+    if feasible_folds < 2:
+        # Not enough samples for any k-fold - use simple holdout
+        logger.warning(
+            f"Insufficient samples for k-fold CV (min_per_class={min_samples_per_class}, "
+            f"n_classes={n_classes}). Falling back to 80/20 holdout."
+        )
+        return _compute_holdout_result(X, y, config, device)
+    
+    # Plan Item 2: Low-Sample Adaptation
+    # If 2 <= min_samples < 5, use StratifiedShuffleSplit to maintain 5 splits
+    # but relax the strict partition constraint of KFold.
+    if 2 <= min_samples_per_class < 5:
+        logger.info(
+            f"Low sample count ({min_samples_per_class}/class). "
+            f"Using StratifiedShuffleSplit(n_splits={config.n_folds}) instead of KFold."
+        )
+        splitter = StratifiedShuffleSplit(
+            n_splits=config.n_folds,
+            test_size=0.2,
+            random_state=config.random_state
+        )
+    else:
+        if feasible_folds < config.n_folds:
+            logger.warning(
+                f"Reducing n_folds from {config.n_folds} to {feasible_folds} "
+                f"(min_samples_per_class={min_samples_per_class})"
+            )
+        
+        splitter = StratifiedKFold(
+            n_splits=feasible_folds,
+            shuffle=True,
+            random_state=config.random_state,
+        )
     
     fold_accs = []
     fold_balanced_accs = []
     
-    for fold_idx, (train_idx, test_idx) in enumerate(skf.split(X, y)):
+    for fold_idx, (train_idx, test_idx) in enumerate(splitter.split(X, y)):
         X_train, X_test = X[train_idx], X[test_idx]
         y_train, y_test = y[train_idx], y[test_idx]
         
@@ -830,8 +917,20 @@ def compute_amnesic_drop_extended(
     X_after = X_after[valid_mask]
     y = y[valid_mask]
     
+    # Plan Item 2: Filter singleton classes (cannot split 1 sample)
+    unique_all, counts_all = np.unique(y, return_counts=True)
+    singleton_classes = unique_all[counts_all < 2]
+    if len(singleton_classes) > 0:
+        logger.warning(
+            f"Dropping classes with < 2 samples for probe evaluation: {singleton_classes}"
+        )
+        keep_mask = np.isin(y, singleton_classes, invert=True)
+        X_before = X_before[keep_mask]
+        X_after = X_after[keep_mask]
+        y = y[keep_mask]
+    
     if len(y) == 0:
-        logger.warning("No valid samples after filtering null labels")
+        logger.warning("No valid samples after filtering null/singleton labels")
         return AmnesicDropResult(
             acc_before=0.0, acc_after=0.0, amnesic_drop=0.0,
             balanced_acc_before=0.0, balanced_acc_after=0.0, balanced_amnesic_drop=0.0,

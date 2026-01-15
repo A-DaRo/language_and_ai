@@ -284,8 +284,13 @@ class PhaseAPipeline:
         # Compute dtype for LEACE math (float64 recommended for stability)
         compute_dtype = self._cfg_get_optional("leace.compute_dtype", "float64")
         
+        # Dynamically derive embedding dimension from the loaded encoder model.
+        # This prevents mismatches between YAML config (e.g. 'base') and actual model (e.g. 'large').
+        embedder = self.get_embedder()
+        embedding_dim = embedder.model.config.hidden_size
+
         self._leace = LEACEComputer(
-            embedding_dim=int(self._cfg_get("encoder.hidden_dim")),
+            embedding_dim=embedding_dim,
             regularization=float(self._cfg_get("leace.regularization")),
             device=device,
             force_cpu=bool(self._cfg_get("leace.force_cpu")),

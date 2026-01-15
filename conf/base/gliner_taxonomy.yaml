@@ -127,7 +127,7 @@ taxonomy:
       # Rationale: Handles compounds like "Japanese-American citizen"
       # and phrases like "citizen of South Korea"
       # ----------------------------------------------------------------
-      width: 12
+      width: 20
       
       mask_token: "[MASK:NATIONALITY]"
 
