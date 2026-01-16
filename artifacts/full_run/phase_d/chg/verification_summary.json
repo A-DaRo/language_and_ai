@@ -1,0 +1,17 @@
+{
+  "baseline": {
+    "gates_path": "artifacts/full_run/phase_d/chg/chg_gates_baseline.pt",
+    "svs_path": "artifacts/full_run/phase_d/chg/svs_baseline.json",
+    "facilitating_count": 52,
+    "irrelevant_count": 102,
+    "neutral_count": 230
+  },
+  "constrained": {
+    "gates_path": "artifacts/full_run/phase_d/chg/chg_gates_constrained.pt",
+    "svs_path": "artifacts/full_run/phase_d/chg/svs_constrained.json",
+    "facilitating_count": 90,
+    "irrelevant_count": 108,
+    "neutral_count": 186
+  },
+  "svs_delta": 0.03357621922775145
+}

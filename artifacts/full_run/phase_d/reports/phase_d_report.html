@@ -1,0 +1,419 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8"/>
+    <title>Phase D Comparative Report</title>
+    <style>
+        :root {
+            --primary: #2c3e50;
+            --secondary: #3498db;
+            --success: #27ae60;
+            --danger: #e74c3c;
+            --light: #ecf0f1;
+            --dark: #2c3e50;
+        }
+        body {
+            font-family: "Segoe UI", -apple-system, BlinkMacSystemFont, Roboto, Arial, sans-serif;
+            margin: 0;
+            padding: 24px;
+            color: #333;
+            background: #fafafa;
+            line-height: 1.6;
+        }
+        h1 {
+            color: var(--primary);
+            border-bottom: 3px solid var(--secondary);
+            padding-bottom: 12px;
+            margin-bottom: 24px;
+        }
+        h2 {
+            color: var(--primary);
+            margin-top: 32px;
+            border-left: 4px solid var(--secondary);
+            padding-left: 12px;
+        }
+        h3 {
+            color: var(--dark);
+            margin-top: 24px;
+        }
+        .meta {
+            background: var(--light);
+            padding: 16px 20px;
+            border-radius: 8px;
+            margin-bottom: 24px;
+            border-left: 4px solid var(--secondary);
+        }
+        .summary-box {
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+            margin-bottom: 24px;
+        }
+        .summary-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 16px;
+            margin-top: 16px;
+        }
+        .summary-item {
+            background: var(--light);
+            padding: 12px 16px;
+            border-radius: 6px;
+            display: flex;
+            flex-direction: column;
+        }
+        .summary-item .label {
+            font-size: 0.85em;
+            color: #666;
+            margin-bottom: 4px;
+        }
+        .summary-item .value {
+            font-size: 1.2em;
+            font-weight: 600;
+            color: var(--primary);
+        }
+        .summary-item.highlight {
+            border: 2px solid var(--secondary);
+        }
+        .summary-item.highlight.negative .value {
+            color: var(--danger);
+        }
+        .summary-item.highlight.positive .value {
+            color: var(--success);
+        }
+        table {
+            border-collapse: collapse;
+            width: 100%;
+            margin: 16px 0;
+            background: white;
+            border-radius: 8px;
+            overflow: hidden;
+            box-shadow: 0 1px 4px rgba(0,0,0,0.1);
+        }
+        th, td {
+            border: 1px solid #ddd;
+            padding: 10px 12px;
+            text-align: left;
+        }
+        th {
+            background: var(--primary);
+            color: white;
+            font-weight: 500;
+        }
+        tr:nth-child(even) {
+            background: #f8f9fa;
+        }
+        tr:hover {
+            background: #e8f4f8;
+        }
+        td.positive {
+            color: var(--success);
+            font-weight: 600;
+        }
+        td.negative {
+            color: var(--danger);
+            font-weight: 600;
+        }
+        figure {
+            margin: 12px 0;
+            background: white;
+            padding: 12px;
+            border-radius: 8px;
+            box-shadow: 0 1px 4px rgba(0,0,0,0.1);
+        }
+        figure.wide {
+            grid-column: span 2;
+        }
+        figure.full-width {
+            grid-column: 1 / -1;
+        }
+        img {
+            max-width: 100%;
+            height: auto;
+            border-radius: 4px;
+        }
+        figcaption {
+            text-align: center;
+            font-size: 0.9em;
+            color: #666;
+            margin-top: 8px;
+            font-style: italic;
+        }
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(400px, 1fr));
+            gap: 16px;
+            margin: 16px 0;
+        }
+        code {
+            background: #f1f3f4;
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-family: "Fira Code", monospace;
+            font-size: 0.9em;
+        }
+        pre {
+            background: #2d2d2d;
+            color: #f8f8f2;
+            padding: 16px;
+            border-radius: 8px;
+            overflow-x: auto;
+            font-size: 0.85em;
+        }
+        details {
+            background: white;
+            border-radius: 8px;
+            padding: 12px 16px;
+            margin: 12px 0;
+            box-shadow: 0 1px 4px rgba(0,0,0,0.1);
+        }
+        summary {
+            cursor: pointer;
+            font-weight: 600;
+            color: var(--primary);
+        }
+        summary:hover {
+            color: var(--secondary);
+        }
+        .task-section {
+            background: white;
+            border-radius: 12px;
+            padding: 24px;
+            margin: 24px 0;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+        }
+        .interpretation {
+            background: #fff8e1;
+            border-left: 4px solid #ffc107;
+            padding: 16px;
+            border-radius: 4px;
+            margin: 16px 0;
+        }
+        .interpretation ul {
+            margin: 8px 0;
+            padding-left: 24px;
+        }
+        .interpretation li {
+            margin: 8px 0;
+        }
+    </style>
+</head>
+<body>
+    <h1>Phase D Comparative Report</h1>
+
+    <div class="meta">
+        <div><strong>Phase D directory:</strong> <code>artifacts/full_run/phase_d</code></div>
+        <div><strong>Dataset:</strong> <code>artifacts/full_run/phase_a/clean_dataset.arrow</code></div>
+        <div><strong>Tasks analyzed:</strong> <code>nationality</code></div>
+    </div>
+
+    
+    <div class="summary-box">
+        <h3>Executive Summary</h3>
+        <div class="summary-grid">
+            <div class="summary-item">
+                <span class="label">Task(s)</span>
+                <span class="value">nationality</span>
+            </div>
+            <div class="summary-item">
+                <span class="label">Total Classes</span>
+                <span class="value">55</span>
+            </div>
+            <div class="summary-item">
+                <span class="label">Training Epochs</span>
+                <span class="value">300</span>
+            </div>
+            <div class="summary-item">
+                <span class="label">Model Variant</span>
+                <span class="value">single_task</span>
+            </div>
+            <div class="summary-item">
+                <span class="label">Avg Baseline Accuracy</span>
+                <span class="value">60.11%</span>
+            </div>
+            <div class="summary-item">
+                <span class="label">Avg Constrained Accuracy</span>
+                <span class="value">57.32%</span>
+            </div>
+            <div class="summary-item highlight negative">
+                <span class="label">Accuracy Delta</span>
+                <span class="value">-2.79%</span>
+            </div>
+        </div>
+    </div>
+    
+
+    <h2>Training Overview</h2>
+    <div class="grid">
+        <figure class="full-width"><img src='phase_d_assets/loss_comparison.png' alt='Training Loss Comparison'/><figcaption>Training Loss Comparison</figcaption></figure>
+        
+        
+    </div>
+
+    <h2>Overall Metrics</h2>
+    <table>
+        <thead>
+            <tr>
+                <th>Task</th>
+                <th>Baseline Acc</th>
+                <th>Constrained Acc</th>
+                <th>Acc Delta</th>
+                <th>Baseline F1</th>
+                <th>Constrained F1</th>
+                <th>F1 Delta</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr><td>nationality</td><td>0.6011</td><td>0.5732</td><td class='negative'>-0.0279</td><td>0.3837</td><td>0.3710</td><td class='negative'>-0.0127</td></tr>
+        </tbody>
+    </table>
+
+    <div class="grid">
+        <figure><img src='phase_d_assets/accuracy_comparison.png' alt='Accuracy Comparison'/><figcaption>Accuracy Comparison</figcaption></figure>
+        <figure><img src='phase_d_assets/f1_comparison.png' alt='F1 Comparison'/><figcaption>F1 Comparison</figcaption></figure>
+    </div>
+
+    
+        <div class="task-section">
+            <h2>Task: Nationality</h2>
+
+            <h3>Per-Class Performance</h3>
+            <div class="grid">
+                <figure class="wide"><img src='phase_d_assets/nationality_baseline_f1_bars.png' alt='Baseline F1 by Class'/><figcaption>Baseline F1 by Class</figcaption></figure>
+                <figure class="wide"><img src='phase_d_assets/nationality_constrained_f1_bars.png' alt='Constrained F1 by Class'/><figcaption>Constrained F1 by Class</figcaption></figure>
+            </div>
+
+            <h3>Confusion Analysis</h3>
+            <div class="grid">
+                <figure><img src='phase_d_assets/nationality_baseline_confusion_topn.png' alt='Baseline Confusion (Top Classes)'/><figcaption>Baseline Confusion (Top Classes)</figcaption></figure>
+                <figure><img src='phase_d_assets/nationality_constrained_confusion_topn.png' alt='Constrained Confusion (Top Classes)'/><figcaption>Constrained Confusion (Top Classes)</figcaption></figure>
+            </div>
+            <figure class="full-width"><img src='phase_d_assets/nationality_confusion_delta.png' alt='Confusion Changes (Baseline -> Constrained)'/><figcaption>Confusion Changes (Baseline -> Constrained)</figcaption></figure>
+
+            <h3>Data Distribution & Analysis</h3>
+            <div class="grid">
+                <figure><img src='phase_d_assets/nationality_class_distribution.png' alt='Class Sample Distribution'/><figcaption>Class Sample Distribution</figcaption></figure>
+                <figure><img src='phase_d_assets/nationality_performance_vs_support.png' alt='Performance vs Sample Count'/><figcaption>Performance vs Sample Count</figcaption></figure>
+                <figure><img src='phase_d_assets/nationality_precision_recall.png' alt='Precision vs Recall Trade-off'/><figcaption>Precision vs Recall Trade-off</figcaption></figure>
+            </div>
+
+            <h3>Detailed Per-Class Metrics</h3>
+            <details>
+                <summary>Baseline Per-Class Metrics (click to expand)</summary>
+                <h3>Baseline: nationality</h3><p><em>Showing top 20 of 44 classes (sorted by F1).</em></p><table><thead><tr><th>Class</th><th>Precision</th><th>Recall</th><th>F1</th><th>Support</th></tr></thead><tbody><tr><td>Italy</td><td>0.9518</td><td>0.7702</td><td>0.8514</td><td>692</td></tr>
+<tr><td>Croatia</td><td>0.8272</td><td>0.8590</td><td>0.8428</td><td>78</td></tr>
+<tr><td>Portugal</td><td>0.7600</td><td>0.9399</td><td>0.8404</td><td>283</td></tr>
+<tr><td>Slovakia</td><td>0.7692</td><td>0.8696</td><td>0.8163</td><td>46</td></tr>
+<tr><td>Poland</td><td>0.6947</td><td>0.8884</td><td>0.7797</td><td>251</td></tr>
+<tr><td>Norway</td><td>0.7649</td><td>0.7601</td><td>0.7625</td><td>321</td></tr>
+<tr><td>Estonia</td><td>0.6575</td><td>0.8727</td><td>0.7500</td><td>55</td></tr>
+<tr><td>Spain</td><td>0.7685</td><td>0.7293</td><td>0.7484</td><td>628</td></tr>
+<tr><td>United Kingdom</td><td>0.6886</td><td>0.8113</td><td>0.7449</td><td>477</td></tr>
+<tr><td>Slovenia</td><td>0.8667</td><td>0.6436</td><td>0.7386</td><td>101</td></tr>
+<tr><td>Sweden</td><td>0.5887</td><td>0.9047</td><td>0.7133</td><td>451</td></tr>
+<tr><td>Turkey</td><td>0.8594</td><td>0.5956</td><td>0.7036</td><td>544</td></tr>
+<tr><td>Greece</td><td>0.6396</td><td>0.7542</td><td>0.6922</td><td>240</td></tr>
+<tr><td>The Netherlands</td><td>0.6719</td><td>0.6926</td><td>0.6821</td><td>618</td></tr>
+<tr><td>Bosnia and Herzegovina</td><td>0.7500</td><td>0.6000</td><td>0.6667</td><td>10</td></tr>
+<tr><td>Germany</td><td>0.4466</td><td>0.8275</td><td>0.5801</td><td>626</td></tr>
+<tr><td>Finland</td><td>0.5349</td><td>0.5702</td><td>0.5520</td><td>349</td></tr>
+<tr><td>USA</td><td>0.4377</td><td>0.7240</td><td>0.5456</td><td>471</td></tr>
+<tr><td>Ireland</td><td>0.8412</td><td>0.3934</td><td>0.5361</td><td>633</td></tr>
+<tr><td>Georgia</td><td>0.6957</td><td>0.4324</td><td>0.5333</td><td>37</td></tr></tbody></table>
+            </details>
+            <details>
+                <summary>Constrained Per-Class Metrics (click to expand)</summary>
+                <h3>Constrained: nationality</h3><p><em>Showing top 20 of 44 classes (sorted by F1).</em></p><table><thead><tr><th>Class</th><th>Precision</th><th>Recall</th><th>F1</th><th>Support</th></tr></thead><tbody><tr><td>Portugal</td><td>0.8061</td><td>0.9399</td><td>0.8679</td><td>283</td></tr>
+<tr><td>Italy</td><td>0.9250</td><td>0.7486</td><td>0.8275</td><td>692</td></tr>
+<tr><td>Sweden</td><td>0.8129</td><td>0.8381</td><td>0.8253</td><td>451</td></tr>
+<tr><td>Slovakia</td><td>0.7959</td><td>0.8478</td><td>0.8211</td><td>46</td></tr>
+<tr><td>Estonia</td><td>0.6986</td><td>0.9273</td><td>0.7969</td><td>55</td></tr>
+<tr><td>Poland</td><td>0.7134</td><td>0.8725</td><td>0.7849</td><td>251</td></tr>
+<tr><td>Spain</td><td>0.9176</td><td>0.6736</td><td>0.7769</td><td>628</td></tr>
+<tr><td>Slovenia</td><td>0.8471</td><td>0.7129</td><td>0.7742</td><td>101</td></tr>
+<tr><td>Greece</td><td>0.7287</td><td>0.7500</td><td>0.7392</td><td>240</td></tr>
+<tr><td>United Kingdom</td><td>0.6499</td><td>0.7862</td><td>0.7116</td><td>477</td></tr>
+<tr><td>Norway</td><td>0.6354</td><td>0.7601</td><td>0.6922</td><td>321</td></tr>
+<tr><td>Croatia</td><td>0.5537</td><td>0.8590</td><td>0.6734</td><td>78</td></tr>
+<tr><td>Turkey</td><td>0.8799</td><td>0.5386</td><td>0.6682</td><td>544</td></tr>
+<tr><td>The Netherlands</td><td>0.6498</td><td>0.6634</td><td>0.6565</td><td>618</td></tr>
+<tr><td>Bulgaria</td><td>0.5000</td><td>0.8750</td><td>0.6364</td><td>8</td></tr>
+<tr><td>Serbia</td><td>0.4839</td><td>0.7143</td><td>0.5769</td><td>21</td></tr>
+<tr><td>Georgia</td><td>1.0000</td><td>0.3784</td><td>0.5490</td><td>37</td></tr>
+<tr><td>Iceland</td><td>0.3636</td><td>1.0000</td><td>0.5333</td><td>12</td></tr>
+<tr><td>Belgium</td><td>0.6181</td><td>0.4241</td><td>0.5031</td><td>290</td></tr>
+<tr><td>Finland</td><td>0.4286</td><td>0.5931</td><td>0.4976</td><td>349</td></tr></tbody></table>
+            </details>
+        </div>
+        
+
+    <h2>Verification Results (CHG + SVS)</h2>
+    <table>
+        <thead>
+            <tr>
+                <th>Model</th>
+                <th>Facilitating Heads</th>
+                <th>Irrelevant Heads</th>
+                <th>Neutral Heads</th>
+                <th>SVS Score</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Baseline</td>
+                <td>52</td>
+                <td>102</td>
+                <td>230</td>
+                <td>0.4813</td>
+            </tr>
+            <tr>
+                <td>Constrained</td>
+                <td>90</td>
+                <td>108</td>
+                <td>186</td>
+                <td>0.5148</td>
+            </tr>
+        </tbody>
+    </table>
+    <p><strong>SVS Delta (constrained - baseline):</strong> 0.0336</p>
+
+    <figure class="full-width"><img src='phase_d_assets/head_classification_comparison.png' alt='Attention Head Classification Comparison'/><figcaption>Attention Head Classification Comparison</figcaption></figure>
+
+    <div class="interpretation">
+        <h4>Interpretation</h4>
+        <ul><li>The constrained model has <strong>6 more irrelevant heads</strong>, indicating more attention heads have become uninformative for the task.</li></ul>
+    </div>
+
+    <h2>Raw Metrics</h2>
+    <details>
+        <summary>Comparative Metrics JSON (click to expand)</summary>
+        <pre>{
+  "baseline": {
+    "test": {
+      "nationality": {
+        "accuracy": 0.6010990142822266,
+        "f1_macro": 0.3837469981297977
+      }
+    }
+  },
+  "constrained": {
+    "test": {
+      "nationality": {
+        "accuracy": 0.5732166767120361,
+        "f1_macro": 0.3710131231877843
+      }
+    }
+  },
+  "delta": {
+    "nationality": {
+      "accuracy_delta": -0.02788233757019043,
+      "baseline_accuracy": 0.6010990142822266,
+      "constrained_accuracy": 0.5732166767120361
+    }
+  }
+}</pre>
+    </details>
+
+</body>
+</html>
