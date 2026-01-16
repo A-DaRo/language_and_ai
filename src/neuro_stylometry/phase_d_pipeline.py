@@ -106,6 +106,11 @@ def run_phase_d_training(
 
     # Extract optimization config for AOT pipeline
     opt_cfg = config.get('optimization', {})
+    
+    # Extract execution config for batching flags
+    exec_cfg = config.get('execution', {})
+    use_token_budget_batching = bool(exec_cfg.get('use_token_budget_batching', True))
+    use_adaptive_token_budget = bool(exec_cfg.get('use_adaptive_token_budget', False))
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -174,6 +179,9 @@ def run_phase_d_training(
         use_device_prefetch=opt_cfg.get('use_device_prefetch', False),
         quantize_step=opt_cfg.get('quantize_step', 16),
         token_budget=opt_cfg.get('token_budget', 65536),
+        # Token-budget batching flags
+        use_token_budget_batching=use_token_budget_batching,
+        use_adaptive_token_budget=use_adaptive_token_budget,
         # Label filtering
         use_only_labels=use_only_labels,
     )
@@ -186,7 +194,7 @@ def run_phase_d_training(
         label_maps=None,
         split="train",
         shuffle=True,
-        enable_dynamic_batching=True,
+        enable_dynamic_batching=use_token_budget_batching,  # Controlled by config flag
     )
     baseline_trainer.label_maps = label_maps
 
@@ -298,6 +306,9 @@ def run_phase_d_training(
         use_device_prefetch=opt_cfg.get('use_device_prefetch', False),
         quantize_step=opt_cfg.get('quantize_step', 16),
         token_budget=opt_cfg.get('token_budget', 65536),
+        # Token-budget batching flags
+        use_token_budget_batching=use_token_budget_batching,
+        use_adaptive_token_budget=use_adaptive_token_budget,
         # Label filtering
         use_only_labels=use_only_labels,
     )
@@ -311,7 +322,7 @@ def run_phase_d_training(
         label_maps=label_maps,
         split="train",
         shuffle=True,
-        enable_dynamic_batching=True,
+        enable_dynamic_batching=use_token_budget_batching,  # Controlled by config flag
     )
 
     val_loader_c, _ = constrained_trainer._build_loader(

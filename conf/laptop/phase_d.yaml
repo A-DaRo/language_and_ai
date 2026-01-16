@@ -41,15 +41,19 @@ execution:
   autotuning:
     enabled: false  # Manual tuning for predictability
     
-  dynamic_batching:
-    enabled: true
+  # Token-budget batching for length-aware batching (required for AOT mode)
+  use_token_budget_batching: true
+  
+  # Adaptive budgets disabled on laptop for predictability
+  use_adaptive_token_budget: false
+  
+  # Batch constraints for JIT mode
+  batch_constraints:
     max_batch_size: 32  # Reasonable cap for laptop VRAM
     min_batch_size: 1
     drop_last: false
     shuffle: true
     seed: 42
-    length_column: "token_count"
-    length_scale: 1.0
     
   telemetry:
     enabled: false  # Disable for speed

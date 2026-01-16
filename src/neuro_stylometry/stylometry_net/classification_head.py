@@ -47,6 +47,21 @@ class SingleTaskHead(nn.Module):
         cls_embedding = self.dropout(cls_embedding)
         return self.classifier(cls_embedding)
 
+    def forward_compiled(self, cls_embedding: torch.Tensor) -> torch.Tensor:
+        """CUDA-graph-safe forward pass returning single logits tensor.
+        
+        Compatible with torch.compile and manual CUDA graphs.
+        Returns plain tensor instead of tuple for single-task simplicity.
+        
+        Args:
+            cls_embedding: [batch_size, hidden_dim] CLS token embeddings
+            
+        Returns:
+            Logits tensor of shape [batch_size, num_classes]
+        """
+        cls_embedding = self.dropout(cls_embedding)
+        return self.classifier(cls_embedding)
+
     def compute_loss(
         self,
         logits: torch.Tensor,
@@ -67,6 +82,52 @@ class SingleTaskHead(nn.Module):
         # Handle all-ignored case (returns nan)
         loss = torch.nan_to_num(loss, nan=0.0)
         return loss if loss.item() != 0.0 else None
+
+    def compute_loss_compiled(
+        self,
+        logits: torch.Tensor,
+        labels: tuple[torch.Tensor],
+        ignore_index: int = -1,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """CUDA-graph-safe loss computation for single task.
+        
+        Compatible with torch.compile and manual CUDA graphs.
+        Accepts labels as tuple for API consistency with MultiTaskHead.
+        
+        Args:
+            logits: [batch_size, num_classes] model predictions
+            labels: Tuple containing single label tensor [batch_size]
+            ignore_index: Label value to ignore in loss computation
+            
+        Returns:
+            Tuple of (loss, valid_flag) where:
+                - loss: scalar loss tensor (zero if all samples ignored)
+                - valid_flag: 1 if any valid samples, 0 otherwise
+        """
+        # Extract single label tensor from tuple
+        label_tensor = labels[0]
+        
+        # Compute valid mask without CPU sync
+        valid_mask = label_tensor != ignore_index
+        valid_count = valid_mask.sum()
+        
+        # Per-sample loss
+        per_sample = F.cross_entropy(
+            logits,
+            label_tensor,
+            reduction="none",
+            ignore_index=ignore_index,
+        )
+        
+        # Masked loss sum
+        loss_sum = (per_sample * valid_mask).sum()
+        denom = valid_count.clamp(min=1)
+        loss = loss_sum / denom
+        
+        # Valid flag (1 if any valid samples, 0 otherwise)
+        valid_flag = (valid_count > 0).to(torch.int32)
+        
+        return loss, valid_flag
 
 
 class MultiTaskHead(nn.Module):

@@ -140,8 +140,41 @@ class PhaseDTrainConfig:
     quantize_step: int = DEFAULT_QUANTIZE_STEP  # Snap-to-Grid step (16)
     token_budget: int = 65536  # Default token budget for quantized sampler
     
+    # Token-budget batching flags (replacing legacy dynamic_batching.enabled)
+    # use_token_budget_batching: Enables QuantizedBucketSampler (AOT) or PhaseDBudgetedBatchSampler (JIT)
+    # use_adaptive_token_budget: Enables RuntimeController for dynamic budget adjustment
+    use_token_budget_batching: bool = True
+    use_adaptive_token_budget: bool = False
+    
     # Label filtering for single-label or subset training
     use_only_labels: Optional[tuple[str, ...]] = None  # Filter to specific demographic labels
+    
+    def __post_init__(self) -> None:
+        """Validate configuration flag combinations."""
+        # Check for removed legacy config
+        if self.execution_config and "dynamic_batching" in self.execution_config:
+            raise RuntimeError(
+                "Config key 'execution.dynamic_batching' has been REMOVED. "
+                "Use 'execution.use_token_budget_batching' (for length-aware batching) "
+                "and 'execution.use_adaptive_token_budget' (for RuntimeController autotuning) instead. "
+                "See conf/base/phase_d.yaml for the new configuration structure."
+            )
+        
+        # AOT mode requires token-budget batching (pre-tokenization is wasted otherwise)
+        if self.use_aot_mode and not self.use_token_budget_batching:
+            raise RuntimeError(
+                "Configuration error: use_aot_mode=True REQUIRES use_token_budget_batching=True. "
+                "AOT pre-tokenization is wasted without token-aware batching. "
+                "Either set execution.use_token_budget_batching=true or disable optimization.use_aot_mode."
+            )
+        
+        # Adaptive budgets require token-budget batching
+        if self.use_adaptive_token_budget and not self.use_token_budget_batching:
+            raise RuntimeError(
+                "Configuration error: use_adaptive_token_budget=True REQUIRES use_token_budget_batching=True. "
+                "RuntimeController needs token budgets to adjust. "
+                "Set execution.use_token_budget_batching=true to enable adaptive budgets."
+            )
 
 
 class PhaseDTrainer:
@@ -165,22 +198,26 @@ class PhaseDTrainer:
         if self.device.type == "cuda":
             torch.set_float32_matmul_precision("high")
         self._execution_config = config.execution_config or {}
+        
+        # Token-budget batching flags (new orthogonal flags)
+        self._use_token_budget_batching = bool(config.use_token_budget_batching)
+        self._use_adaptive_token_budget = bool(config.use_adaptive_token_budget)
+        
+        # RuntimeController for adaptive budgets (only when adaptive budgets enabled)
         autotuning_cfg = self._execution_config.get("autotuning", {})
-        self._autotuning_enabled = bool(autotuning_cfg.get("enabled", False))
         self._runtime_controller = (
             RuntimeController.from_config({"execution": {"autotuning": autotuning_cfg}})
-            if self._autotuning_enabled
+            if self._use_adaptive_token_budget
             else None
         )
-        self._dynamic_batching_cfg = self._execution_config.get("dynamic_batching", {})
-        self._dynamic_batching_enabled = bool(
-            self._dynamic_batching_cfg.get("enabled", self._autotuning_enabled)
-        )
+        
+        # Batch constraints for JIT mode (PhaseDBudgetedBatchSampler)
+        self._batch_constraints = self._execution_config.get("batch_constraints", {})
         
         # Telemetry configuration with strided sampling support
         telemetry_cfg = self._execution_config.get("telemetry", {})
         self._telemetry_enabled = bool(
-            telemetry_cfg.get("enabled", False) or self._autotuning_enabled
+            telemetry_cfg.get("enabled", False) or self._use_adaptive_token_budget
         )
         self._telemetry_stride = int(telemetry_cfg.get("stride", 1))  # Measure every Nth batch
         self._telemetry = TelemetryCollector.get_instance() if self._telemetry_enabled else None
@@ -225,6 +262,51 @@ class PhaseDTrainer:
         shuffle: bool = False,
         enable_dynamic_batching: bool = False,
     ) -> tuple[DataLoader, PhaseDLabelMaps]:
+        """
+        Build a DataLoader with the appropriate batching strategy.
+        
+        Batching Strategy Decision Tree:
+        ================================
+        
+        Strategy A - QuantizedBucketSampler (optimal for AOT mode):
+            Prerequisites:
+                - AOT mode active (dataset has 'input_ids' column)
+                - config.use_token_budget_batching = True
+                - Parameter enable_dynamic_batching = True
+                - Dataset has 'token_count' column
+            Features:
+                - Quantized bucketing for CUDA Graph stability
+                - Static token_budget OR dynamic via RuntimeController
+                - Minimal padding waste via length-sorted batches
+        
+        Strategy B - PhaseDBudgetedBatchSampler (for JIT mode):
+            Prerequisites:
+                - config.use_token_budget_batching = True
+                - Parameter enable_dynamic_batching = True
+                - NOT AOT mode (or AOT without token_count column)
+            Features:
+                - Estimates token counts via length function
+                - Uses batch_constraints from config (max/min batch sizes)
+        
+        Strategy C - Standard DataLoader (fixed batching):
+            Fallback when:
+                - config.use_token_budget_batching = False, OR
+                - Parameter enable_dynamic_batching = False
+            Features:
+                - Fixed batch_size from config
+                - No token-aware batching
+        
+        Args:
+            text_field: Column name for text data ('post' or 'post_masked')
+            label_maps: Existing label maps (reuse for val/test loaders)
+            split: Dataset split ('train', 'val', 'test')
+            shuffle: Whether to shuffle data
+            enable_dynamic_batching: Per-loader override. Must be True to use
+                token-budget batching. Cannot enable if config flag is False.
+        
+        Returns:
+            Tuple of (DataLoader, PhaseDLabelMaps)
+        """
         # Determine label_fields based on use_only_labels filter
         use_only = self.config.use_only_labels
         if use_only:
@@ -284,23 +366,34 @@ class PhaseDTrainer:
             loader_kwargs["persistent_workers"] = persistent_workers
             loader_kwargs["prefetch_factor"] = prefetch_factor
 
-        # Use QuantizedBucketSampler in AOT mode for CUDA Graph stability
-        if aot_mode_active and enable_dynamic_batching:
+        # =========================================================================
+        # Batching Strategy Selection
+        # =========================================================================
+        # Check both the global config flag (use_token_budget_batching) AND the
+        # per-loader parameter (enable_dynamic_batching) before using token-aware
+        # batching. This ensures YAML config authority is respected.
+        
+        use_token_batching = enable_dynamic_batching and self._use_token_budget_batching
+
+        # Strategy A: QuantizedBucketSampler (AOT mode with token counts)
+        if aot_mode_active and use_token_batching:
             token_counts = dataset.get_all_token_counts()
             
             if token_counts is not None:
-                # Use dynamic budget from RuntimeController if autotuning enabled
+                # Use dynamic budget from RuntimeController if adaptive budgets enabled
                 if self._runtime_controller is not None:
                     budget_provider = self._runtime_controller.get_next_budget
                     logger.info(
-                        f"Using QuantizedBucketSampler with dynamic budget: {len(token_counts)} samples, "
-                        f"step={self._quantize_step}, autotuning=enabled"
+                        f"Using QuantizedBucketSampler with ADAPTIVE budget: "
+                        f"{len(token_counts)} samples, step={self._quantize_step}, "
+                        f"RuntimeController active"
                     )
                 else:
                     budget_provider = self._token_budget
                     logger.info(
-                        f"Using QuantizedBucketSampler: {len(token_counts)} samples, "
-                        f"token_budget={self._token_budget}, step={self._quantize_step}"
+                        f"Using QuantizedBucketSampler with STATIC budget: "
+                        f"{len(token_counts)} samples, token_budget={self._token_budget}, "
+                        f"step={self._quantize_step}"
                     )
                 
                 batch_sampler = create_quantized_sampler(
@@ -321,21 +414,20 @@ class PhaseDTrainer:
                 return loader, dataset.label_maps
             else:
                 logger.warning(
-                    "AOT mode but token_count column not found. "
-                    "Falling back to budgeted sampler."
+                    "AOT mode active but token_count column not found. "
+                    "Falling back to PhaseDBudgetedBatchSampler."
                 )
 
-        if enable_dynamic_batching and self._dynamic_batching_enabled:
-            # Legacy budgeted batch sampler
+        # Strategy B: PhaseDBudgetedBatchSampler (JIT mode or AOT without token_count)
+        if use_token_batching:
+            # Read batch constraints from config
             max_batch_size = int(
-                self._dynamic_batching_cfg.get("max_batch_size", self.config.batch_size)
+                self._batch_constraints.get("max_batch_size", self.config.batch_size)
             )
-            min_batch_size = int(self._dynamic_batching_cfg.get("min_batch_size", 1))
-            drop_last = bool(self._dynamic_batching_cfg.get("drop_last", False))
-            shuffle_batches = bool(self._dynamic_batching_cfg.get("shuffle", shuffle))
-            seed = int(self._dynamic_batching_cfg.get("seed", 42))
-            length_column = str(self._dynamic_batching_cfg.get("length_column", "text_length"))
-            length_scale = float(self._dynamic_batching_cfg.get("length_scale", 1.0))
+            min_batch_size = int(self._batch_constraints.get("min_batch_size", 1))
+            drop_last = bool(self._batch_constraints.get("drop_last", False))
+            shuffle_batches = bool(self._batch_constraints.get("shuffle", shuffle))
+            seed = int(self._batch_constraints.get("seed", 42))
 
             # Create tokenizer only if not in AOT mode
             if not aot_mode_active:
@@ -346,15 +438,15 @@ class PhaseDTrainer:
                 )
 
             def length_fn(index: int) -> int:
-                # Prefer token_count in AOT mode
+                # Prefer token_count (available in AOT mode)
                 if aot_mode_active:
                     tc = dataset.get_token_count(index)
                     if tc is not None:
                         return min(tc, int(self.config.max_length))
-                cached = dataset.get_length(index, length_column)
+                # Fallback: use cached text_length or estimate via tokenizer
+                cached = dataset.get_length(index, "text_length")
                 if cached is not None:
-                    scaled = max(1, int(cached * length_scale))
-                    return min(scaled, int(self.config.max_length))
+                    return min(max(1, int(cached)), int(self.config.max_length))
                 text = dataset.get_text(index)
                 length = tokenizer.estimate_length(text)
                 return min(int(length), int(self.config.max_length))
@@ -381,6 +473,16 @@ class PhaseDTrainer:
                 **loader_kwargs,
             )
         else:
+            # Strategy C: Standard DataLoader (fixed batching)
+            # Used when token-budget batching is disabled via config or parameter
+            if self._use_token_budget_batching and not enable_dynamic_batching:
+                logger.debug(
+                    "Token-budget batching disabled for this loader (enable_dynamic_batching=False)"
+                )
+            elif not self._use_token_budget_batching:
+                logger.debug(
+                    "Token-budget batching disabled globally (use_token_budget_batching=False)"
+                )
             loader = DataLoader(
                 dataset,
                 batch_size=self.config.batch_size,
@@ -730,17 +832,19 @@ class PhaseDTrainer:
         
         # Track whether batch count is approximate (dynamic batching can change it)
         batch_sampler = getattr(loader, "batch_sampler", None)
-        # Consider dynamic batching enabled only when the sampler provides a
-        # budget_provider OR when the runtime controller is present AND
-        # dynamic batching was explicitly enabled in config. Previously the
-        # mere presence of a RuntimeController forced dynamic-batching
-        # behavior even when dynamic batching was disabled.
-        is_dynamic_batching = (
-            (batch_sampler is not None
+        
+        # Detect if token-budget batching is active by checking:
+        # 1. Sampler has budget_provider (QuantizedBucketSampler or PhaseDBudgetedBatchSampler)
+        # 2. AND token-budget batching is enabled in config
+        has_budget_sampler = (
+            batch_sampler is not None
             and hasattr(batch_sampler, "budget_provider")
-            and callable(getattr(batch_sampler, "budget_provider", None)))
-            or (self._runtime_controller is not None and self._dynamic_batching_enabled)
+            and callable(getattr(batch_sampler, "budget_provider", None))
         )
+        is_token_budget_batching = has_budget_sampler and self._use_token_budget_batching
+        
+        # Adaptive budgets active when RuntimeController is present
+        is_adaptive_batching = is_token_budget_batching and self._use_adaptive_token_budget
         
         if steps_per_epoch is not None:
             total_batch_steps = (
@@ -773,10 +877,17 @@ class PhaseDTrainer:
         # Overall training info
         num_epochs = self.config.num_epochs
         if steps_per_epoch is not None:
-            batch_qualifier = "~" if is_dynamic_batching else ""
+            # Use "~" prefix only for adaptive batching (where batch count varies per epoch)
+            batch_qualifier = "~" if is_adaptive_batching else ""
+            if is_adaptive_batching:
+                batching_mode = "Adaptive Token-Budget Batching"
+            elif is_token_budget_batching:
+                batching_mode = "Token-Budget Batching (Static)"
+            else:
+                batching_mode = "Fixed Batching"
             logger.info(
-                f"Starting training: {num_epochs} epochs, {batch_qualifier}{steps_per_epoch} batches/epoch"
-                + (f" (dynamic budget)" if is_dynamic_batching else "")
+                f"Starting training: {num_epochs} epochs, {batch_qualifier}{steps_per_epoch} batches/epoch "
+                f"({batching_mode})"
             )
         else:
             logger.info(
@@ -799,10 +910,10 @@ class PhaseDTrainer:
                 logger.info("DevicePrefetcher enabled: async H2D transfers active")
         
         for epoch in range(start_epoch, num_epochs):
-            # Conservative epoch start: reset budget to 75% of previous successful budget
+            # Conservative epoch start: reset budget to 50% of previous successful budget
             # This prevents OOM from aggressive scaling carrying over to new epoch with different data distribution
             if epoch > start_epoch and self._runtime_controller is not None:
-                conservative_budget = int(self._runtime_controller.successful_budget * 0.75)
+                conservative_budget = int(self._runtime_controller.successful_budget * 0.50)
                 new_budget = max(
                     conservative_budget,
                     self._runtime_controller.config.initial_token_budget
@@ -811,7 +922,7 @@ class PhaseDTrainer:
                     logger.info(
                         f"Epoch {epoch + 1}: resetting budget conservatively: "
                         f"{self._runtime_controller.current_budget} → {new_budget} "
-                        f"(75% of successful budget {self._runtime_controller.successful_budget})"
+                        f"(50% of successful budget {self._runtime_controller.successful_budget})"
                     )
                     self._runtime_controller._current_budget = new_budget
             
@@ -837,9 +948,11 @@ class PhaseDTrainer:
             except TypeError:
                 epoch_total = steps_per_epoch  # Use cached estimate or None
             
-            # For dynamic batching, don't set a fixed total since batch count varies
-            # This prevents misleading progress percentages (e.g., "499/2059" when actual is 2629)
-            if is_dynamic_batching:
+            # For adaptive batching (RuntimeController), don't set a fixed total 
+            # since batch count varies per epoch. This prevents misleading progress 
+            # percentages (e.g., "499/2059" when actual is 2629).
+            # Static token-budget batching has predictable batch counts.
+            if is_adaptive_batching:
                 epoch_total = None  # Let tqdm show raw batch count without percentage
             
             # Progress bar for batches within epoch - single persistent bar

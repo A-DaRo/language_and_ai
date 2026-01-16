@@ -7,7 +7,7 @@
 # HPC training overrides
 training:
   num_epochs: 300
-  batch_size: 128  # Base batch (dynamic batching uses token budget instead)
+  batch_size: 64  # Base batch (dynamic batching uses token budget instead)
   learning_rate: 3e-5
   layerwise_lr_decay: 0.9
   gradient_accumulation_steps: 2
@@ -70,12 +70,12 @@ optimization:
   # Start lower to avoid OOM cascade during warmup
   # Reduced conservative token budget to avoid large single allocations
   # Further reduced from 8192 to 4096 to prevent aggressive epoch-to-epoch scaling
-  token_budget: 4096  # safer default for large models
+  token_budget: 8192  # safer default for large models
 
 # HPC execution overrides
 execution:
   autotuning:
-    enabled: true  # Let runtime find optimal budget
+    enabled: false  # Let runtime find optimal budget
     warmup_batches: 10
     initial_token_budget: 8192  # Conservative start (down from 8192)
     min_token_budget: 1024
@@ -88,17 +88,21 @@ execution:
     history_window: 10
     recovery_patience: 5
     
-  dynamic_batching:
-    enabled: false
-    # NO artificial cap - token budget controls batch size
-    # Added conservative caps to avoid runaway batch sizes causing OOM
+  # Token-budget batching: REQUIRED for AOT mode (mandatory for HPC pipeline)
+  # Enables QuantizedBucketSampler for CUDA Graph stability and padding efficiency
+  use_token_budget_batching: true
+  
+  # Adaptive token budget: RuntimeController adjusts budget based on GPU feedback
+  # Works with autotuning above for maximum throughput
+  use_adaptive_token_budget: false
+  
+  # Batch constraints (for JIT mode fallback only)
+  batch_constraints:
     max_batch_size: 1024
-    min_batch_size: 64
+    min_batch_size: 128
     drop_last: false
     shuffle: true
     seed: 42
-    length_column: "token_count"
-    length_scale: 1.0
     
   telemetry:
     enabled: true  # Monitor for profiling

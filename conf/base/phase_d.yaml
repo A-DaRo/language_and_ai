@@ -155,17 +155,23 @@ execution:
     history_window: 10
     recovery_patience: 5
     
-  dynamic_batching:
-    enabled: true  # Enable for AOT mode with quantized bucketing
-    # NOTE: max_batch_size is NOT enforced in AOT mode
-    # Token budget controls batch formation instead
+  # Token-budget batching: enables QuantizedBucketSampler (AOT) or PhaseDBudgetedBatchSampler (JIT)
+  # for length-aware batching that minimizes padding waste.
+  # REQUIRED when use_aot_mode=True (raises RuntimeError otherwise).
+  use_token_budget_batching: true
+  
+  # Adaptive token budget: enables RuntimeController for dynamic budget adjustment
+  # via PID-like feedback loop. Requires use_token_budget_batching=True.
+  use_adaptive_token_budget: false
+  
+  # Batch constraints for PhaseDBudgetedBatchSampler (JIT mode only)
+  # QuantizedBucketSampler uses token_budget from optimization config instead
+  batch_constraints:
     max_batch_size: 2048  # High cap (no artificial starvation)
     min_batch_size: 1
     drop_last: false
     shuffle: true
     seed: 42
-    length_column: "token_count"  # Use exact token counts from AOT
-    length_scale: 1.0
     
   telemetry:
     enabled: false  # Disable by default to avoid sync overhead
