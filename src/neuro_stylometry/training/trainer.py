@@ -13,6 +13,7 @@ from __future__ import annotations
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+import gc
 import logging
 import math
 import json
@@ -792,6 +793,22 @@ class PhaseDTrainer:
                 logger.info("DevicePrefetcher enabled: async H2D transfers active")
         
         for epoch in range(start_epoch, num_epochs):
+            # Conservative epoch start: reset budget to 75% of previous successful budget
+            # This prevents OOM from aggressive scaling carrying over to new epoch with different data distribution
+            if epoch > start_epoch and self._runtime_controller is not None:
+                conservative_budget = int(self._runtime_controller.successful_budget * 0.75)
+                new_budget = max(
+                    conservative_budget,
+                    self._runtime_controller.config.initial_token_budget
+                )
+                if new_budget != self._runtime_controller.current_budget:
+                    logger.info(
+                        f"Epoch {epoch + 1}: resetting budget conservatively: "
+                        f"{self._runtime_controller.current_budget} → {new_budget} "
+                        f"(75% of successful budget {self._runtime_controller.successful_budget})"
+                    )
+                    self._runtime_controller._current_budget = new_budget
+            
             optimizer.zero_grad(set_to_none=True)
             accum_counter = 0
             epoch_loss_sum = 0.0
@@ -814,12 +831,17 @@ class PhaseDTrainer:
             except TypeError:
                 epoch_total = steps_per_epoch  # Use cached estimate or None
             
+            # For dynamic batching, don't set a fixed total since batch count varies
+            # This prevents misleading progress percentages (e.g., "499/2059" when actual is 2629)
+            if is_dynamic_batching:
+                epoch_total = None  # Let tqdm show raw batch count without percentage
+            
             # Progress bar for batches within epoch - single persistent bar
             # Explicitly pass total to avoid tqdm guessing wrong on wrapped iterators
             batch_pbar = tqdm(
                 train_iterator,
                 desc=f"Epoch {epoch + 1}/{num_epochs}",
-                total=epoch_total,  # Explicit total handles DevicePrefetcher wrapping
+                total=epoch_total,  # None for dynamic batching, fixed otherwise
                 unit="batch",
                 leave=True,  # Keep bar visible after epoch completes
                 ncols=100,  # Fixed width for consistency
@@ -1123,6 +1145,13 @@ class PhaseDTrainer:
                     if bad_epochs >= self.config.early_stopping_patience:
                         logger.info(f"Early stopping at epoch {epoch + 1}")
                         break
+                
+                # Memory cleanup after evaluation before next epoch
+                if self.device.type == "cuda":
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+                gc.collect()
+                logger.debug("Memory cleanup completed after evaluation")
             if self.config.max_steps and step >= self.config.max_steps:
                 logger.info(f"Reached max_steps={self.config.max_steps}")
                 break
@@ -1287,45 +1316,3 @@ def _compute_detailed_metrics(
         "confusion_matrix": conf.tolist(),
         "per_class": per_class,
     }
-
-    def train_baseline_and_constrained(self, *, use_affine_guard: bool = True) -> None:
-        label_maps = load_label_maps(self.config.dataset_path, get_demographic_columns())
-        self.label_maps = label_maps
-        baseline_loader, _ = self._build_loader(
-            text_field="post",
-            label_maps=label_maps,
-            split="train",
-        )
-        baseline_eval_loader, _ = self._build_loader(
-            text_field="post",
-            label_maps=label_maps,
-            split="val",
-        )
-        baseline_model, baseline_head = self._build_model(use_affine_guard=False)
-
-        self._train(
-            model=baseline_model,
-            head=baseline_head,
-            loader=baseline_loader,
-            eval_loader=baseline_eval_loader,
-            run_dir=self.config.output_dir / "baseline",
-        )
-        if use_affine_guard:
-            constrained_loader, _ = self._build_loader(
-                text_field="post_masked",
-                label_maps=label_maps,
-                split="train",
-            )
-            constrained_eval_loader, _ = self._build_loader(
-                text_field="post_masked",
-                label_maps=label_maps,
-                split="val",
-            )
-            constrained_model, constrained_head = self._build_model(use_affine_guard=True)
-            self._train(
-                model=constrained_model,
-                head=constrained_head,
-                loader=constrained_loader,
-                eval_loader=constrained_eval_loader,
-                run_dir=self.config.output_dir / "constrained",
-            )

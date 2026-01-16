@@ -325,16 +325,6 @@ class HPCFilterStrategy(PollutionFilterStrategy):
             else:
                 logger.warning(f"Resume validation failed for {len(invalid_chunk_rows)} rows")
         
-        # Reload without mmap for atomic save (Windows compatibility)
-        dataset_stage1 = SOBRDataset(
-            arrow_path=input_dataset_path,
-            seed=int(self._cfg_get(config, "seed")),
-            memory_map=False,
-        )
-        table = dataset_stage1.table
-        posts = table["post"].to_pylist()
-        post_ids = table["post_id"].to_pylist()
-        
         # Prepare labels list
         labels_list: List[Optional[List[str]]] = [inference_labels for _ in posts]
         

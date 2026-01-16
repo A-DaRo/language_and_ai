@@ -1108,7 +1108,8 @@ def run_full_pipeline(
     from .phase_a_pipeline import PhaseAPipeline
     from .factories.strategy_factory import StrategyFactory
     from .hardware_ops.detection import HardwareDetector, ProfileType
-    from .config import load_pipeline_config
+    from .config import load_pipeline_config, load_phase_d_config
+    from .data_engine.tokenization import preprocess_dataset
     
     try:
         def _derive_tokenized_paths(base_path: Path) -> tuple[Path, Path]:
@@ -1223,9 +1224,62 @@ def run_full_pipeline(
         clean_dataset_path = phase_a_dir / "clean_dataset.arrow"
         projection_matrix_path = phase_a_dir / "projection_matrix.pt"
         
+        # Load Phase D config to check for AOT mode
+        phase_d_config = load_phase_d_config(mode=mode, experiment_config_path=config_path)
+        opt_cfg = phase_d_config.get('optimization', {})
+        use_aot_mode = opt_cfg.get('use_aot_mode', False)
+        
+        # Determine tokenized dataset paths
+        dataset_post, dataset_masked = _derive_tokenized_paths(clean_dataset_path)
+        
+        # Auto-preprocess tokenized datasets if AOT mode is enabled and they don't exist
+        if use_aot_mode and (not dataset_post.exists() or not dataset_masked.exists()):
+            model_name = phase_d_config.get("model", {}).get("name", "roberta-base")
+            max_length = phase_d_config.get("model", {}).get("max_length", 512)
+            pre_pad = True  # Default to pre-padding for AOT mode
+
+            click.echo(f"\n{'=' * 80}")
+            click.echo("AUTO-PREPROCESSING: Creating tokenized datasets for AOT mode")
+            click.echo(f"{'=' * 80}")
+            click.echo(f"Source: {clean_dataset_path}")
+            click.echo(f"Model: {model_name}")
+            click.echo(f"Max length: {max_length}")
+            click.echo(f"Pre-pad: {pre_pad}")
+
+            for text_field, output_path in (
+                ("post", dataset_post),
+                ("post_masked", dataset_masked),
+            ):
+                if output_path.exists():
+                    click.echo(f"Skipping {text_field}: exists at {output_path}")
+                    continue
+                click.echo(f"\nTokenizing '{text_field}' -> {output_path}")
+                stats = preprocess_dataset(
+                    input_path=clean_dataset_path,
+                    output_path=output_path,
+                    model_name=model_name,
+                    max_length=max_length,
+                    text_field=text_field,
+                    num_workers=None,
+                    pre_pad=pre_pad,
+                )
+                click.echo(
+                    "Tokenization complete: "
+                    f"{stats['num_rows']} rows in {stats['elapsed_seconds']:.1f}s "
+                    f"(pre_pad={stats['pre_pad']})"
+                )
+
+            click.echo(f"{'=' * 80}\n")
+        
+        # Set dataset paths if they exist, otherwise pass None
+        dataset_post_arg = dataset_post if dataset_post.exists() else None
+        dataset_masked_arg = dataset_masked if dataset_masked.exists() else None
+        
         # Run Phase D
         phase_d_results = run_phase_d_training(
             dataset_path=clean_dataset_path,
+            dataset_path_post=dataset_post_arg,
+            dataset_path_masked=dataset_masked_arg,
             output_dir=phase_d_dir,
             artifacts_dir=phase_a_dir,
             mode=mode,
@@ -1267,19 +1321,17 @@ def run_full_pipeline(
             chg_cfg = verify_cfg.get("chg", {})
             svs_cfg = verify_cfg.get("svs", {})
 
-            dataset_post, dataset_masked = _derive_tokenized_paths(clean_dataset_path)
-            if not dataset_post.exists():
-                dataset_post = None
-            if not dataset_masked.exists():
-                dataset_masked = None
+            # Use tokenized datasets from Phase D (already preprocessed if needed)
+            verify_dataset_post = dataset_post_arg
+            verify_dataset_masked = dataset_masked_arg
 
             verify_output_dir = phase_d_dir / "chg"
             verify_output_dir.mkdir(parents=True, exist_ok=True)
 
             run_verification(
                 dataset_path=clean_dataset_path,
-                dataset_path_post=dataset_post,
-                dataset_path_masked=dataset_masked,
+                dataset_path_post=verify_dataset_post,
+                dataset_path_masked=verify_dataset_masked,
                 artifacts_dir=phase_a_dir,
                 phase_d_dir=phase_d_dir,
                 output_dir=verify_output_dir,
@@ -1328,6 +1380,8 @@ def run_full_pipeline(
                 phase_d_dir=phase_d_dir,
                 output_dir=report_dir,
                 dataset_path=clean_dataset_path,
+                baseline_subdir="baseline",
+                constrained_subdir="constrained",
                 chg_subdir="chg",
                 use_only=use_only_list,
             )

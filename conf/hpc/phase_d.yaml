@@ -7,7 +7,7 @@
 # HPC training overrides
 training:
   num_epochs: 300
-  batch_size: 64  # Base batch (dynamic batching uses token budget instead)
+  batch_size: 128  # Base batch (dynamic batching uses token budget instead)
   learning_rate: 3e-5
   layerwise_lr_decay: 0.9
   gradient_accumulation_steps: 2
@@ -46,7 +46,7 @@ optimization:
   # torch.compile with CUDA Graph capture
   use_torch_compile: true
   torch_compile_mode: "reduce-overhead"
-  torch_compile_dynamic: false
+  torch_compile_dynamic: true
   torch_compile_backend: "inductor"
   compile_train_step: true
   # IMPORTANT: Set to true to avoid "tensor output of CUDAGraphs overwritten" errors
@@ -69,18 +69,18 @@ optimization:
   # Conservative token budget - autotuning will scale up if headroom exists
   # Start lower to avoid OOM cascade during warmup
   # Reduced conservative token budget to avoid large single allocations
-  # Original 32768 produced very large intermediate buffers; lower to 8192.
-  token_budget: 8192  # safer default for large models
+  # Further reduced from 8192 to 4096 to prevent aggressive epoch-to-epoch scaling
+  token_budget: 4096  # safer default for large models
 
 # HPC execution overrides
 execution:
   autotuning:
     enabled: true  # Let runtime find optimal budget
     warmup_batches: 10
-    initial_token_budget: 32768  # Start conservative, scale up if headroom
-    min_token_budget: 4096
-    max_token_budget: 262144       # Tuned for ~24-32GB VRAM usage (Safety cap)
-    memory_headroom_mb: 4096       # Larger headroom for 5090 burst allocations
+    initial_token_budget: 8192  # Conservative start (down from 8192)
+    min_token_budget: 1024
+    max_token_budget: 393216     # Reduced safety cap (down from 262144)
+    memory_headroom_mb: 4096    # Larger headroom for 5090 burst allocations
     scale_up_factor: 1.25
     scale_down_factor: 0.85
     oom_slash_factor: 0.5
@@ -93,7 +93,7 @@ execution:
     # NO artificial cap - token budget controls batch size
     # Added conservative caps to avoid runaway batch sizes causing OOM
     max_batch_size: 1024
-    min_batch_size: 16
+    min_batch_size: 64
     drop_last: false
     shuffle: true
     seed: 42
@@ -107,10 +107,10 @@ execution:
   # DataLoader tuning optimized for RTX 5090 / A100 / H100
   # GPU is so fast it can starve without aggressive prefetching
   data_loader:
-    num_workers: 16  # Increased parallelism - RTX 5090 needs more data throughput
+    num_workers: 24  # Increased parallelism - RTX 5090 needs more data throughput
     pin_memory: true  # Required for async H2D transfers
     persistent_workers: true  # Avoid worker respawn overhead (critical for throughput)
-    prefetch_factor: 8  # Aggressive prefetching to prevent GPU starvation
+    prefetch_factor: 16  # Aggressive prefetching to prevent GPU starvation
     
   # OOM recovery configuration
   oom_recovery:
