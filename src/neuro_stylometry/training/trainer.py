@@ -730,11 +730,17 @@ class PhaseDTrainer:
         
         # Track whether batch count is approximate (dynamic batching can change it)
         batch_sampler = getattr(loader, "batch_sampler", None)
+        # Consider dynamic batching enabled only when the sampler provides a
+        # budget_provider OR when the runtime controller is present AND
+        # dynamic batching was explicitly enabled in config. Previously the
+        # mere presence of a RuntimeController forced dynamic-batching
+        # behavior even when dynamic batching was disabled.
         is_dynamic_batching = (
-            batch_sampler is not None 
+            (batch_sampler is not None
             and hasattr(batch_sampler, "budget_provider")
-            and callable(getattr(batch_sampler, "budget_provider", None))
-        ) or self._runtime_controller is not None
+            and callable(getattr(batch_sampler, "budget_provider", None)))
+            or (self._runtime_controller is not None and self._dynamic_batching_enabled)
+        )
         
         if steps_per_epoch is not None:
             total_batch_steps = (
@@ -838,14 +844,16 @@ class PhaseDTrainer:
             
             # Progress bar for batches within epoch - single persistent bar
             # Explicitly pass total to avoid tqdm guessing wrong on wrapped iterators
+            # Use dynamic_ncols so the progress bar can report rates and fit
+            # terminal widths. Keep `total=None` for true dynamic batching.
             batch_pbar = tqdm(
                 train_iterator,
                 desc=f"Epoch {epoch + 1}/{num_epochs}",
                 total=epoch_total,  # None for dynamic batching, fixed otherwise
                 unit="batch",
-                leave=True,  # Keep bar visible after epoch completes
-                ncols=100,  # Fixed width for consistency
-                dynamic_ncols=False,  # Prevent resize issues
+                leave=True,
+                ncols=None,
+                dynamic_ncols=True,
             )
             
             for batch in batch_pbar:
