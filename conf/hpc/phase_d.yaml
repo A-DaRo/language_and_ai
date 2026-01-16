@@ -89,7 +89,7 @@ execution:
     recovery_patience: 5
     
   dynamic_batching:
-    enabled: true
+    enabled: false
     # NO artificial cap - token budget controls batch size
     # Added conservative caps to avoid runaway batch sizes causing OOM
     max_batch_size: 1024

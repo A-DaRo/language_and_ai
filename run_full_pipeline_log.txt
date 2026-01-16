@@ -1,0 +1,82 @@
+Epoch 2/300:   0%|                                                       | 0/540 [00:02<?, ?batch/s]
+2026-01-16 00:39:49,499 - __main__ - ERROR - Full pipeline execution failed: CUDA OOM after 4 attempts. Final budget: 1954
+Traceback (most recent call last):
+  File "/workspace/language_and_ai/src/neuro_stylometry/hardware_ops/oom_guard.py", line 184, in execute_with_oom_protection
+    return func()
+           ^^^^^^
+  File "/workspace/language_and_ai/src/neuro_stylometry/training/trainer.py", line 966, in run_step
+    outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/venv/main/lib/python3.12/site-packages/torch/_dynamo/eval_frame.py", line 414, in __call__
+    return super().__call__(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/venv/main/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/venv/main/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/venv/main/lib/python3.12/site-packages/torch/_dynamo/eval_frame.py", line 832, in compile_wrapper
+    return fn(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^
+  File "/venv/main/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/venv/main/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/language_and_ai/src/neuro_stylometry/stylometry_net/transformer.py", line 121, in forward
+    def forward(
+  File "/venv/main/lib/python3.12/site-packages/torch/_dynamo/eval_frame.py", line 1044, in _fn
+    return fn(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^
+  File "/venv/main/lib/python3.12/site-packages/torch/_functorch/aot_autograd.py", line 1130, in forward
+    return compiled_fn(full_args)
+           ^^^^^^^^^^^^^^^^^^^^^^
+  File "/venv/main/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 339, in runtime_wrapper
+    all_outs = call_func_at_runtime_with_args(
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/venv/main/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/utils.py", line 129, in call_func_at_runtime_with_args
+    out = normalize_as_list(f(args))
+                            ^^^^^^^
+  File "/venv/main/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/utils.py", line 103, in g
+    return f(*args)
+           ^^^^^^^^
+  File "/venv/main/lib/python3.12/site-packages/torch/autograd/function.py", line 581, in apply
+    return super().apply(*args, **kwargs)  # type: ignore[misc]
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/venv/main/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 2118, in forward
+    fw_outs = call_func_at_runtime_with_args(
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/venv/main/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/utils.py", line 129, in call_func_at_runtime_with_args
+    out = normalize_as_list(f(args))
+                            ^^^^^^^
+  File "/venv/main/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 526, in wrapper
+    return compiled_fn(runtime_args)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/venv/main/lib/python3.12/site-packages/torch/_inductor/output_code.py", line 613, in __call__
+    return self.current_callable(inputs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/venv/main/lib/python3.12/site-packages/torch/_inductor/utils.py", line 3017, in run
+    out = model(new_inputs)
+          ^^^^^^^^^^^^^^^^^
+  File "/tmp/torchinductor_root/4h/c4hclgg47kjrwapukozqfh5yprqdfpwynkwvf7gmdkhojbggal7o.py", line 1861, in call
+    buf355 = empty_strided_cuda((512*s43, 1024), (1024, 1), torch.float32)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 122.00 MiB. GPU 0 has a total capacity of 31.36 GiB of which 91.00 MiB is free. Including non-PyTorch memory, this process has 31.26 GiB memory in use. Of the allocated memory 30.53 GiB is allocated by PyTorch, and 73.01 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/workspace/language_and_ai/src/neuro_stylometry/__main__.py", line 1279, in run_full_pipeline
+    phase_d_results = run_phase_d_training(
+                      ^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/language_and_ai/src/neuro_stylometry/phase_d_pipeline.py", line 219, in run_phase_d_training
+    baseline_trainer._train(
+  File "/workspace/language_and_ai/src/neuro_stylometry/training/trainer.py", line 1021, in _train
+    result = execute_with_oom_protection(
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/language_and_ai/src/neuro_stylometry/hardware_ops/oom_guard.py", line 231, in execute_with_oom_protection
+    raise OOMRecoveryError(
+neuro_stylometry.hardware_ops.oom_guard.OOMRecoveryError: CUDA OOM after 4 attempts. Final budget: 1954
+Error: CUDA OOM after 4 attempts. Final budget: 1954
