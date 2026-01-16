@@ -1,0 +1,231 @@
+# conf/base/pipeline.yaml - Base configuration (shared across all environments)
+
+seed: 42
+
+gliner:
+  model: "urchade/gliner_multi-v2.1"
+  confidence_threshold: 0.60
+  batch_size: 32
+  device: "auto"  # "auto" | "cpu" | "cuda" (explicit authority)
+  taxonomy_path: "conf/base/gliner_taxonomy.yaml"
+  compute_explicit_recall: false
+  explicit_recall_threshold: 0.80
+  
+  # ---------------------------------------------------------------------------
+  # Bi-Encoder Enforcement & Word-Limit Settings
+  # ---------------------------------------------------------------------------
+  # Bi-encoder models support label embedding caching (encode_labels API).
+  # Set require_bi_encoder: true to enforce bi-encoder architecture at load time.
+  # If true and model lacks labels_encoder config, initialization fails.
+  #
+  # CRITICAL: GLiNER's internal processor truncates at max_words WORDS (not tokens).
+  # The chunker uses tokens for budgeting, but GLiNER counts whitespace-split words.
+  # gliner_max_words ensures chunks never exceed GLiNER's word limit.
+  # Formula: effective_budget = min(token_budget, gliner_max_words * tokens_per_word_ratio)
+  # ---------------------------------------------------------------------------
+  require_bi_encoder: false  # Set true to enforce bi-encoder model architecture
+  gliner_max_words: 315      # GLiNER processor word limit (matches model default)
+  tokens_per_word_ratio: 1.3 # Avg subword tokens per word (conservative estimate)
+  
+  # ---------------------------------------------------------------------------
+  # Batch Inference Optimization Settings (v2.0)
+  # ---------------------------------------------------------------------------
+  # These settings control the batched inference pipeline for improved throughput.
+  # Key optimization: Batch multiple chunks together instead of sequential inference.
+  #
+  # Throughput gains: 4-8x speedup with batching enabled on GPU.
+  # ---------------------------------------------------------------------------
+  batch_inference:
+    # Enable batched inference (recommended: true for production)
+    # Set false to use legacy sequential mode for debugging or exact backward compat
+    enable_batching: true
+    
+    # Number of length buckets for smart batching
+    # null = auto-compute from VRAM (recommended)
+    # Manual override: 5 (low VRAM) to 16 (high VRAM like A100)
+    # More buckets = less padding waste, but more batch dispatch overhead
+    num_buckets: null
+    
+    # Minimum samples per bucket before merging with adjacent bucket
+    min_bucket_size: 4
+    
+    # Enable prompt/label embedding caching for bi-encoder models
+    # Saves redundant encoding when processing multiple texts with same labels
+    enable_prompt_caching: true
+    
+    # Strict padding for CUDA graph optimization
+    # When true, pads all sequences to nearest bucket boundary (seq_len_buckets)
+    # instead of just max length in batch. Improves CUDA graph cache hit rate.
+    # Recommended: true for HPC (with CUDA graphs), false for laptop
+    strict_padding: false
+    
+    # Sequence length bucket boundaries for strict padding
+    # Should match cuda_graphs.seq_len_buckets if CUDA graphs are enabled
+    # null = use default [64, 128, 192, 256, 320, 384, 448, 512]
+    seq_len_buckets: null
+  
+  # Chunking strategy settings
+  chunking:
+    mode: "single_sentence"  # "single_sentence" | "accumulate"
+    # legacy_sequential_mode bypasses all batch optimizations (debug only)
+    legacy_sequential_mode: false
+    # Parallelize CPU-side chunking across documents (multiprocessing).
+    # Default off; enable on large workloads to reduce wall-clock time.
+    parallel_chunking_workers: 0
+    parallel_chunking_min_texts: 5000
+    # minimum cores to enable parallel chunking
+    parallel_chunking_min_cores: 16
+    # batch_size_per_worker: Documents per worker batch (0 = auto)
+    # Higher values reduce IPC overhead but increase per-worker memory
+    batch_size_per_worker: 0
+
+encoder:
+  model: "intfloat/multilingual-e5-large"
+  max_length: 512
+  batch_size: 32
+  device: "auto"  # "auto" | "cpu" | "cuda"
+  # output_device: Device to move embeddings to after extraction.
+  # null = keep on model device (recommended for HPC).
+  # "cpu" = move to CPU after extraction (recommended for laptop VRAM management).
+  output_device: null
+
+paths:
+  raw_data: "${oc.env:SOBR_DATA_PATH,./datasets}"
+  output: "./artifacts"
+
+dataloader:
+  batch_size: 32
+  num_workers: 4
+  persistent_workers: false
+  prefetch_factor: 2
+  pin_memory: true
+
+# ---------------------------------------------------------------------------
+# Advanced Execution Optimizations
+# ---------------------------------------------------------------------------
+# These settings control low-level inference optimizations for maximum throughput.
+# Most are disabled by default for compatibility; enable based on hardware.
+# ---------------------------------------------------------------------------
+execution:
+  # CUDA Graph capture for static-shape inference (reduces kernel launch overhead)
+  # Enable on GPU with consistent batch sizes; requires PyTorch with CUDA support
+  enable_cuda_graphs: false
+  cuda_graph_warmup: 3           # Warmup iterations before graph capture
+  cuda_graph_cache_size: 16      # Max cached graphs (LRU eviction)
+  
+  # torch.compile for kernel fusion (PyTorch 2.0+)
+  # "reduce-overhead" mode recommended for small batch sizes
+  enable_torch_compile: false
+  torch_compile_mode: "reduce-overhead"  # "default" | "reduce-overhead" | "max-autotune"
+  torch_compile_fullgraph: false
+  torch_compile_dynamic: false
+  torch_compile_backend: "inductor"
+  
+  # Sequence packing: concatenate sentences with block-diagonal attention
+  # Eliminates padding waste by packing multiple short sentences together
+  sequence_packing:
+    enabled: false
+    max_packed_length: 2048      # Max total tokens in packed sequence
+    min_sequences_to_pack: 2     # Minimum sequences before packing activates
+    use_block_diagonal_mask: true
+    pack_by_similarity: true     # Group similar-length sequences
+  
+  # Asynchronous prefetching: decouple CPU chunking from GPU inference
+  # Uses producer-consumer pattern with multiprocessing.Queue
+  async_prefetch:
+    enabled: false
+    queue_size: 4                # Items in prefetch queue
+    num_workers: 1               # Prefetch worker processes
+    timeout_seconds: 30.0
+    prefetch_factor: 2
+    use_multiprocessing: true    # false = use threading (lighter)
+    pin_memory: true
+    profile_aware: true          # Adjust settings based on ProfileType
+  
+  # GPU-accelerated span filtering (threshold on device before CPU transfer)
+  gpu_span_filter:
+    enabled: true
+    max_spans_per_sequence: 100
+    use_topk: false
+    topk_k: 50
+  
+  # NUMA pinning for multi-socket systems
+  numa_pinning: false
+
+precision:
+  dtype: "float32"
+  use_grad_scaler: false
+
+probe:
+  compute_amnesic_drop: true
+  amnesic_drop_threshold: 0.30
+  train_split: 0.8
+  max_samples: 20000
+  # Backend selection: "auto" | "sklearn" | "cuml" | "torch"
+  # "auto" detects GPU and uses cuml > torch > sklearn
+  backend: "auto"
+  # K-fold cross-validation settings
+  use_kfold: true
+  n_folds: 5
+  # Statistical significance threshold for paired t-test
+  pvalue_threshold: 0.05
+  # Torch backend hyperparameters (used when backend="torch" or auto-selected)
+  torch_lr: 0.01
+  torch_epochs: 100
+  torch_batch_size: 256
+  torch_weight_decay: 0.0001
+  # Class imbalance handling
+  use_class_weights: true
+  # Benchmark exact vs approximate solvers (for validation)
+  benchmark_solvers: false
+
+leace:
+  force_cpu: false
+  regularization: 1e-5
+  batch_size: 100
+  # device: Device for LEACE accumulation and computation.
+  # null = fallback to encoder.device.
+  # "cuda" = GPU LEACE (HPC), "cpu" = CPU LEACE (laptop/VRAM-limited).
+  device: null
+  # compute_dtype: Precision for LEACE matrix math.
+  # "float64" (default): Numerical stability for Cholesky/SVD.
+  # "float32": Faster on GPU but may have reduced precision.
+  compute_dtype: "float64"
+
+quality:
+  enforce_thresholds: false
+
+subset:
+  enabled: false
+  size: null
+
+# ---------------------------------------------------------------------------
+# Phase A Visualization Settings
+# ---------------------------------------------------------------------------
+# Controls report and plot generation after Phase A completes.
+# Visualizations are generated inline after artifacts are saved (minimal overhead).
+# ---------------------------------------------------------------------------
+visualization:
+  enabled: true                    # Set false to skip visualization generation
+  pca_max_samples: 1000            # Max samples for PCA scatter plots (memory bound)
+  embedding_batch_size: 32         # Batch size for computing embeddings for viz
+  figure_dpi: 150                  # DPI for saved PNG figures
+  figure_format: "png"             # Output format: "png" | "pdf" | "svg"
+  color_palette: "husl"            # Seaborn color palette for demographic plots
+  
+  # Per-plot toggles (all enabled by default)
+  plots:
+    pca_before_after: true         # PCA scatter colored by demographic
+    singular_values: true          # Projection matrix SVD spectrum
+    embedding_norms: true          # Histogram of embedding norms
+    amnesic_drop_bars: true        # Bar chart of probe accuracy drop
+    gliner_confidence: true        # GLiNER confidence distribution
+    detection_counts: true         # Detection count by entity type
+    explicit_recall_bars: true     # Per-column recall bar chart
+    entity_cooccurrence: true      # Entity co-occurrence heatmap
+    demographic_scores: true       # Demographic score scatter matrix
+    masking_coverage: true         # Masking coverage statistics
+
+logging:
+  level: "INFO"
+  wandb_enabled: false

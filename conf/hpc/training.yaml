@@ -1,0 +1,17 @@
+# conf/hpc/training.yaml - HPC training configuration
+
+defaults:
+  - /base/training
+
+training:
+  num_epochs: 100
+  gradient_accumulation_steps: 1
+
+optimizer:
+  lr: 5e-5
+
+dataloader:
+  batch_size: 256
+
+precision:
+  dtype: "bfloat16"

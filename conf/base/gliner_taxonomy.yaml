@@ -1,0 +1,312 @@
+# GLiNER Taxonomy Configuration - Column-Driven Schema
+#
+# Maps SOBR Arrow columns to GLiNER prompts, distractors, masks, and validation patterns.
+# All prompt/distractor selection is driven by per-row column presence (non-null values).
+#
+# SOBR demographic columns (from schemas.py):
+#   birth_year, female, nationality, political_leaning,
+#   extrovert, sensing, feeling, judging
+#
+# Reference: SOBR paper extraction methodology (Emmery et al., LREC-COLING 2024)
+
+taxonomy:
+  # -------------------------------------------------------------------------
+  # Column-to-Prompts Mapping
+  # Each key is a SOBR Arrow column name from get_demographic_columns()
+  # -------------------------------------------------------------------------
+  column_prompts:
+    # -----------------------------------------------------------------------
+    # birth_year: Extracted from (GAA) patterns like "(F34)", "(32M)"
+    # SOBR paper: "age and gender were obtained via posts self-reporting
+    # age and gender information in the format (GAA)"
+    # -----------------------------------------------------------------------
+    birth_year:
+      prompts:
+        - "age statement"
+        - "self-identified age"
+        - "birth year statement"
+        - "born in year"
+      distractors:
+        - "third-person age mention"
+        - "historical age reference"
+      mask_token: "[MASK:AGE]"
+      width: 6
+      reference_patterns:
+        # SOBR (GAA) format: (F34), (M25), (34F), (25M), 34F, M25, etc.
+        - "\\([MFmf]\\d{1,2}\\)"
+        - "\\(\\d{1,2}[MFmf]\\)"
+        - "\\b\\d{1,2}[MFmf]\\b"
+        - "\\b[MFmf]\\d{1,2}\\b"
+        # Prose patterns
+        - "(?i)\\bI\\s*(?:am|'m)\\s*\\d{1,2}\\b"
+        - "(?i)\\b(?:born\\s+in|born\\s+around)\\s*\\d{4}\\b"
+        - "(?i)\\bI\\s+was\\s+born\\s+in\\s+\\d{4}\\b"
+
+    # -----------------------------------------------------------------------
+    # female: Extracted from (GAA) patterns - gender component
+    # SOBR paper: "authors reporting gender F or f were labeled as female,
+    # while users reporting M or m were considered male"
+    # -----------------------------------------------------------------------
+    female:
+      prompts:
+        - "gender self-identification"
+        - "self-identified gender"
+      distractors:
+        - "third-person gender mention"
+        - "gender of another person"
+      mask_token: "[MASK:GENDER]"
+      width: 4
+      reference_patterns:
+        # SOBR (GAA) format - gender markers
+        - "\\([MFmf]\\d{1,2}\\)"
+        - "\\(\\d{1,2}[MFmf]\\)"
+        - "\\b\\d{1,2}[MFmf]\\b"
+        - "\\b[MFmf]\\d{1,2}\\b"
+        # Prose patterns
+        - "(?i)\\bI\\s*(?:am|'m)\\s*(?:a\\s+)?(?:man|woman|male|female|guy|girl)\\b"
+        - "(?i)\\bas\\s+a\\s+(?:man|woman|male|female|guy|girl)\\b"
+
+    # -----------------------------------------------------------------------
+    # nationality: Extracted from flairs on European subreddits
+    # SOBR paper: "Nationality labels were extracted through user flairs
+    # from r/Europe, r/AskEurope, r/Eurosceptics, etc."
+    # -----------------------------------------------------------------------
+    nationality:
+      # ----------------------------------------------------------------
+      # PRIMARY PROMPTS: Entity-Centric Span Descriptions
+      # ----------------------------------------------------------------
+      # DESIGN PRINCIPLE: Describe what the span IS, not what it DOES.
+      # GLiNER's architecture requires prompts that match the semantic
+      # content of the target span (e.g., "Mexican", "from Ireland").
+      #
+      # BAD (task-oriented): "nationality statement", "user origin"  
+      # GOOD (entity-centric): "the author's country of origin"
+      # ----------------------------------------------------------------
+      prompts:
+        # Core identity prompts - describe possessive relationship
+        - "the author's country of origin"
+        - "the speaker's nationality"  
+        - "the user's home country"
+        
+        # Demonym-focused prompts - capture "I'm Chilean" patterns
+        # GLiNER paper (Table 5) shows 50% negative sampling optimal
+        - "a demonym describing the author"
+        - "the writer's ethnic or national identity"
+        
+        # Contextual residence prompts - for "I live in..." patterns
+        - "the country where the author lives"
+        - "the nation the user identifies with"
+
+      # ----------------------------------------------------------------
+      # COMPETING DISTRACTORS: Semantic Negative Classes
+      # ----------------------------------------------------------------
+      # RATIONALE: GLiNER calculates similarity scores for ALL labels.
+      # By providing semantically similar "wrong" labels, we force the
+      # model to distinguish self-identification from country mentions.
+      #
+      # Training shows negative entities improve precision (Table 5).
+      # 50% negative:positive ratio = optimal F1 (60.9 vs 53.3).
+      # ----------------------------------------------------------------
+      distractors:
+        # Political/news context absorbers
+        - "a country mentioned in news or politics"
+        - "a nation involved in the discussed event"
+        - "a foreign government being referenced"
+        
+        # Linguistic false-positive absorbers  
+        - "a language being discussed"
+        - "an unrelated geographical location"
+        
+        # Comparative context absorbers ("unlike France...")
+        - "a country used for comparison"
+
+      # ----------------------------------------------------------------
+      # SPAN CONFIGURATION
+      # ----------------------------------------------------------------
+      # width: GLiNER default max_span_width=12 (Hyperparams Table 7)
+      # Rationale: Handles compounds like "Japanese-American citizen"
+      # and phrases like "citizen of South Korea"
+      # ----------------------------------------------------------------
+      width: 20
+      
+      mask_token: "[MASK:NATIONALITY]"
+
+      # ----------------------------------------------------------------
+      # MULTILINGUAL REGEX PATTERNS: Heuristic Bootstrapping
+      # ----------------------------------------------------------------
+      # PURPOSE: Pre-filter obvious cases + provide weak supervision
+      # SOBR shows multilingual data (Section 2.1): ES, PT, DE, NL, RU
+      # 
+      # DESIGN NOTES:
+      # - [A-ZÀ-ÿ] captures accented capitals (Panamá, Brasília, etc.)
+      # - [\w-]+ captures hyphens (Japanese-American, Franco-German)
+      # - Non-capturing groups (?:...) for efficiency
+      # - Word boundaries \b prevent partial matches
+      # ----------------------------------------------------------------
+      reference_patterns:
+        # ==================== ENGLISH PATTERNS ====================
+        
+        # Pattern: "I'm from Mexico", "I am Chilean", "I'm a Japanese-American"
+        # Rationale: Most common self-ID in SOBR (Emmery et al. 2017)
+        # Captures: nationality demonym OR country name
+        - "(?i)\\bI(?:'m|\\s+am)\\s+(?:from\\s+)?(?:a|an)?\\s*([A-Z][\\w-]+(?:\\s+[A-Z][\\w-]+)?)\\b"
+        
+        # Pattern: "As a Canadian...", "Speaking as a German..."
+        # Rationale: Contextual self-identification (high precision)
+        - '(?i)\b(?:As|Speaking\s+as)\s+(?:a|an)\s+([A-Z][\w-]+)\b'
+        
+        # Pattern: "I'm Italian", "I am Dutch"
+        # Rationale: Direct demonym without "from"
+        - "(?i)\\bI(?:'m|\\s+am)\\s+([A-Z][\\w-]+)\\b"
+        
+        # Pattern: "My country (Germany)", "my country - Ireland"
+        # Rationale: Explicit possessive alignment
+        - '(?i)\b[Mm]y\s+country\s*[\(\-,]\s*([A-Z][\w\s]+?)[\)\-,]'
+
+        # ==================== SPANISH PATTERNS ====================
+        
+        # Pattern: "Soy de Granada", "Soy Argentino"
+        # Rationale: Primary Spanish self-ID (SOBR Section 2.1)
+        # Note: Granada is a city, but in context usually means nationality
+        - '(?i)\bSoy\s+(?:de\s+)?([A-ZÀ-ÿ][\w-]+)\b'
+        
+        # Pattern: "Vivo en México", "Vivo en Chile"  
+        # Rationale: Residence → nationality proxy (SOBR assumption)
+        - '(?i)\bVivo\s+en\s+([A-ZÀ-ÿ][\w\s-]+)\b'
+        
+        # Pattern: "Soy mexicano", "Soy española"
+        # Rationale: Demonym form (lowercase handled by (?i))
+        - '(?i)\bSoy\s+(?:un|una)?\s*([A-ZÀ-ÿ][\w-]+o|[A-ZÀ-ÿ][\w-]+a)\b'
+
+        # ==================== PORTUGUESE PATTERNS ====================
+        
+        # Pattern: "Sou Brasileiro", "Sou de Portugal"
+        # Rationale: Portuguese equivalent of Spanish "Soy"
+        # Captures both demonym and "de [country]" forms
+        - '(?i)\bSou\s+(?:de\s+)?([A-ZÀ-ÿ][\w-]+)\b'
+        
+        # Pattern: "Moro no Brasil", "Moro na Argentina"  
+        # Rationale: "I live in..." - residence proxy
+        # Note: "no" (masc), "na" (fem), "nos/nas" (plural)
+        - '(?i)\bMoro\s+n[oa]s?\s+([A-ZÀ-ÿ][\w\s-]+)\b'
+        
+        # Pattern: "Vou sair do Brasil" → contextual origin
+        # Rationale: Leaving implies current location/origin
+        - '(?i)\b(?:Vou\s+)?sair\s+d[oa]\s+([A-ZÀ-ÿ][\w-]+)\b'
+
+        # ==================== GERMAN PATTERNS ====================
+        
+        # Pattern: "Ich bin Deutscher", "Ich komme aus Österreich"
+        # Rationale: Standard German self-ID structures  
+        # "bin" (am) + demonym, "komme aus" (come from) + country
+        - '(?i)\bIch\s+(?:bin|komme\s+aus)\s+(?:ein|eine|einer)?\s*([A-ZÀ-ÿ][\w-]+)\b'
+        
+        # Pattern: "Ich bin aus Deutschland"
+        # Rationale: Alternative "from" construction
+        - '(?i)\bIch\s+bin\s+aus\s+([A-ZÀ-ÿ][\w\s-]+)\b'
+
+        # ==================== DUTCH PATTERNS ====================
+        
+        # Pattern: "Ik ben Nederlands", "Ik kom uit België"  
+        # Rationale: Dutch parallel to German structures
+        # "ben" (am), "kom uit" (come from)
+        - '(?i)\bIk\s+(?:ben|kom\s+uit)\s+([A-Z][\w-]+)\b'
+
+        # ==================== CROSS-LINGUAL PATTERNS ====================
+        
+        # Pattern: Hyphenated dual identities
+        # Rationale: "Italian-American", "Franco-German" (width=12 handles these)
+        # Requires capital start to avoid false positives
+        - '\b([A-Z][\w]+-[A-Z][\w]+)\b'
+        
+        # Pattern: "citizen of [Country]", "national of [Country]"
+        # Rationale: Formal self-identification (multilingual contexts)
+        - '(?i)\b(?:citizen|national)\s+of\s+([A-Z][\w\s-]+)\b'
+
+    # -----------------------------------------------------------------------
+    # political_leaning: Extracted from r/PoliticalCompass flairs
+    # SOBR paper: "self-reports from the Political Compass in flairs...
+    # Test results are often reported in the form of: [social]-[economic]
+    # e.g., auth-left. We only considered the economic scale."
+    # -----------------------------------------------------------------------
+    political_leaning:
+      prompts:
+        - "political affiliation"
+        - "self-identified political leaning"
+        - "political ideology"
+      distractors:
+        - "third-person political mention"
+        - "political party mentioned"
+        - "politician name"
+      mask_token: "[MASK:POLITICAL]"
+      width: 6
+      reference_patterns:
+        # Political Compass format from SOBR
+        - "(?i)\\b(?:auth|lib)[-\\s]?(?:left|right|center|centre)\\b"
+        - "(?i)\\b(?:left|right|center|centre)[-\\s]?(?:auth|lib)\\b"
+        # Standalone political positions
+        - "(?i)\\bI\\s*(?:am|'m)\\s*(?:a\\s+)?(?:liberal|conservative|libertarian|socialist|communist|anarchist|centrist|moderate|progressive|leftist|right-wing|left-wing)\\b"
+        - "(?i)\\bI\\s+(?:lean|vote)\\s+(?:left|right|liberal|conservative|democrat|republican)\\b"
+
+    # -----------------------------------------------------------------------
+    # MBTI Personality Dimensions (extrovert, sensing, feeling, judging)
+    # SOBR paper: "Personality labels were assigned through flairs for
+    # Myers-Briggs Type Indicators on MBTI-related subreddits...
+    # split into four dimensions"
+    # -----------------------------------------------------------------------
+    extrovert:
+      prompts:
+        - "MBTI type"
+        - "personality type identifier"
+        - "self-identified personality type"
+      distractors:
+        - "third-person personality mention"
+        - "personality of fictional character"
+      mask_token: "[MASK:MBTI]"
+      width: 6
+      reference_patterns:
+        # Full 16 MBTI types (E/I is first letter)
+        - "(?i)\\b(?:INTJ|INTP|ENTJ|ENTP|INFJ|INFP|ENFJ|ENFP|ISTJ|ISFJ|ESTJ|ESFJ|ISTP|ISFP|ESTP|ESFP)\\b"
+        - "(?i)\\bI\\s*(?:am|'m)\\s*(?:an?\\s+)?(?:introvert|extrovert|extravert)\\b"
+
+    sensing:
+      prompts:
+        - "MBTI type"
+        - "personality type identifier"
+        - "cognitive function preference"
+      distractors:
+        - "third-person personality mention"
+        - "personality of fictional character"
+      mask_token: "[MASK:MBTI]"
+      width: 6
+      reference_patterns:
+        # Full 16 MBTI types (S/N is second letter)
+        - "(?i)\\b(?:INTJ|INTP|ENTJ|ENTP|INFJ|INFP|ENFJ|ENFP|ISTJ|ISFJ|ESTJ|ESFJ|ISTP|ISFP|ESTP|ESFP)\\b"
+
+    feeling:
+      prompts:
+        - "MBTI type"
+        - "personality type identifier"
+        - "cognitive function preference"
+      distractors:
+        - "third-person personality mention"
+        - "personality of fictional character"
+      mask_token: "[MASK:MBTI]"
+      width: 6
+      reference_patterns:
+        # Full 16 MBTI types (T/F is third letter)
+        - "(?i)\\b(?:INTJ|INTP|ENTJ|ENTP|INFJ|INFP|ENFJ|ENFP|ISTJ|ISFJ|ESTJ|ESFJ|ISTP|ISFP|ESTP|ESFP)\\b"
+
+    judging:
+      prompts:
+        - "MBTI type"
+        - "personality type identifier"
+        - "cognitive function preference"
+      distractors:
+        - "third-person personality mention"
+        - "personality of fictional character"
+      mask_token: "[MASK:MBTI]"
+      width: 6
+      reference_patterns:
+        # Full 16 MBTI types (J/P is fourth letter)
+        - "(?i)\\b(?:INTJ|INTP|ENTJ|ENTP|INFJ|INFP|ENFJ|ENFP|ISTJ|ISFJ|ESTJ|ESFJ|ISTP|ISFP|ESTP|ESFP)\\b"

@@ -1,0 +1,185 @@
+# Phase D Training Configuration (Base)
+# ==============================================================================
+# AOT Pipeline Optimization Blueprint Implementation
+# Target: High-throughput training (100+ it/s on RTX 5090)
+# ==============================================================================
+
+phase_d:
+  experiment_name: "phase_d_baseline"
+  seed: 1337
+
+# Model configuration
+model:
+  name: "intfloat/multilingual-e5-large"
+  max_length: 512
+  taxonomy_path: "conf/base/gliner_taxonomy.yaml"
+
+# Data configuration
+data:
+  # Dataset paths (override via CLI)
+  dataset_path: "artifacts/phase_d/tokenized_dataset.arrow"  # Pre-tokenized AOT data
+  fallback_path: "artifacts/phase_a/clean_dataset.arrow"     # JIT fallback
+  artifacts_dir: "artifacts/phase_a"
+
+  # Split configuration
+  use_split_column: true  # Use existing 'split' column if present
+  split_ratios:
+    train: 0.8
+    val: 0.1
+    test: 0.1
+  split_seed: 42
+
+  # Demographic label fields (from SOBR schema)
+  label_fields:
+    - female
+    - birth_year
+    - nationality
+    - political_leaning
+    - extrovert
+    - sensing
+    - feeling
+    - judging
+
+# Training configuration
+training:
+  num_epochs: 3
+  batch_size: 8  # Base batch size (used when dynamic batching disabled)
+  learning_rate: 2e-5
+  layerwise_lr_decay: 0.95
+  gradient_accumulation_steps: 1
+  
+  # Precision: "fp32", "bf16", "fp8" (fp8 requires TransformerEngine)
+  precision: "bf16"
+  
+  early_stopping:
+    enabled: false
+    patience: 2
+    min_delta: 0.0
+    metric: "f1_macro"
+
+  # For testing/debugging
+  max_steps: null  # null means run full epochs
+
+  # Checkpointing
+  save_every_steps: null
+  save_every_epochs: 1  # Save after each epoch
+  resume_from: null
+
+  # Device
+  device: "auto"  # auto, cuda, cpu
+
+# Scheduler
+scheduler:
+  name: "linear"  # linear or cosine
+  num_warmup_steps: 0
+
+# Evaluation
+evaluation:
+  eval_on_val: true
+  eval_on_test: true
+  eval_every_epochs: 1
+  write_report: true
+
+# Output
+output:
+  save_model: true
+  save_logs: true
+  save_metrics: true
+  reports_dir: "artifacts/reports"
+
+# ==============================================================================
+# AOT Pipeline Optimization Settings
+# Reference: Phase D Final Optimization Blueprint
+# ==============================================================================
+
+optimization:
+  # AOT (Ahead-Of-Time) tokenization mode
+  # When true, uses pre-tokenized data from preprocess_tokens.py
+  use_aot_mode: true
+  
+  # torch.compile settings for CUDA Graph caching
+  use_torch_compile: true
+  torch_compile_mode: "reduce-overhead"  # Enables automatic CUDA Graph capture
+  torch_compile_dynamic: false
+  torch_compile_backend: "inductor"
+  compile_train_step: false
+  torch_compile_disable_cudagraphs: false
+
+  # Manual CUDA-graph training (forward + loss + backward capture)
+  # NOTE: Requires static bucket shapes and disables torch.compile.
+  use_cuda_graph_training: false
+  cuda_graph_training:
+    enabled: true
+    # Shape buckets for graph capture (pad to nearest bucket)
+    batch_buckets: [8, 16, 32, 64]
+    seq_len_buckets: [128, 256, 384, 512]
+    max_batch_size: 64
+    max_seq_len: 512
+    min_bucket_usage: 2
+    # Graph cache behavior
+    warmup_iterations: 0  # Avoid extra backward passes during graph capture
+    max_cached_graphs: 16
+    capture_pool_size_mb: 256
+    use_cuda_graph_memory_pool: true
+    clone_outputs: true
+    pad_token_id: 1
+    ignore_index: -1
+  
+  # Fused AdamW kernel (eliminates Python loop overhead)
+  use_fused_optimizer: true
+  
+  # Async H2D prefetching via DevicePrefetcher
+  use_device_prefetch: true
+  
+  # Quantized bucketing (Snap-to-Grid) for stable tensor shapes
+  # Step of 16 aligns with transformer attention blocks
+  quantize_step: 16
+  
+  # Token budget for quantized sampler (replaces max_batch_size)
+  # Higher = larger batches, better GPU utilization
+  token_budget: 65536  # ~128 samples @ 512 tokens
+
+# Hardware-aware execution
+execution:
+  autotuning:
+    enabled: false
+    warmup_batches: 10
+    initial_token_budget: 65536
+    min_token_budget: 8192
+    max_token_budget: 262144
+    memory_headroom_mb: 1024
+    scale_up_factor: 1.25
+    scale_down_factor: 0.85
+    oom_slash_factor: 0.5
+    stability_threshold: 0.1
+    history_window: 10
+    recovery_patience: 5
+    
+  # Token-budget batching: enables QuantizedBucketSampler (AOT) or PhaseDBudgetedBatchSampler (JIT)
+  # for length-aware batching that minimizes padding waste.
+  # REQUIRED when use_aot_mode=True (raises RuntimeError otherwise).
+  use_token_budget_batching: true
+  
+  # Adaptive token budget: enables RuntimeController for dynamic budget adjustment
+  # via PID-like feedback loop. Requires use_token_budget_batching=True.
+  use_adaptive_token_budget: false
+  
+  # Batch constraints for PhaseDBudgetedBatchSampler (JIT mode only)
+  # QuantizedBucketSampler uses token_budget from optimization config instead
+  batch_constraints:
+    max_batch_size: 2048  # High cap (no artificial starvation)
+    min_batch_size: 1
+    drop_last: false
+    shuffle: true
+    seed: 42
+    
+  telemetry:
+    enabled: false  # Disable by default to avoid sync overhead
+    # Strided sampling: measure every Nth batch to reduce overhead
+    stride: 50  # Measure every 50th batch
+    
+  data_loader:
+    num_workers: 4  # Parallel data loading
+    pin_memory: true  # For async H2D transfers
+    persistent_workers: true  # Keep workers alive between epochs
+    prefetch_factor: 2  # Batches to prefetch per worker
