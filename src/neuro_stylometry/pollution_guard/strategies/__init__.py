@@ -1,1 +1,0 @@
-"""Pollution filtering strategies."""
