@@ -565,43 +565,71 @@ The minimum is 3, achieved by the diagonal move (match).
 
 **Step 5: Backtrace to Recover Alignment**
 
-Starting at $D[9,9] = 8$, trace back to $D[0,0]$ by choosing the cell that contributed the minimum:
+The backtrace procedure reconstructs the optimal sequence of edit operations by tracing backwards from $D[n,m]$ to $D[0,0]$.
 
-| Position | Source | Target | Operation | Path Cell |
-|----------|--------|--------|-----------|-----------|
-| (9,9)→(8,8) | n | n | **Match** (cost 0) | diagonal |
-| (8,8)→(7,7) | o | o | **Match** (cost 0) | diagonal |
-| (7,7)→(6,6) | i | i | **Match** (cost 0) | diagonal |
-| (6,6)→(5,5) | t | t | **Match** (cost 0) | diagonal |
-| (5,5)→(4,4) | n | u | **Substitute** (cost 2) | diagonal |
-| (4,4)→(3,3) | e | e | **Match** (cost 0) | diagonal |
-| (3,3)→(2,2) | t | x | **Substitute** (cost 2) | diagonal |
-| (2,2)→(1,1) | n | e | **Substitute** (cost 2) | diagonal |
-| (1,1)→(0,0) | i | e | **Substitute** (cost 2) | diagonal |
+**General Backtrace Protocol**:
 
-**Total cost verification**: 4 matches (cost 0 each) + 5 substitutions? Let us recount.
+At each cell $D[i,j]$, determine which predecessor cell contributed the current value by checking the recurrence relation in reverse:
 
-Actually, a more careful backtrace reveals one optimal alignment:
+| **Current Cell Came From** | **Direction** | **Operation** | **Condition** |
+|----------------------------|---------------|---------------|---------------|
+| $D[i-1,j-1]$ | Diagonal (↖) | **Match** if $s_i = t_j$; **Substitute** otherwise | $D[i,j] = D[i-1,j-1] + \text{cost}$ |
+| $D[i-1,j]$ | Up (↑) | **Delete** $s_i$ from source | $D[i,j] = D[i-1,j] + 1$ |
+| $D[i,j-1]$ | Left (←) | **Insert** $t_j$ into source | $D[i,j] = D[i,j-1] + 1$ |
+
+When multiple predecessors yield the same minimum, multiple optimal alignments exist; choose any one.
+
+---
+
+**Backtrace for `intention` → `execution`**:
+
+Starting at $D[9,9] = 8$, we trace back by identifying which predecessor contributed each cell's value:
+
+| **Cell** | **Value** | **Source Char** | **Target Char** | **Predecessor Options** | **Chosen Path** | **Operation** |
+|----------|-----------|-----------------|-----------------|-------------------------|-----------------|---------------|
+| $(9,9)$ | 8 | `n` | `n` | ↖ $D[8,8]=8+0=8$ ✓ | Diagonal | **Match** |
+| $(8,8)$ | 8 | `o` | `o` | ↖ $D[7,7]=8+0=8$ ✓ | Diagonal | **Match** |
+| $(7,7)$ | 8 | `i` | `i` | ↖ $D[6,6]=8+0=8$ ✓ | Diagonal | **Match** |
+| $(6,6)$ | 8 | `t` | `t` | ↖ $D[5,5]=8+0=8$ ✓ | Diagonal | **Match** |
+| $(5,5)$ | 8 | `n` | `u` | ↖ $D[4,4]=6+2=8$ ✓ | Diagonal | **Substitute** `n`→`u` |
+| $(4,4)$ | 6 | `e` | `c` | ← $D[4,3]=5+1=6$ ✓ | Left | **Insert** `c` |
+| $(4,3)$ | 5 | `e` | `e` | ↖ $D[3,2]=5+0=5$ ✓ | Diagonal | **Match** |
+| $(3,2)$ | 5 | `t` | `x` | ↖ $D[2,1]=3+2=5$ ✓ | Diagonal | **Substitute** `t`→`x` |
+| $(2,1)$ | 3 | `n` | `e` | ↖ $D[1,0]=1+2=3$ ✓ | Diagonal | **Substitute** `n`→`e` |
+| $(1,0)$ | 1 | `i` | ε | ↑ $D[0,0]=0+1=1$ ✓ | Up | **Delete** `i` |
+| $(0,0)$ | 0 | — | — | — | **Done** | — |
+
+---
+
+**Reconstructed Operation Sequence** (reading the trace in reverse, from start to end):
+
+| **Step** | **Operation** | **Cost** | **Cumulative** |
+|----------|---------------|----------|----------------|
+| 1 | Delete `i` | 1 | 1 |
+| 2 | Substitute `n` → `e` | 2 | 3 |
+| 3 | Substitute `t` → `x` | 2 | 5 |
+| 4 | Match `e` = `e` | 0 | 5 |
+| 5 | Insert `c` | 1 | 6 |
+| 6 | Substitute `n` → `u` | 2 | 8 |
+| 7 | Match `t` = `t` | 0 | 8 |
+| 8 | Match `i` = `i` | 0 | 8 |
+| 9 | Match `o` = `o` | 0 | 8 |
+| 10 | Match `n` = `n` | 0 | 8 |
+
+---
+
+**Final Alignment Visualization**:
 
 ```
-Source: i n t e n t i o n
-        d   s s   s
-Target: e x e c u t i o n
+Source: i  n  t  e  -  n  t  i  o  n
+        D  S  S  M  I  S  M  M  M  M
+Target: -  e  x  e  c  u  t  i  o  n
 ```
 
-**Operations**:
-- Delete `i` (cost 1)
-- Substitute `n` → `x` (cost 2)
-- Substitute `t` → `e` (cost 2) — wait, this doesn't align with `execution`
+**Legend**: D = Delete, S = Substitute, M = Match, I = Insert
 
-**Alternative optimal alignment** (one of several):
-
-```
-Source: i n t e n - t i o n
-Target: - e x e c u t i o n
-```
-
-**Total**: 1 deletion + 1 insertion + 3 substitutions = $1 + 1 + 3(2) = 8$ ✓
+**Cost Verification**:
+$$\text{Total} = 1_{\text{del}} + 3 \times 2_{\text{sub}} + 1_{\text{ins}} + 5 \times 0_{\text{match}} = 1 + 6 + 1 + 0 = 8 \; \checkmark$$
 
 ---
 
@@ -1781,6 +1809,379 @@ The BIO encoding makes this unambiguous: B-PER marks each entity's start.
 **Final tagging**: Janet/NNP will/MD back/VB the/DT bill/NN
 
 **Interpretation**: The Viterbi algorithm resolves the ambiguity of "back" (which could be verb, adjective, adverb, or noun) by considering the context: "will back" strongly suggests verb usage because modals are almost always followed by verbs.
+
+---
+
+### Worked Example 5: Complete HMM Construction and Viterbi Decoding — "She can fish in rivers"
+
+This comprehensive example demonstrates the full pipeline: (1) estimating HMM parameters from a tagged training corpus, (2) constructing transition and emission probability matrices, and (3) applying the Viterbi algorithm to find the most probable POS tag sequence for a 5-word sentence with lexical ambiguity.
+
+---
+
+#### Part A: Training Corpus and Parameter Estimation
+
+**Given**: A small tagged training corpus (6 sentences):
+
+```
+She/PRP runs/VBZ fast/RB
+They/PRP can/MD swim/VB
+I/PRP fish/VB in/IN lakes/NNS
+The/DT can/NN is/VBZ empty/JJ
+Fish/NN swim/VB in/IN rivers/NNS
+She/PRP can/MD run/VB in/IN parks/NNS
+```
+
+**Target sentence to tag**: `"She can fish in rivers"`
+
+**Key Ambiguities**:
+- **"can"**: MD (modal verb, "She can swim") or NN (noun, "a can of beans")
+- **"fish"**: VB (verb, "I fish daily") or NN (noun, "the fish swims")
+
+**States (POS Tags)**: $Q = \{\text{PRP}, \text{VBZ}, \text{RB}, \text{MD}, \text{VB}, \text{IN}, \text{NNS}, \text{DT}, \text{NN}, \text{JJ}\}$
+
+---
+
+**Step A.1: Count Tag Unigrams**
+
+Count the total occurrences of each tag in the corpus:
+
+| Tag | Occurrences | Count |
+|-----|-------------|-------|
+| PRP | She, They, I, She | 4 |
+| VBZ | runs, is | 2 |
+| RB | fast | 1 |
+| MD | can, can | 2 |
+| VB | swim, fish, swim, run | 4 |
+| IN | in, in, in | 3 |
+| NNS | lakes, rivers, parks | 3 |
+| DT | The | 1 |
+| NN | can, Fish | 2 |
+| JJ | empty | 1 |
+
+**Total tags**: $N = 23$
+
+---
+
+**Step A.2: Count Tag Bigrams**
+
+Count transitions between consecutive tags (including start symbol $\langle s \rangle$):
+
+| Bigram | Occurrences | Count |
+|--------|-------------|-------|
+| $\langle s \rangle \to \text{PRP}$ | 4 sentences start with PRP | 4 |
+| $\langle s \rangle \to \text{DT}$ | 1 sentence starts with DT | 1 |
+| $\langle s \rangle \to \text{NN}$ | 1 sentence starts with NN | 1 |
+| $\text{PRP} \to \text{VBZ}$ | She→runs | 1 |
+| $\text{PRP} \to \text{MD}$ | They→can, She→can | 2 |
+| $\text{PRP} \to \text{VB}$ | I→fish | 1 |
+| $\text{VBZ} \to \text{RB}$ | runs→fast | 1 |
+| $\text{VBZ} \to \text{JJ}$ | is→empty | 1 |
+| $\text{MD} \to \text{VB}$ | can→swim, can→run | 2 |
+| $\text{VB} \to \text{IN}$ | fish→in, swim→in, run→in | 3 |
+| $\text{VB} \to \langle /s \rangle$ | swim (end of sentence 2) | 1 |
+| $\text{IN} \to \text{NNS}$ | in→lakes, in→rivers, in→parks | 3 |
+| $\text{DT} \to \text{NN}$ | The→can | 1 |
+| $\text{NN} \to \text{VBZ}$ | can→is | 1 |
+| $\text{NN} \to \text{VB}$ | Fish→swim | 1 |
+
+---
+
+**Step A.3: Compute Transition Probabilities (MLE)**
+
+$$P(t_i \mid t_{i-1}) = \frac{C(t_{i-1}, t_i)}{C(t_{i-1})}$$
+
+**Initial State Distribution $\pi$ (transitions from $\langle s \rangle$)**:
+
+$$P(\text{PRP} \mid \langle s \rangle) = \frac{C(\langle s \rangle, \text{PRP})}{C(\langle s \rangle)} = \frac{4}{6} = 0.667$$
+
+$$P(\text{DT} \mid \langle s \rangle) = \frac{1}{6} = 0.167$$
+
+$$P(\text{NN} \mid \langle s \rangle) = \frac{1}{6} = 0.167$$
+
+All other tags: $P(t \mid \langle s \rangle) = 0$
+
+**Transition Matrix $A$ (selected relevant entries)**:
+
+| From $\downarrow$ \ To $\rightarrow$ | PRP | VBZ | RB | MD | VB | IN | NNS | DT | NN | JJ |
+|--------------------------------------|-----|-----|----|----|----|----|-----|----|----|-----|
+| $\langle s \rangle$ | 0.667 | 0 | 0 | 0 | 0 | 0 | 0 | 0.167 | 0.167 | 0 |
+| PRP | 0 | 0.25 | 0 | 0.50 | 0.25 | 0 | 0 | 0 | 0 | 0 |
+| MD | 0 | 0 | 0 | 0 | 1.0 | 0 | 0 | 0 | 0 | 0 |
+| VB | 0 | 0 | 0 | 0 | 0 | 0.75 | 0 | 0 | 0 | 0 |
+| IN | 0 | 0 | 0 | 0 | 0 | 0 | 1.0 | 0 | 0 | 0 |
+| NN | 0 | 0.50 | 0 | 0 | 0.50 | 0 | 0 | 0 | 0 | 0 |
+
+**Sample calculation for $P(\text{MD} \mid \text{PRP})$**:
+$$P(\text{MD} \mid \text{PRP}) = \frac{C(\text{PRP}, \text{MD})}{C(\text{PRP})} = \frac{2}{4} = 0.50$$
+
+**Sample calculation for $P(\text{VB} \mid \text{MD})$**:
+$$P(\text{VB} \mid \text{MD}) = \frac{C(\text{MD}, \text{VB})}{C(\text{MD})} = \frac{2}{2} = 1.0$$
+
+**Semantic insight**: The transition $P(\text{VB} \mid \text{MD}) = 1.0$ reflects the grammatical constraint that modal verbs (can, will, should) are always followed by base-form verbs in this corpus.
+
+---
+
+**Step A.4: Count Word-Tag Pairs**
+
+| Word | Tag | Count |
+|------|-----|-------|
+| She | PRP | 2 |
+| They | PRP | 1 |
+| I | PRP | 1 |
+| runs | VBZ | 1 |
+| is | VBZ | 1 |
+| fast | RB | 1 |
+| can | MD | 2 |
+| can | NN | 1 |
+| swim | VB | 2 |
+| fish | VB | 1 |
+| run | VB | 1 |
+| in | IN | 3 |
+| lakes | NNS | 1 |
+| rivers | NNS | 1 |
+| parks | NNS | 1 |
+| The | DT | 1 |
+| Fish | NN | 1 |
+| empty | JJ | 1 |
+
+---
+
+**Step A.5: Compute Emission Probabilities (MLE)**
+
+$$P(w_i \mid t_i) = \frac{C(t_i, w_i)}{C(t_i)}$$
+
+**Emission Matrix $B$ (relevant entries for target sentence)**:
+
+| Tag | She | can | fish | in | rivers |
+|-----|-----|-----|------|----|---------| 
+| PRP | 0.50 | 0 | 0 | 0 | 0 |
+| MD | 0 | 1.0 | 0 | 0 | 0 |
+| VB | 0 | 0 | 0.25 | 0 | 0 |
+| IN | 0 | 0 | 0 | 1.0 | 0 |
+| NNS | 0 | 0 | 0 | 0 | 0.333 |
+| NN | 0 | 0.333 | 0.333* | 0 | 0 |
+
+*Note: We assume "fish" (lowercase) can be emitted by NN with probability 0.333, treating "Fish" and "fish" as the same lemma after normalization.
+
+**Sample calculation for $P(\text{She} \mid \text{PRP})$**:
+$$P(\text{She} \mid \text{PRP}) = \frac{C(\text{PRP}, \text{She})}{C(\text{PRP})} = \frac{2}{4} = 0.50$$
+
+**Sample calculation for $P(\text{can} \mid \text{MD})$**:
+$$P(\text{can} \mid \text{MD}) = \frac{C(\text{MD}, \text{can})}{C(\text{MD})} = \frac{2}{2} = 1.0$$
+
+**Sample calculation for $P(\text{can} \mid \text{NN})$**:
+$$P(\text{can} \mid \text{NN}) = \frac{C(\text{NN}, \text{can})}{C(\text{NN})} = \frac{1}{2} = 0.50$$
+
+---
+
+#### Part B: Viterbi Algorithm Application
+
+**Observation sequence**: $O = [\text{She}, \text{can}, \text{fish}, \text{in}, \text{rivers}]$
+
+**Relevant states**: For computational tractability, we focus on states that can emit the observed words: $\{\text{PRP}, \text{MD}, \text{NN}, \text{VB}, \text{IN}, \text{NNS}\}$
+
+---
+
+**Step B.1: Initialization ($t = 1$, word = "She")**
+
+$$v_1(j) = P(j \mid \langle s \rangle) \times P(\text{She} \mid j)$$
+
+| State | $\pi_j$ | $b_j(\text{She})$ | Calculation | $v_1(j)$ |
+|-------|---------|-------------------|-------------|----------|
+| PRP | 0.667 | 0.50 | $0.667 \times 0.50$ | **0.333** |
+| MD | 0 | 0 | $0 \times 0$ | 0 |
+| NN | 0.167 | 0 | $0.167 \times 0$ | 0 |
+| VB | 0 | 0 | $0 \times 0$ | 0 |
+| IN | 0 | 0 | $0 \times 0$ | 0 |
+| NNS | 0 | 0 | $0 \times 0$ | 0 |
+
+**Summary Table ($t = 1$)**:
+
+| State | $v_1$ | Backpointer |
+|-------|-------|-------------|
+| PRP | **0.333** | $\langle s \rangle$ |
+| MD | 0 | — |
+| NN | 0 | — |
+| VB | 0 | — |
+| IN | 0 | — |
+| NNS | 0 | — |
+
+**Interpretation (sentence start)**: Only PRP has non-zero probability because "She" is exclusively a personal pronoun in our corpus, and sentences commonly begin with pronouns ($P(\text{PRP} \mid \langle s \rangle) = 0.667$).
+
+---
+
+**Step B.2: Recursion ($t = 2$, word = "can")**
+
+$$v_2(j) = \max_i \left[ v_1(i) \cdot a_{ij} \cdot b_j(\text{can}) \right]$$
+
+**$v_2(\text{MD})$** (can as modal verb):
+- From PRP: $v_1(\text{PRP}) \times P(\text{MD} \mid \text{PRP}) \times P(\text{can} \mid \text{MD})$
+  $$= 0.333 \times 0.50 \times 1.0 = \mathbf{0.167}$$
+- All other predecessors: 0 (either $v_1(i) = 0$ or $a_{i,\text{MD}} = 0$)
+- **Max: 0.167** (from PRP)
+
+**$v_2(\text{NN})$** (can as noun):
+- From PRP: $v_1(\text{PRP}) \times P(\text{NN} \mid \text{PRP}) \times P(\text{can} \mid \text{NN})$
+  $$= 0.333 \times 0 \times 0.50 = 0$$
+- All other predecessors: 0
+- **Max: 0** (no valid path)
+
+**Summary Table ($t = 2$)**:
+
+| State | $v_2$ | Backpointer |
+|-------|-------|-------------|
+| PRP | 0 | — |
+| MD | **0.167** | PRP |
+| NN | 0 | — |
+| VB | 0 | — |
+| IN | 0 | — |
+| NNS | 0 | — |
+
+**Interpretation (first ambiguity resolved)**: Although "can" could be a modal (MD) or noun (NN), only the MD path survives because:
+1. The transition $P(\text{NN} \mid \text{PRP}) = 0$ in our corpus (pronouns are never followed by nouns directly)
+2. The transition $P(\text{MD} \mid \text{PRP}) = 0.50$ is valid (pronouns can be followed by modals)
+
+The Viterbi algorithm exploits the grammatical constraint that personal pronouns are typically followed by verbs or modals, not nouns.
+
+---
+
+**Step B.3: Recursion ($t = 3$, word = "fish")**
+
+$$v_3(j) = \max_i \left[ v_2(i) \cdot a_{ij} \cdot b_j(\text{fish}) \right]$$
+
+**$v_3(\text{VB})$** (fish as verb):
+- From MD: $v_2(\text{MD}) \times P(\text{VB} \mid \text{MD}) \times P(\text{fish} \mid \text{VB})$
+  $$= 0.167 \times 1.0 \times 0.25 = \mathbf{0.0417}$$
+- All other predecessors: 0
+- **Max: 0.0417** (from MD)
+
+**$v_3(\text{NN})$** (fish as noun):
+- From MD: $v_2(\text{MD}) \times P(\text{NN} \mid \text{MD}) \times P(\text{fish} \mid \text{NN})$
+  $$= 0.167 \times 0 \times 0.333 = 0$$
+- All other predecessors: 0
+- **Max: 0** (no valid path)
+
+**Summary Table ($t = 3$)**:
+
+| State | $v_3$ | Backpointer |
+|-------|-------|-------------|
+| PRP | 0 | — |
+| MD | 0 | — |
+| NN | 0 | — |
+| VB | **0.0417** | MD |
+| IN | 0 | — |
+| NNS | 0 | — |
+
+**Interpretation (second ambiguity resolved)**: "Fish" could be a verb (VB) or noun (NN), but only the VB path survives. The critical constraint is $P(\text{VB} \mid \text{MD}) = 1.0$: modals are always followed by verbs. The noun interpretation fails because $P(\text{NN} \mid \text{MD}) = 0$—you cannot say *"She can table"* in standard grammar.
+
+---
+
+**Step B.4: Recursion ($t = 4$, word = "in")**
+
+$$v_4(j) = \max_i \left[ v_3(i) \cdot a_{ij} \cdot b_j(\text{in}) \right]$$
+
+**$v_4(\text{IN})$** (in as preposition):
+- From VB: $v_3(\text{VB}) \times P(\text{IN} \mid \text{VB}) \times P(\text{in} \mid \text{IN})$
+  $$= 0.0417 \times 0.75 \times 1.0 = \mathbf{0.0313}$$
+- All other predecessors: 0
+- **Max: 0.0313** (from VB)
+
+**Summary Table ($t = 4$)**:
+
+| State | $v_4$ | Backpointer |
+|-------|-------|-------------|
+| PRP | 0 | — |
+| MD | 0 | — |
+| NN | 0 | — |
+| VB | 0 | — |
+| IN | **0.0313** | VB |
+| NNS | 0 | — |
+
+**Interpretation**: "In" is unambiguously a preposition (IN) in this context. The transition probability $P(\text{IN} \mid \text{VB}) = 0.75$ reflects that verbs are often followed by prepositional phrases.
+
+---
+
+**Step B.5: Recursion ($t = 5$, word = "rivers")**
+
+$$v_5(j) = \max_i \left[ v_4(i) \cdot a_{ij} \cdot b_j(\text{rivers}) \right]$$
+
+**$v_5(\text{NNS})$** (rivers as plural noun):
+- From IN: $v_4(\text{IN}) \times P(\text{NNS} \mid \text{IN}) \times P(\text{rivers} \mid \text{NNS})$
+  $$= 0.0313 \times 1.0 \times 0.333 = \mathbf{0.0104}$$
+- All other predecessors: 0
+- **Max: 0.0104** (from IN)
+
+**Summary Table ($t = 5$)**:
+
+| State | $v_5$ | Backpointer |
+|-------|-------|-------------|
+| PRP | 0 | — |
+| MD | 0 | — |
+| NN | 0 | — |
+| VB | 0 | — |
+| IN | 0 | — |
+| NNS | **0.0104** | IN |
+
+**Interpretation (sentence end)**: "Rivers" is unambiguously a plural noun (NNS). The transition $P(\text{NNS} \mid \text{IN}) = 1.0$ captures the pattern that prepositions are followed by noun phrases (their objects).
+
+---
+
+#### Part C: Termination and Backtrace
+
+**Step C.1: Identify Best Final State**
+
+$$\hat{q}_T = \arg\max_j v_5(j) = \text{NNS} \quad \text{with probability } 0.0104$$
+
+**Step C.2: Backtrace**
+
+Trace backpointers from $t = 5$ to $t = 1$:
+
+| $t$ | Best State | Backpointer → Previous State |
+|-----|------------|------------------------------|
+| 5 | NNS | → IN |
+| 4 | IN | → VB |
+| 3 | VB | → MD |
+| 2 | MD | → PRP |
+| 1 | PRP | → $\langle s \rangle$ |
+
+**Recovered path**: $\langle s \rangle$ → PRP → MD → VB → IN → NNS
+
+---
+
+**Step C.3: Final Tagged Sentence**
+
+$$\boxed{\text{She/PRP can/MD fish/VB in/IN rivers/NNS}}$$
+
+**Joint probability of the best path**:
+$$P^* = 0.0104$$
+
+---
+
+#### Part D: Interpretation and Analysis
+
+**Summary of Probability Flow**:
+
+| Position | Word | Tag | $v_t$ | Key Probability Factor |
+|----------|------|-----|-------|------------------------|
+| 1 (start) | She | PRP | 0.333 | $P(\text{PRP} \mid \langle s \rangle) = 0.667$ |
+| 2 | can | MD | 0.167 | $P(\text{MD} \mid \text{PRP}) = 0.50$ |
+| 3 | fish | VB | 0.0417 | $P(\text{VB} \mid \text{MD}) = 1.0$ |
+| 4 | in | IN | 0.0313 | $P(\text{IN} \mid \text{VB}) = 0.75$ |
+| 5 (end) | rivers | NNS | 0.0104 | $P(\text{NNS} \mid \text{IN}) = 1.0$ |
+
+**How Viterbi Resolved Ambiguities**:
+
+1. **Sentence-initial position ("She")**: The high prior $P(\text{PRP} \mid \langle s \rangle) = 0.667$ combined with the emission $P(\text{She} \mid \text{PRP}) = 0.50$ made PRP the only viable starting state. Sentences frequently begin with pronouns.
+
+2. **Ambiguous "can" (MD vs NN)**: Although "can" could be a modal verb ("I can swim") or a noun ("a tin can"), the transition constraint $P(\text{NN} \mid \text{PRP}) = 0$ eliminated the noun interpretation. Grammatically, personal pronouns are not directly followed by common nouns in English.
+
+3. **Ambiguous "fish" (VB vs NN)**: The critical constraint $P(\text{VB} \mid \text{MD}) = 1.0$ resolved this ambiguity. Modal verbs obligatorily select for following verbs, making the noun reading impossible (*"She can table" is ungrammatical).
+
+4. **Sentence-internal "in"**: Prepositions are unambiguous in isolation; the transition $P(\text{IN} \mid \text{VB}) = 0.75$ reflects verbs' tendency to take prepositional phrase complements.
+
+5. **Sentence-final "rivers"**: The object of a preposition is typically a noun phrase. The deterministic transition $P(\text{NNS} \mid \text{IN}) = 1.0$ reflects this grammatical requirement.
+
+**Key Insight**: The Viterbi algorithm successfully disambiguates lexically ambiguous words by exploiting **sequential constraints encoded in transition probabilities**. Even though "can" and "fish" each have multiple possible tags, the grammatical context (preceding and following tags) narrows down the possibilities. This demonstrates how HMMs capture syntactic structure through local dependencies.
 
 ---
 
